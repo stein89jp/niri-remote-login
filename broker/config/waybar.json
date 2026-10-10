@@ -1,0 +1,16 @@
+{
+  "layer": "top",
+  "position": "top",
+  "height": 30,
+  "spacing": 12,
+  "modules-left": ["custom/launcher", "niri/workspaces"],
+  "modules-center": ["niri/window"],
+  "modules-right": ["tray", "clock"],
+  "custom/launcher": {
+    "format": "Applications",
+    "tooltip": false,
+    "on-click": "fuzzel"
+  },
+  "niri/window": {"max-length": 60},
+  "clock": {"format": "{:%a %H:%M}"}
+}

@@ -178,6 +178,16 @@ static BOOL end_paint(rdpContext *ctx) {
                                            probe->pointer_x, probe->pointer_y)) return FALSE;
         probe->phase = 3;
     } else if (probe->phase == 3 && contains_color(ctx->gdi, 180, 40, 30)) {
+        // Consecutive characters, modifier release, Enter and a compositor bind.
+        // The Wayland fixture decodes this with the advertised XKB keymap.
+        if (getenv("NIRI_RDP_TEST_KEYBOARD")) {
+            if (!login_key(ctx, 1) || !login_text(ctx, "abc123ABc") || !login_key(ctx, 28) ||
+                !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_EXTENDED | KBD_FLAGS_DOWN, 0x5b) ||
+                !login_key(ctx, 32) ||
+                !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_EXTENDED | KBD_FLAGS_RELEASE, 0x5b))
+                return FALSE;
+            puts("NIRI_RDP_KEYBOARD_SEQUENCE_SENT");
+        }
         probe->phase = 4;
     }
     return TRUE;

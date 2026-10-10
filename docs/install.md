@@ -117,7 +117,12 @@ or world write access. Invalid, expired, mismatched, or incomplete identities
 fail startup rather than silently replacing your certificate. Replacing an
 identity requires restarting both services so the frontend loads new credentials.
 
-The defaults launch `foot`. Super+Enter opens a terminal; Super+Shift+Q logs out.
+The remote desktop loads your existing `~/.config/niri/config.kdl`, preserving
+your bindings, appearance, includes and startup applications. DankMaterialShell
+(when installed), otherwise Waybar, starts on the private session if configured
+startup commands have not already launched a bar. Accounts without a Niri
+configuration receive `foot` and a bar: Super+Enter opens a terminal, Super+D
+opens Fuzzel, Super+Q closes a window, and Super+Shift+Q logs out.
 Disconnect ends the desktop; reconnect creates a fresh session. The compositor
 tries headless GPU rendering automatically, preferring NVIDIA hardware, and falls
 back to surfaceless rendering when hardware is unavailable. Optional NVIDIA
@@ -127,8 +132,22 @@ monitor tests are tracked in [acceptance](acceptance.md).
 
 ## Configuration and troubleshooting
 
+Configuration priority is `~/.config/niri-rdp/config.kdl`, then your usual
+`~/.config/niri/config.kdl`, then `/etc/niri-rdp/headless.kdl`. `XDG_CONFIG_HOME`
+is honored when set. Your usual configuration is included by a temporary wrapper
+that keeps `HEADLESS-1` at scale 1 with normal orientation and supplies a private
+bar startup helper. Physical output settings do not apply to this virtual output.
+Your original files are preserved. The helper waits up to two seconds for
+configured DMS/Waybar/Quickshell startup before supplying a bar; unusually slow or
+custom bars should use an explicit remote configuration.
+
+To opt into separate remote settings, create `~/.config/niri-rdp/config.kdl`.
+This override is loaded directly, so include your desired `spawn-at-startup`
+commands for the bar. The remote session uses its own Wayland socket and D-Bus
+bus. Local systemd desktop services are not started or given the remote environment.
+
 Review `/etc/niri-rdp/frontend.conf`, `/etc/niri-rdp/headless.kdl`,
-`/etc/niri-rdp/renderer.conf`, and
+`/etc/niri-rdp/waybar.json`, `/etc/niri-rdp/renderer.conf`, and
 `/etc/pam.d/niri-rdp`. `NIRI_RDP_LISTEN` accepts a numeric IP address and port,
 including bracketed IPv6. To use the standard RDP port on a host where it is free,
 set `NIRI_RDP_LISTEN=0.0.0.0:3389`. To retain tunnel-only access, set

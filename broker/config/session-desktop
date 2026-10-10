@@ -1,0 +1,49 @@
+#!/usr/bin/python3
+"""Start a desktop bar on Niri's private bus when user services would supply it."""
+import os
+from pathlib import Path
+import shutil
+import time
+
+PROC = Path("/proc")
+
+def bar_running():
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "")
+    display = os.environ.get("WAYLAND_DISPLAY", "")
+    if not runtime or not display:
+        return False
+    for process in PROC.iterdir():
+        if not process.name.isdecimal():
+            continue
+        try:
+            if process.stat().st_uid != os.getuid():
+                continue
+            command = (process / "cmdline").read_bytes().split(b"\0")
+            if not command:
+                continue
+            executable = Path(os.fsdecode(command[0])).name
+            if executable not in {"dms", "waybar", "qs", "quickshell"}:
+                continue
+            environment = (process / "environ").read_bytes().split(b"\0")
+            if (os.fsencode("XDG_RUNTIME_DIR=" + runtime) in environment and
+                    os.fsencode("WAYLAND_DISPLAY=" + display) in environment):
+                return True
+        except (OSError, ValueError):
+            continue
+    return False
+
+
+def main():
+    # Give configured startup commands time to launch before supplying a bar.
+    for _ in range(20):
+        if bar_running():
+            return
+        time.sleep(0.1)
+    if shutil.which("dms"):
+        os.execvp("dms", ["dms", "run"])
+    elif shutil.which("waybar"):
+        os.execvp("waybar", ["waybar", "--config", "/etc/niri-rdp/waybar.json"])
+
+
+if __name__ == "__main__":
+    main()

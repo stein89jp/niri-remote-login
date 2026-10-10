@@ -33,12 +33,22 @@ Allow TCP 33991 in your existing firewall if necessary. The listener address and
 port are configurable in `/etc/niri-rdp/frontend.conf`.
 
 Stock `/usr/bin/niri` stays alongside the patched
-`/usr/lib/niri-rdp/niri-headless`. The remote session has its own desktop and
+`/usr/lib/niri-rdp/niri-headless`. The remote session has its own display and uses your Niri
 configuration. Reconnect creates a new session. Client-selected resolution and
 single-display live resizing are supported. Bitmap transport is the default;
 optional host NVIDIA NVENC H.264 encoding is available, with a 60 fps capture
 budget, reusable capture buffers and unchanged-frame suppression. The compositor
 prefers hardware EGL rendering, including NVIDIA, with software fallback.
+
+The remote desktop uses your existing Niri configuration, including its bindings,
+appearance and startup applications. It starts DankMaterialShell privately when
+installed, otherwise a Niri Waybar, if your startup commands have not started a
+bar. Accounts without a Niri configuration receive a terminal and bar with
+Super+Enter for a terminal and Super+D for Fuzzel. An optional
+`~/.config/niri-rdp/config.kdl` overrides these defaults; see the
+[configuration guide](docs/install.md#configuration-and-troubleshooting).
+See [upgrade instructions](docs/upgrade.md) for existing remote overrides and
+`headless.kdl.pacnew` files.
 
 This remains **experimental**. Disposable Niri/RDP integration has demonstrated
 changing application frames, keyboard/pointer input, authentication rejection,

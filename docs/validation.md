@@ -298,3 +298,42 @@ the shared TLS protocol and supplies ClientInfo credentials even when they are
 empty. This supports the ordinary-client/login-screen design; it is not evidence
 that a specific Windows build interoperates. Actual Windows mstsc, installed
 PAM/logind boot login, and physical-monitor acceptance remain pending.
+
+## Remote login graphics fixes (2026-10-11)
+
+The rebuilt bridge passed eight login-related tests and sixteen video tests,
+including static-form repaint, bitmap fallback without AVC, and delivery of the
+first graphics surface while the client suppresses output during its handshake.
+An isolated bitmap/TLS login-screen run passed wrong-password rejection,
+authentication into a real headless Niri desktop, decoded frames, live resizing,
+application input, disconnect releases, compositor failure, and broker lease
+closure. Its report is `artifacts/remote-fixes-login-integration.json`.
+
+The run used fixture credentials through the namespace broker, existing lab
+compositor/client binaries, and FreeRDP libraries extracted into the local test
+sysroot. It did not validate installed PAM/logind, an actual Windows mstsc
+client, or hardware NVENC; no NVIDIA devices were available. Login and desktop
+now share one graphics wrapper, so authentication at the negotiated desktop
+size reuses the login surface and adds no surface initialization to the NVENC
+integration fixture's existing count.
+
+## Remote keyboard and desktop fixes (2026-10-11)
+
+`make check` passed: 22 Python tests (one optional transport test skipped),
+five transport unit tests, four startup checks, ten native broker groups, and
+42 bridge tests. The worker's 14 host setup tests include host configuration
+reuse, remote override precedence, private bar startup and duplicate detection.
+Niri validated the user's existing configuration through the remote wrapper.
+
+The rebuilt compositor and expanded FreeRDP fixture passed combined TLS login
+and keyboard integration, recorded in
+`artifacts/login-keyboard-regression-integration.json`. The Wayland application
+decodes its actual advertised XKB keymap and requires consecutive `abc123ABc`,
+Return, and a Meta+D compositor binding. The run also checks resize, capture,
+disconnect release and compositor crash cleanup. The maintained patch applies
+cleanly to the exact pinned source archive and its checksum matches `pins.json`.
+Actual Windows mstsc, installed PAM/logind, the running DMS bar and hardware
+NVENC remain machine checks; these results do not claim those checks passed.
+
+Both headless compositor library regressions passed on the rebuilt source
+(`cargo test --locked --offline --no-default-features --lib backend::headless`).

@@ -21,7 +21,9 @@ rendering. `lab/run-isolated.sh python3 scripts/headless-integration.py` exercis
 library-managed RDP and the real compositor/app capture/input bridge.
 
 The broker's worker launches with `NIRI_BACKEND=headless`, a private runtime
-directory as `XDG_RUNTIME_DIR`, and `--config /etc/niri-rdp/headless.kdl`.
+directory as `XDG_RUNTIME_DIR`, and a configuration selected by the worker.
+It normally includes the user's existing Niri configuration, with an explicit
+remote override and system fallback described in [installation](../docs/install.md).
 It must never inherit a local display socket or run Niri with `--session`.
 `/etc/niri-rdp/renderer.conf` selects `auto`, `hardware`, or `software`. `auto`
 tries non-software EGL devices first, preferring NVIDIA devices that advertise
@@ -50,3 +52,13 @@ requests a new size. Changes preserve the output, workspaces and applications,
 update layout and announced capture geometry, and keep a single current mode.
 Dimensions remain bounded to 1–8192 and refresh to 1–240 Hz. No RDP protocol code
 lives in the compositor.
+
+The patched virtual keyboard implementation routes remote key events through
+Niri's normal XKB, focus, grab and keybinding handling. The old pinned Smithay
+implementation sent events directly to `wl_keyboard` and maintained a separate
+client keymap; it bypassed compositor shortcuts such as Mod+D. The compositor
+now uses the advertised virtual keymap as its authoritative map, applies modifier
+synchronization only when necessary, and releases held keys and restores the
+configured map on disconnect. The isolated integration fixture decodes the actual
+Wayland XKB map and requires consecutive `abc123ABc`, Return and a Mod+D compositor
+binding, in addition to capture, resize and disconnect checks.

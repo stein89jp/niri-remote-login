@@ -366,12 +366,19 @@ impl RdpServerDisplay for Login {
         }
     }
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
-        Ok(Box::new(Updates {
+        let updates = Box::new(Updates {
             login: self.clone(),
             rx: self.changed.subscribe(),
             first: true,
             desktop: None,
-        }))
+            repaint: tokio::time::Instant::now() + Duration::from_secs(1),
+        });
+        // Use the negotiated graphics channel for the form as well as the
+        // desktop. mstsc may stop presenting classic bitmaps once GFX opens.
+        match &self.video {
+            Some(video) => Ok(video.wrap_updates(updates)?),
+            None => Ok(updates),
+        }
     }
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         if let Some(mut desktop) = self.state.lock().unwrap().desktop.clone() {
@@ -385,6 +392,7 @@ struct Updates {
     rx: tokio::sync::watch::Receiver<u64>,
     first: bool,
     desktop: Option<Box<dyn RdpServerDisplayUpdates + Send>>,
+    repaint: tokio::time::Instant,
 }
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for Updates {
@@ -398,22 +406,28 @@ impl RdpServerDisplayUpdates for Updates {
             }
             let desktop = self.login.state.lock().unwrap().desktop.clone();
             if let Some(desktop) = desktop {
-                self.desktop = Some(match &self.login.video {
-                    Some(video) => video.updates_send(&desktop)?,
-                    None => desktop.updates_send(),
-                });
+                self.desktop = Some(desktop.updates_send());
                 continue;
             }
             if self.first || self.rx.has_changed().unwrap_or(false) {
                 self.first = false;
                 self.rx.borrow_and_update();
+                self.repaint = tokio::time::Instant::now() + Duration::from_secs(1);
                 return Ok(Some(DisplayUpdate::Bitmap(
                     render(&self.login.state.lock().unwrap())
                         .map_err(|_| crate::server_error("login framebuffer dimensions invalid"))?,
                 )));
             }
-            if self.rx.changed().await.is_err() {
-                return Ok(None);
+            // A client can initialize its surface or negotiate GFX after the
+            // first bitmap, and refresh requests do not produce input events.
+            // Keep a heartbeat so a static login form can recover as well.
+            tokio::select! {
+                changed = self.rx.changed() => {
+                    if changed.is_err() {
+                        return Ok(None);
+                    }
+                }
+                _ = tokio::time::sleep_until(self.repaint) => {}
             }
             self.first = true;
         }
@@ -762,6 +776,24 @@ mod tests {
         ));
         login.stop();
         assert!(updates.next_update().await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn unchanged_login_repaints_after_client_surface_initialization() {
+        let mut login = login("alice");
+        let mut updates = login.updates().await.unwrap();
+        let Some(DisplayUpdate::Bitmap(first)) = updates.next_update().await.unwrap() else {
+            panic!("expected initial login bitmap");
+        };
+        let Some(DisplayUpdate::Bitmap(repaint)) =
+            tokio::time::timeout(Duration::from_millis(1500), updates.next_update())
+                .await
+                .expect("static login must repaint without input")
+                .unwrap()
+        else {
+            panic!("expected login repaint");
+        };
+        assert_eq!(first.data, repaint.data);
     }
 
     #[tokio::test]

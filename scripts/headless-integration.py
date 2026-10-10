@@ -209,7 +209,8 @@ def main():
             else:
                 raise RuntimeError("bridge startup timed out")
             client_env = dict(env, WLOG_LEVEL=os.environ.get("NIRI_RDP_LAB_WLOG", "OFF"), NIRI_RDP_TEST_NLA="1",
-                              NIRI_RDP_TEST_USERNAME=username, NIRI_RDP_TEST_PASSWORD=password)
+                              NIRI_RDP_TEST_USERNAME=username, NIRI_RDP_TEST_PASSWORD=password,
+                              NIRI_RDP_TEST_KEYBOARD="1")
             if tls_contract:
                 client_env.pop("NIRI_RDP_TEST_NLA")
             if gfx:
@@ -253,6 +254,11 @@ def main():
                     raise RuntimeError(f"Wayland app did not acknowledge {event}")
             if "FRAME" not in log:
                 raise RuntimeError("animated app did not reach frame callback checkpoint")
+            if "XKB_TEXT abc123ABc" not in log or "KEYSYM 65293" not in log:
+                raise RuntimeError("remote consecutive text, Shift release or Enter did not decode with the client's XKB map")
+            if not Path("/tmp/niri-rdp-meta-d-proof").exists():
+                raise RuntimeError("remote Meta+D did not reach Niri's compositor keybindings")
+            results["decoded_consecutive_text_shift_release_enter_and_meta_d_bind"] = "passed"
             results["wayland_application_events_and_animation"] = "passed"
             if gpu_rendering:
                 results["no_physical_input_or_drm_modesetting_or_inherited_display"] = "passed; DRM render nodes only"
@@ -297,6 +303,8 @@ def main():
                     raise RuntimeError("requested NVENC encoder did not pass hardware preflight")
                 # Three normal clients recreate graphics at every live layout;
                 # held-input and crash probes retain their initial desktop.
+                # Login and desktop share a graphics wrapper and the same
+                # negotiated size, so authentication reuses the login surface.
                 expected_graphics = 3 * len(DESKTOP_SIZES) + 2 if gfx else 0
                 actual_graphics = bridge_log.count("RDP graphics using NVENC H.264 AVC420")
                 if actual_graphics != expected_graphics:

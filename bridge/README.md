@@ -33,7 +33,7 @@ needed by this library's default NLA backend. Credentials supplied in the
 library's TLS-protected ClientInfo flow reach the broker. Remembered Windows
 domain credentials open an empty Linux login form and are never forwarded to
 PAM. A client omitting its password also receives a
-restricted bitmap login screen. No compositor or Linux login session starts until
+restricted login screen. No compositor or Linux login session starts until
 the screen submits credentials and the broker accepts them. Incorrect credentials
 clear the password; attempts have a two-second delay and the connection closes
 after five failures. The screen supports US physical keys and Unicode character
@@ -41,6 +41,11 @@ events, Tab, Backspace, Enter, and mouse focus/sign-in. Password pixels contain
 a fixed mask, never the secret or its length. Disconnect cancels access to a
 pending session and releases its lease. The display/input adapters switch to the
 real desktop after successful login, including optional NVENC and live resizing.
+The login form uses the same negotiated graphics wrapper as the desktop and
+repaints once per second while waiting for input, so late client surface setup
+or graphics negotiation does not leave a static black screen. The initial
+graphics surface is delivered even during startup output suppression; later
+suppression still pauses desktop output.
 
 Ordinary mstsc can negotiate TLS when the server offers no NLA. An explicit
 `enablecredsspsupport:i:0` profile remains a fallback; policies requiring NLA are

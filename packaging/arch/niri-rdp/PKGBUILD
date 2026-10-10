@@ -4,20 +4,20 @@
 # Export a portable source bundle with makepkg --allsource.
 pkgname=niri-remote-login
 pkgver=0.1.0
-pkgrel=5
+pkgrel=6
 pkgdesc='Niri remote desktop host with a PAM/logind broker and dedicated headless compositor'
 arch=('x86_64')
 # Niri is GPL-3.0-or-later; the bridge links Arch's GPL-licensed FFmpeg.
 license=('MIT' 'GPL-3.0-only' 'GPL-3.0-or-later')
 options=('!debug' '!lto')
 depends=('pam' 'systemd' 'systemd-libs' 'dbus' 'wayland' 'libxkbcommon'
-         'xkeyboard-config' 'foot' 'ttf-dejavu' 'ffmpeg' 'seatd' 'libinput'
+         'xkeyboard-config' 'foot' 'fuzzel' 'waybar' 'ttf-dejavu' 'ffmpeg' 'seatd' 'libinput'
          'libdisplay-info' 'mesa' 'libglvnd' 'pango' 'cairo' 'pixman'
          'openssl' 'python')
 makedepends=('rust>=1.94' 'cargo' 'git' 'gcc' 'pkgconf')
-provides=('niri-rdp-headless=26.04.remote1-3')
+provides=('niri-rdp-headless=26.04.remote1-4')
 conflicts=('niri-rdp-headless')
-backup=('etc/niri-rdp/frontend.conf' 'etc/niri-rdp/headless.kdl' 'etc/niri-rdp/renderer.conf' 'etc/pam.d/niri-rdp')
+backup=('etc/niri-rdp/frontend.conf' 'etc/niri-rdp/headless.kdl' 'etc/niri-rdp/waybar.json' 'etc/niri-rdp/renderer.conf' 'etc/pam.d/niri-rdp')
 _revision=0be60b742762905b7bee1ea67bb5a2fb00859bf0
 source=("niri-$_revision.tar.gz::https://codeload.github.com/niri-wm/niri/tar.gz/$_revision")
 sha256sums=('680374cae233d2ed1e0f8474aeb017e36872b30b9e291ce43b1521724b8fe2a9')

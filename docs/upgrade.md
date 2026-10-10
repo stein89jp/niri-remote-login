@@ -50,3 +50,18 @@ services before updating and review `.pacnew` files before restarting them.
 Existing TLS files are not package-owned and are preserved by first-start setup.
 When migrating from the old loopback configuration, pacman preserves your edited
 `frontend.conf`; choose `NIRI_RDP_LISTEN` explicitly if you want direct access.
+
+The remote desktop now loads your existing Niri configuration automatically,
+with a private DankMaterialShell/Waybar startup helper. Existing optional
+`~/.config/niri-rdp/config.kdl` files still take precedence; keep one for remote
+customization, or move it aside to use your usual Niri settings on the next login.
+Accounts without either user configuration get the system defaults, which start
+a bar and bind Super+D to Fuzzel. Pacman keeps
+an edited `/etc/niri-rdp/headless.kdl` and may place the new defaults in
+`/etc/niri-rdp/headless.kdl.pacnew`. Merge the bar `spawn-at-startup` line and
+updated `binds` into your existing remote configuration before reconnecting.
+If you use `~/.config/niri-rdp/config.kdl`, that file takes precedence over the
+system defaults and must be updated separately. Existing remote sessions need a
+disconnect and fresh login to run new startup commands. The remote compositor
+has its own Wayland runtime and D-Bus bus; shared systemd desktop services are
+not started or given its environment.

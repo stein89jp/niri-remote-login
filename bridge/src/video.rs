@@ -190,9 +190,15 @@ impl Video {
         &self,
         desktop: &crate::wayland::Desktop,
     ) -> ServerResult<Box<dyn RdpServerDisplayUpdates + Send>> {
+        self.wrap_updates(desktop.updates_send())
+    }
+    pub(crate) fn wrap_updates(
+        &self,
+        inner: Box<dyn RdpServerDisplayUpdates + Send>,
+    ) -> ServerResult<Box<dyn RdpServerDisplayUpdates + Send>> {
         let state = self.0.lock().unwrap();
         Ok(Box::new(VideoUpdates {
-            inner: desktop.updates_send(),
+            inner,
             handle: state
                 .handle
                 .clone()
@@ -375,7 +381,7 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                     }
                 };
                 if self.generation.load(Ordering::SeqCst) != generation
-                    || self.suppressed.load(Ordering::Relaxed)
+                    || (self.surface.is_some() && self.suppressed.load(Ordering::Relaxed))
                 {
                     // Decoder recovery/minimize can invalidate an in-flight reference frame.
                     self.force_idr = true;
@@ -410,7 +416,10 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                 self.force_idr = true;
                 self.known_generation = generation;
             }
-            if self.suppressed.load(Ordering::Relaxed) {
+            // mstsc can suppress output during connection setup before it has
+            // a surface. Deliver the first graphics frame so initialization
+            // cannot deadlock on the client's later un-suppress request.
+            if self.surface.is_some() && self.suppressed.load(Ordering::Relaxed) {
                 self.force_idr = true;
                 continue;
             }
@@ -578,6 +587,24 @@ mod tests {
         assert!(stream.next_update().await.is_err());
         assert!(stream.next_update().await.unwrap().is_none());
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn login_stream_can_use_graphics_wrapper_without_a_wayland_desktop() {
+        let mut video = Video::default();
+        let (_, handle) = video.build_server_with_handle().unwrap();
+        handle.lock().unwrap().start(7).unwrap();
+        advertise(&handle, false);
+        let (sender, mut events) = tokio::sync::mpsc::unbounded_channel();
+        video.set_sender(sender);
+        let mut stream = video
+            .wrap_updates(Box::new(Sequence(vec![image()].into())))
+            .unwrap();
+        assert!(matches!(
+            stream.next_update().await.unwrap(),
+            Some(DisplayUpdate::Bitmap(_))
+        ));
+        assert!(events.try_recv().is_err());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn clients_without_avc_receive_bitmaps_without_encoder_initialization() {
         let (mut stream, mut events) = updates(vec![image()]);
@@ -787,6 +814,23 @@ mod tests {
         );
         assert!(events.try_recv().is_ok());
     }
+    #[tokio::test(flavor = "current_thread")]
+    async fn handshake_suppression_does_not_drop_first_graphics_surface() {
+        let (mut stream, mut events) = updates(vec![]);
+        advertise(&stream.handle, true);
+        stream.known_generation = stream.generation.load(Ordering::SeqCst);
+        stream.suppressed.store(true, Ordering::Relaxed);
+        stream.pending = Some((
+            tokio::spawn(async { Ok(vec![0, 0, 0, 1, 0x65]) }),
+            64,
+            64,
+            stream.known_generation,
+        ));
+        assert!(stream.next_update().await.unwrap().is_none());
+        assert!(stream.surface.is_some());
+        assert!(events.try_recv().is_ok());
+    }
+
     #[tokio::test(flavor = "current_thread")]
     async fn minimized_output_drops_pending_reference_and_requires_idr_on_resume() {
         let (mut stream, mut events) = updates(vec![image()]);

@@ -15,3 +15,7 @@ layout {
     default-column-width { proportion 1.0; }
     background-color "#203040"
 }
+
+binds {
+    Mod+D { spawn "/usr/bin/touch" "/tmp/niri-rdp-meta-d-proof"; }
+}

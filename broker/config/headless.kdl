@@ -1,4 +1,4 @@
-// Private remote desktop: do not import host Niri/GNOME configuration.
+// Private remote desktop. Customize separately in ~/.config/niri-rdp/config.kdl.
 // The patched headless backend provides a 1920x1080 output with its own frame clock.
 output "HEADLESS-1" {
     scale 1
@@ -9,8 +9,18 @@ layout {
     default-column-width { proportion 1.0; }
 }
 spawn-at-startup "foot"
+// Launch the bar on this session's private Wayland socket and D-Bus bus.
+// Host systemd user services belong to the local desktop and are not imported.
+spawn-at-startup "sh" "-c" "if command -v dms >/dev/null 2>&1; then exec dms run; else exec waybar --config /etc/niri-rdp/waybar.json; fi"
 prefer-no-csd
 binds {
-    Mod+Return { spawn "foot"; }
-    Mod+Shift+Q { quit skip-confirmation=true; }
+    // Explicit Super also works if the headless backend chooses a nested Mod.
+    Super+Return { spawn "foot"; }
+    Super+D { spawn "fuzzel"; }
+    Super+Q { close-window; }
+    Super+Left { focus-column-left; }
+    Super+Right { focus-column-right; }
+    Super+Up { focus-window-up; }
+    Super+Down { focus-window-down; }
+    Super+Shift+Q { quit skip-confirmation=true; }
 }

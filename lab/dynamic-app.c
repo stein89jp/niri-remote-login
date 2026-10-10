@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <stdbool.h>
 #include <string.h>
+#include <xkbcommon/xkbcommon.h>
 
 struct app {
     struct wl_display *display; struct wl_compositor *compositor;
@@ -16,6 +17,8 @@ struct app {
     struct xdg_wm_base *wm; struct wl_surface *surface;
     struct xdg_surface *xdg; struct xdg_toplevel *top;
     unsigned width, height, frames; bool configured, key, button, quit;
+    struct xkb_context *xkb; struct xkb_state *xkb_state;
+    char typed[128]; size_t typed_length;
 };
 struct buffer { struct wl_buffer *wl; void *data; size_t size; };
 static void release(void *data, struct wl_buffer *wl) {
@@ -66,15 +69,42 @@ static void size(void *d,struct xdg_toplevel *t,int32_t w,int32_t h,struct wl_ar
 }
 static void closed(void *d,struct xdg_toplevel *t){(void)t;((struct app*)d)->quit=true;}
 static const struct xdg_toplevel_listener top_listener={.configure=size,.close=closed};
-static void keymap(void*d,struct wl_keyboard*k,uint32_t format,int32_t fd,uint32_t size){(void)d;(void)k;(void)format;(void)size;close(fd);}
+static void keymap(void*d,struct wl_keyboard*k,uint32_t format,int32_t fd,uint32_t size){
+    (void)k;struct app*a=d;
+    if(format!=WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 || !size){close(fd);return;}
+    char *text=mmap(NULL,size,PROT_READ,MAP_PRIVATE,fd,0);close(fd);
+    if(text==MAP_FAILED){perror("keyboard keymap mmap");exit(1);}
+    if(!a->xkb)a->xkb=xkb_context_new(XKB_CONTEXT_NO_FLAGS);
+    struct xkb_keymap *map=xkb_keymap_new_from_string(a->xkb,text,XKB_KEYMAP_FORMAT_TEXT_V1,XKB_KEYMAP_COMPILE_NO_FLAGS);
+    munmap(text,size);
+    if(!map){fputs("invalid keyboard XKB map\n",stderr);exit(1);}
+    xkb_state_unref(a->xkb_state);a->xkb_state=xkb_state_new(map);xkb_keymap_unref(map);
+    puts("XKB_KEYMAP");
+}
 static void kenter(void*d,struct wl_keyboard*k,uint32_t s,struct wl_surface*f,struct wl_array*keys){(void)d;(void)k;(void)s;(void)f;(void)keys;puts("KEYBOARD_ENTER");}
 static void kleave(void*d,struct wl_keyboard*k,uint32_t s,struct wl_surface*f){(void)k;(void)s;(void)f;((struct app*)d)->key=false;puts("KEYBOARD_LEAVE");}
 static void key(void*d,struct wl_keyboard*k,uint32_t s,uint32_t time,uint32_t code,uint32_t state){
     (void)k;(void)s;(void)time;struct app*a=d;
     if(code==KEY_A)a->key=state==WL_KEYBOARD_KEY_STATE_PRESSED;
     printf("KEY %u %u\n",code,state);
+    if(state==WL_KEYBOARD_KEY_STATE_PRESSED && a->xkb_state){
+        xkb_keysym_t sym=xkb_state_key_get_one_sym(a->xkb_state,code+8);
+        printf("KEYSYM %u\n",sym);
+        if(sym==XKB_KEY_Escape)a->typed_length=0;
+        else if(sym==XKB_KEY_Return){
+            a->typed[a->typed_length]='\0';printf("XKB_TEXT %s\n",a->typed);a->typed_length=0;
+        }else{
+            char text[16];int len=xkb_state_key_get_utf8(a->xkb_state,code+8,text,sizeof text);
+            if(len>0 && (size_t)len<sizeof text && a->typed_length+(size_t)len<sizeof a->typed){
+                memcpy(a->typed+a->typed_length,text,(size_t)len);a->typed_length+=(size_t)len;
+            }
+        }
+    }
 }
-static void mods(void*d,struct wl_keyboard*k,uint32_t s,uint32_t dep,uint32_t lat,uint32_t lock,uint32_t group){(void)d;(void)k;(void)s;(void)dep;(void)lat;(void)lock;(void)group;}
+static void mods(void*d,struct wl_keyboard*k,uint32_t s,uint32_t dep,uint32_t lat,uint32_t lock,uint32_t group){
+    (void)k;(void)s;struct app*a=d;
+    if(a->xkb_state)xkb_state_update_mask(a->xkb_state,dep,lat,lock,0,0,group);
+}
 static void repeat(void*d,struct wl_keyboard*k,int32_t rate,int32_t delay){(void)d;(void)k;(void)rate;(void)delay;}
 static const struct wl_keyboard_listener keyboard_listener={.keymap=keymap,.enter=kenter,.leave=kleave,.key=key,.modifiers=mods,.repeat_info=repeat};
 static void penter(void*d,struct wl_pointer*p,uint32_t s,struct wl_surface*f,wl_fixed_t x,wl_fixed_t y){(void)d;(void)p;(void)s;(void)f;printf("POINTER_ENTER %.1f %.1f\n",wl_fixed_to_double(x),wl_fixed_to_double(y));}

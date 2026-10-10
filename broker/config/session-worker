@@ -21,4 +21,30 @@ case "$renderer" in
 esac
 export NIRI_RDP_RENDERER="$renderer"
 unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET NIRI_SOCKET SSH_AUTH_SOCK
-exec /usr/lib/niri-rdp/niri-headless --config /etc/niri-rdp/headless.kdl
+# Reuse the user's desktop settings without starting the shared user services.
+config=/etc/niri-rdp/headless.kdl
+remote_config="${XDG_CONFIG_HOME:-$HOME/.config}/niri-rdp/config.kdl"
+desktop_config="${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl"
+if [ -f "$remote_config" ]; then
+    config="$remote_config"
+elif [ -f "$desktop_config" ]; then
+    config="$NIRI_RDP_RUNTIME_DIR/config.kdl"
+    # The include retains the original file's relative include paths (DMS
+    # output/color snippets). Escape paths as KDL, including control characters.
+    /usr/bin/python3 - "$desktop_config" "$config" <<'PY'
+import pathlib
+import sys
+source = pathlib.Path(sys.argv[1]).absolute()
+quoted = '"' + ''.join(
+    '\\u{' + format(ord(char), 'x') + '}' if ord(char) < 32 else
+    '\\"' if char == '"' else '\\\\' if char == '\\' else char
+    for char in str(source)
+) + '"'
+pathlib.Path(sys.argv[2]).write_text(
+    "include " + quoted + "\n"
+    'output "HEADLESS-1" { scale 1; transform "normal"; }\n'
+    'spawn-at-startup "/usr/lib/niri-rdp/session-desktop"\n'
+)
+PY
+fi
+exec /usr/lib/niri-rdp/niri-headless --config "$config"

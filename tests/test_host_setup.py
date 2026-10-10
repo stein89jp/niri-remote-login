@@ -1,5 +1,6 @@
 """Exercise first-start TLS provisioning without changing the host."""
 import importlib.util
+from importlib.machinery import SourceFileLoader
 import os
 from pathlib import Path
 import subprocess
@@ -20,26 +21,100 @@ def load(name, filename):
 
 tls = load("prepare_tls", "prepare-tls.py")
 setup = load("host_setup", "niri-rdp-setup.py")
+desktop_loader = SourceFileLoader("session_desktop", str(ROOT / "broker/config/session-desktop"))
+desktop = importlib.util.module_from_spec(importlib.util.spec_from_loader(desktop_loader.name, desktop_loader))
+desktop_loader.exec_module(desktop)
 
 
 class HostSetupTests(unittest.TestCase):
-    def run_worker(self, policy):
+    def test_private_bar_detection_ignores_local_desktop_and_other_applications(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            proc = Path(temporary)
+            process = proc / "123"
+            process.mkdir()
+            (process / "cmdline").write_bytes(b"/usr/bin/dms\0run\0")
+            with patch.object(desktop, "PROC", proc), patch.dict(os.environ, {
+                    "XDG_RUNTIME_DIR": "/private/remote", "WAYLAND_DISPLAY": "wayland-0"}):
+                (process / "environ").write_bytes(b"XDG_RUNTIME_DIR=/run/user/1000\0WAYLAND_DISPLAY=wayland-0\0")
+                self.assertFalse(desktop.bar_running())
+                (process / "environ").write_bytes(b"XDG_RUNTIME_DIR=/private/remote\0WAYLAND_DISPLAY=wayland-1\0")
+                self.assertFalse(desktop.bar_running())
+                (process / "environ").write_bytes(b"XDG_RUNTIME_DIR=/private/remote\0WAYLAND_DISPLAY=wayland-0\0")
+                self.assertTrue(desktop.bar_running())
+                (process / "cmdline").write_bytes(b"/usr/bin/foot\0")
+                self.assertFalse(desktop.bar_running())
+
+    def test_private_bar_startup_waits_bounded_time_and_does_not_duplicate(self):
+        with patch.object(desktop, "bar_running", side_effect=[False, False, True]), \
+                patch.object(desktop.time, "sleep") as sleep, patch.object(desktop.os, "execvp") as execute:
+            desktop.main()
+            self.assertEqual(sleep.call_count, 2)
+            execute.assert_not_called()
+        with patch.object(desktop, "bar_running", return_value=False), \
+                patch.object(desktop.time, "sleep") as sleep, \
+                patch.object(desktop.shutil, "which", return_value="/usr/bin/dms"), \
+                patch.object(desktop.os, "execvp") as execute:
+            desktop.main()
+            self.assertEqual(sleep.call_count, 20)
+            execute.assert_called_once_with("dms", ["dms", "run"])
+
+    def run_worker(self, policy, remote_config=False, custom_config_home=False, desktop_config=False):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             config = directory / "renderer.conf"
             if policy is not None:
                 config.write_text(policy + "\n")
             executable = directory / "niri-headless"
-            executable.write_text("#!/bin/sh\nexec /usr/bin/env\n")
+            executable.write_text('#!/bin/sh\nexport NIRI_TEST_CONFIG="$2"\n'
+                                 'if [ "$2" = "$NIRI_RDP_RUNTIME_DIR/config.kdl" ]; then\n'
+                                 'export NIRI_TEST_WRAPPER="$(cat "$2")"\nfi\nexec /usr/bin/env\n')
             executable.chmod(0o755)
             worker = (ROOT / "broker/config/session-worker").read_text()
             worker = worker.replace("/etc/niri-rdp/renderer.conf", str(config))
             worker = worker.replace("/usr/lib/niri-rdp/niri-headless", str(executable))
             environment = dict(os.environ, NIRI_RDP_RUNTIME_DIR=str(directory),
+                               HOME=str(directory),
                                DISPLAY=":0", WAYLAND_DISPLAY="local-wayland",
                                LIBGL_ALWAYS_SOFTWARE="1", GALLIUM_DRIVER="llvmpipe")
+            environment.pop("XDG_CONFIG_HOME", None)
+            config_home = directory / ("custom config" if custom_config_home else ".config")
+            if custom_config_home:
+                environment["XDG_CONFIG_HOME"] = str(config_home)
+            if remote_config:
+                remote = config_home / "niri-rdp" / "config.kdl"
+                remote.parent.mkdir(parents=True)
+                remote.write_text("// private remote configuration\n")
+                environment["NIRI_TEST_EXPECTED_CONFIG"] = str(remote)
+            if desktop_config:
+                desktop = config_home / "niri" / "config.kdl"
+                desktop.parent.mkdir(parents=True)
+                desktop.write_text('binds { Mod+D { spawn "fuzzel"; } }\n')
             return subprocess.run(["/bin/sh", "-c", worker], env=environment,
                                   text=True, capture_output=True)
+
+    def test_worker_selects_explicit_remote_config_without_importing_local_config(self):
+        for custom in (False, True):
+            with self.subTest(custom_config_home=custom):
+                result = self.run_worker("auto", remote_config=True, custom_config_home=custom,
+                                         desktop_config=True)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                environment = dict(line.split("=", 1) for line in result.stdout.splitlines())
+                self.assertEqual(environment["NIRI_TEST_CONFIG"], environment["NIRI_TEST_EXPECTED_CONFIG"])
+
+    def test_worker_reuses_host_config_with_private_bar_and_headless_output(self):
+        for custom in (False, True):
+            with self.subTest(custom_config_home=custom):
+                result = self.run_worker("auto", desktop_config=True, custom_config_home=custom)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('niri/config.kdl"', result.stdout)
+                self.assertIn('output "HEADLESS-1" { scale 1; transform "normal"; }', result.stdout)
+                self.assertIn('spawn-at-startup "/usr/lib/niri-rdp/session-desktop"', result.stdout)
+
+    def test_worker_uses_system_remote_config_by_default(self):
+        result = self.run_worker("auto")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(environment["NIRI_TEST_CONFIG"], "/etc/niri-rdp/headless.kdl")
 
     def test_worker_auto_and_hardware_allow_gpu_without_local_desktop(self):
         for policy in (None, "auto", "hardware"):
