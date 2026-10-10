@@ -4,7 +4,7 @@ IronRDP git revision `bf019ca502d1e52616853a5ded68c885cec1e322` owns RDP,
 TLS, optional CredSSP, bitmap codecs, graphics framing and negotiation. This exact revision includes
 `CredentialValidator` and `ConnectionBinder`, absent from crates.io 0.13.0.
 Rust >=1.94 is required. `Cargo.lock` pins every transitive crate and Git source.
-Native dependencies include `libxkbcommon` with `xkeyboard-config` US/evdev data
+Native dependencies include `libxkbcommon` with `xkeyboard-config` Japanese/evdev data
 and FFmpeg's codec, utility and scaling libraries. Install the distribution's
 `ffmpeg` package before building; the native shim uses `pkg-config` to find it.
 
@@ -46,7 +46,7 @@ PAM. A client omitting its password also receives a
 restricted login screen. No compositor or Linux login session starts until
 the screen submits credentials and the broker accepts them. Incorrect credentials
 clear the password; attempts have a two-second delay and the connection closes
-after five failures. The screen supports US physical keys and Unicode character
+after five failures. The screen supports JP106 physical keys and Unicode character
 events, Tab, Backspace, Enter, and mouse focus/sign-in. Password pixels contain
 a fixed mask, never the secret or its length. Disconnect cancels access to a
 pending desktop binding and releases its lease; a desktop already created by the
@@ -198,14 +198,17 @@ Set `NIRI_RDP_LAB_GFX=0` in that command to check bitmap fallback for a client
 without graphics support while the host encoder remains configured as NVENC.
 
 Input uses virtual keyboard and virtual pointer v2 bound to the selected output
-and seat. The compiled US PC105/evdev XKB map, modifiers and Caps/Num/Scroll
+and seat. The compiled Japanese JP106/evdev XKB map, modifiers and Caps/Num/Scroll
 synchronization are sent to Niri; held keys/buttons are released at disconnect, and a bounded compositor sync
 acknowledgment completes input teardown before the socket closes.
 RDP set-1 E0 codes map explicitly to Linux evdev codes. Pointer absolute and
 relative motion is bounded before mapping into the capture output. Click
 coordinates travel with the button event. Output scale 1 and normal transform
-are required; unsupported layouts fail closed. Unicode/IME events are ignored,
-not treated as physical keys; arbitrary layouts, Pause/E1, IME, clipboard, audio
+are required; unsupported layouts fail closed. Unicode events commit exact text through a temporary one-level XKB map, including
+Japanese and UTF-16 surrogate pairs (emoji). Each character is a balanced tap; the
+physical keymap and held modifiers are restored afterward. Phone-side IME
+composition can submit committed text this way. Arbitrary layouts, Pause/E1,
+remote IME composition, clipboard, audio
 and lock-screen behavior remain work.
 
 ## Dynamic resolution

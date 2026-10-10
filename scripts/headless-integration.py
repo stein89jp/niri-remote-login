@@ -259,6 +259,14 @@ def main():
             if not Path("/tmp/niri-rdp-meta-d-proof").exists():
                 raise RuntimeError("remote Meta+D did not reach Niri's compositor keybindings")
             results["decoded_consecutive_text_shift_release_enter_and_meta_d_bind"] = "passed"
+            for text in ['@"^&:[]\\\\', 'Phone@"日本😀Aa@']:
+                if f"XKB_TEXT {text}" not in log:
+                    raise RuntimeError(f"JIS/phone input did not arrive unchanged: {text!r}")
+            for key in (93, 92, 94):
+                for state in (1, 0):
+                    if f"KEY {key} {state}" not in log:
+                        raise RuntimeError(f"Japanese conversion key did not arrive: {key} {state}")
+            results["jp106_punctuation_ro_yen_and_phone_unicode_surrogate_shift_roundtrip"] = "passed"
             results["wayland_application_events_and_animation"] = "passed"
             if gpu_rendering:
                 results["no_physical_input_or_drm_modesetting_or_inherited_display"] = "passed; DRM render nodes only"

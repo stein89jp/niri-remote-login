@@ -6,7 +6,8 @@ output "HEADLESS-1" {
 input {
     keyboard {
         xkb {
-            layout "us"
+            model "jp106"
+            layout "jp"
         }
     }
     focus-follows-mouse

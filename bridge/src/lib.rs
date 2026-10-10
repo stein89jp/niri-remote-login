@@ -1,5 +1,6 @@
 //! Real desktop adapter. IronRDP owns every RDP wire operation.
 pub mod broker;
+pub(crate) mod keyboard;
 pub mod login;
 pub mod performance;
 pub mod video;
@@ -50,6 +51,11 @@ pub fn evdev_key(code: u8, extended: bool) -> Option<u32> {
     if !extended {
         return match code {
             1..=83 | 86..=88 => Some(u32::from(code)),
+            0x70 => Some(93),  // Hiragana/Katakana
+            0x73 => Some(89),  // JIS Ro
+            0x79 => Some(92),  // Henkan
+            0x7b => Some(94),  // Muhenkan
+            0x7d => Some(124), // JIS Yen
             _ => None,
         };
     }
@@ -196,6 +202,13 @@ mod tests {
         assert_eq!(evdev_key(0x48, true), Some(103));
         assert_eq!(evdev_key(0xff, true), None);
         assert_eq!(evdev_key(0, false), None);
+    }
+    #[test]
+    fn japanese_scancodes_reach_distinct_evdev_keys() {
+        for (scan, evdev) in [(0x70, 93), (0x73, 89), (0x79, 92), (0x7b, 94), (0x7d, 124)] {
+            assert_eq!(evdev_key(scan, false), Some(evdev));
+            assert_eq!(evdev_key(scan, true), None);
+        }
     }
     #[test]
     fn shm_bounds_reject_malicious_dimensions_and_stride() {

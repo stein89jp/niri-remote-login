@@ -91,6 +91,12 @@ static void key(void*d,struct wl_keyboard*k,uint32_t s,uint32_t time,uint32_t co
         xkb_keysym_t sym=xkb_state_key_get_one_sym(a->xkb_state,code+8);
         printf("KEYSYM %u\n",sym);
         if(sym==XKB_KEY_Escape)a->typed_length=0;
+        else if(sym==XKB_KEY_BackSpace){
+            if(a->typed_length){
+                do { a->typed_length--; }
+                while(a->typed_length && ((unsigned char)a->typed[a->typed_length]&0xc0)==0x80);
+            }
+        }
         else if(sym==XKB_KEY_Return){
             a->typed[a->typed_length]='\0';printf("XKB_TEXT %s\n",a->typed);a->typed_length=0;
         }else{

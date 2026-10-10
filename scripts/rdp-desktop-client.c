@@ -108,8 +108,8 @@ static BOOL contains_color(rdpGdi *gdi, BYTE b, BYTE g, BYTE r) {
 static BOOL login_text(rdpContext *ctx, const char *text) {
     /* Exercise ordinary mstsc scancode input. Fixture credentials are ASCII. */
     static const struct { UINT16 first; const char *normal, *shifted; } rows[] = {
-        {2, "1234567890-=", "!@#$%^&*()_+"}, {16, "qwertyuiop[]", "QWERTYUIOP{}"},
-        {30, "asdfghjkl;'`", "ASDFGHJKL:\"~"}, {43, "\\", "|"},
+        {2, "1234567890-^", "!\"#$%&'()~=~"}, {16, "qwertyuiop@[", "QWERTYUIOP`{"},
+        {30, "asdfghjkl;:", "ASDFGHJKL+*"}, {43, "]", "}"},
         {44, "zxcvbnm,./", "ZXCVBNM<>?"}, {57, " ", " "}
     };
     for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
@@ -126,6 +126,11 @@ static BOOL login_text(rdpContext *ctx, const char *text) {
             (shift && !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_RELEASE, 42))) return FALSE;
     }
     return TRUE;
+}
+
+static BOOL unicode_unit(rdpContext *ctx, UINT16 unit) {
+    return freerdp_input_send_unicode_keyboard_event(ctx->input, 0, unit) &&
+        freerdp_input_send_unicode_keyboard_event(ctx->input, KBD_FLAGS_RELEASE, unit);
 }
 
 static BOOL login_key(rdpContext *ctx, UINT16 code) {
@@ -182,6 +187,19 @@ static BOOL end_paint(rdpContext *ctx) {
         // The Wayland fixture decodes this with the advertised XKB keymap.
         if (getenv("NIRI_RDP_TEST_KEYBOARD")) {
             if (!login_key(ctx, 1) || !login_text(ctx, "abc123ABc") || !login_key(ctx, 28) ||
+                !login_text(ctx, "@\"^&:[]") || !login_key(ctx, 0x73) ||
+                !login_key(ctx, 0x7d) || !login_key(ctx, 28) ||
+                !login_key(ctx, 0x70) || !login_key(ctx, 0x79) || !login_key(ctx, 0x7b)) return FALSE;
+            /* Mobile-style UTF-16, including releases between surrogate halves.
+             * Held Shift must survive text injection and physical-key resumption. */
+            static const UINT16 phone[] = {'P', 'h', 'o', 'n', 'e', '@', '"', 0x65e5, 0x672c, 0xd83d, 0xde00};
+            if (!freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_DOWN, 42)) return FALSE;
+            for (unsigned i = 0; i < sizeof(phone) / sizeof(phone[0]); i++)
+                if (!unicode_unit(ctx, phone[i])) return FALSE;
+            if (!unicode_unit(ctx, 'x') || !unicode_unit(ctx, 'x') ||
+                !unicode_unit(ctx, 8) || !unicode_unit(ctx, 8) || !login_key(ctx, 30) ||
+                !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_RELEASE, 42) ||
+                !login_text(ctx, "a@") || !unicode_unit(ctx, '\r') ||
                 !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_EXTENDED | KBD_FLAGS_DOWN, 0x5b) ||
                 !login_key(ctx, 32) ||
                 !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_EXTENDED | KBD_FLAGS_RELEASE, 0x5b))

@@ -55,11 +55,11 @@ encoder listed by FFmpeg alone proves only that the software was built with it.
 Inspect service/UID before terminating any session. Monitor-off is not suspend;
 keep the test machine awake without modifying the working host's power policy.
 
-Single-session frontend, US physical-key input, normal transform and scale 1 are
+Single-session frontend, Japanese JP106 physical-key input, normal transform and scale 1 are
 the current contract. The frontend follows client-selected initial dimensions
 and supports live single-display resolution requests through Display Control.
 Rebuild both packages; see the [resolution contract](../bridge/README.md#dynamic-resolution). No
-multi-monitor, clipboard, audio or Unicode/IME claim is made. Broker mode retains
+multi-monitor, clipboard, audio or remote IME composition claim is made. Broker mode retains
 desktops for authenticated reconnect; installed PAM/logind and Windows validation
 of that behavior remains pending.
 The optional host encoder uses H.264 AVC420; it does not enable host-side NVDEC

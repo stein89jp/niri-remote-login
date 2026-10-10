@@ -37,6 +37,7 @@ struct State {
     password_focus: bool,
     shift: [bool; 2],
     caps: bool,
+    unicode: crate::keyboard::UnicodeInput,
     synchronize: Option<KeyboardEvent>,
     control: [bool; 2],
     alt: [bool; 2],
@@ -77,6 +78,7 @@ impl Login {
                 password: Password::default(),
                 shift: [false; 2],
                 caps: false,
+                unicode: Default::default(),
                 synchronize: None,
                 control: [false; 2],
                 alt: [false; 2],
@@ -236,6 +238,9 @@ impl RdpServerInputHandler for Login {
         if let KeyboardEvent::Pressed { code, extended }
         | KeyboardEvent::Released { code, extended } = &event
         {
+            if matches!(event, KeyboardEvent::Pressed { .. }) {
+                self.state.lock().unwrap().unicode = Default::default();
+            }
             if *code == 29 || *code == 56 {
                 let down = matches!(event, KeyboardEvent::Pressed { .. });
                 let mut state = self.state.lock().unwrap();
@@ -257,8 +262,20 @@ impl RdpServerInputHandler for Login {
                 extended: false,
             } => (code, false),
             KeyboardEvent::UnicodePressed(value) => {
-                if let Some(character) = char::from_u32(u32::from(value)) {
-                    self.character(character);
+                let character = self.state.lock().unwrap().unicode.press(value);
+                if let Some(character) = character {
+                    match character {
+                        '\r' | '\n' => self.submit(),
+                        '\t' => self.keyboard(KeyboardEvent::Pressed {
+                            code: 15,
+                            extended: false,
+                        }),
+                        '\u{8}' => self.keyboard(KeyboardEvent::Pressed {
+                            code: 14,
+                            extended: false,
+                        }),
+                        _ => self.character(character),
+                    }
                 }
                 return;
             }
@@ -312,7 +329,7 @@ impl RdpServerInputHandler for Login {
             58 => state.caps = !state.caps,
             _ => {
                 let character =
-                    us_character(code, state.shift.iter().any(|shift| *shift), state.caps);
+                    jp_character(code, state.shift.iter().any(|shift| *shift), state.caps);
                 drop(state);
                 if let Some(character) = character {
                     self.character(character);
@@ -433,12 +450,14 @@ impl RdpServerDisplayUpdates for Updates {
         }
     }
 }
-fn us_character(code: u8, shift: bool, caps: bool) -> Option<char> {
+fn jp_character(code: u8, shift: bool, caps: bool) -> Option<char> {
     let (normal, shifted): (&[u8], &[u8]) = match code {
-        2..=13 => (b"1234567890-=", b"!@#$%^&*()_+"),
-        16..=27 => (b"qwertyuiop[]", b"QWERTYUIOP{}"),
-        30..=41 => (b"asdfghjkl;'`", b"ASDFGHJKL:\"~"),
-        43 => (b"\\".as_slice(), b"|".as_slice()),
+        2..=13 => (b"1234567890-^", b"!\"#$%&'()~=~"),
+        16..=27 => (b"qwertyuiop@[", b"QWERTYUIOP`{"),
+        30..=40 => (b"asdfghjkl;:", b"ASDFGHJKL+*"),
+        43 => (b"]".as_slice(), b"}".as_slice()),
+        0x73 => return Some(if shift { '_' } else { '\\' }),
+        0x7d => return Some(if shift { '|' } else { '\\' }),
         44..=53 => (b"zxcvbnm,./".as_slice(), b"ZXCVBNM<>?".as_slice()),
         57 => return Some(' '),
         _ => return None,
@@ -446,7 +465,7 @@ fn us_character(code: u8, shift: bool, caps: bool) -> Option<char> {
     let base = match code {
         2..=13 => 2,
         16..=27 => 16,
-        30..=41 => 30,
+        30..=40 => 30,
         43 => 43,
         _ => 44,
     };
@@ -537,7 +556,7 @@ fn render(state: &State) -> anyhow::Result<ironrdp_server::BitmapUpdate> {
         if state.failed {
             "Login failed. Try again."
         } else {
-            "Tab switches fields. US keyboard."
+            "Tab switches fields. JP106 keyboard."
         },
         [200, 200, 200],
     );
@@ -686,7 +705,43 @@ mod tests {
     }
 
     #[test]
-    fn form_handles_us_keyboard_focus_mouse_and_bounded_secrets() {
+    fn phone_unicode_login_preserves_text_surrogates_and_edit_keys() {
+        let mut login = login("alice");
+        for unit in "@\"日本😀".encode_utf16() {
+            login.keyboard(KeyboardEvent::UnicodePressed(unit));
+            login.keyboard(KeyboardEvent::UnicodeReleased(unit));
+        }
+        assert_eq!(login.state.lock().unwrap().password.0, "@\"日本😀");
+        login.keyboard(KeyboardEvent::UnicodePressed(8));
+        assert_eq!(login.state.lock().unwrap().password.0, "@\"日本");
+        login.keyboard(KeyboardEvent::UnicodePressed(9));
+        login.keyboard(KeyboardEvent::UnicodePressed(u16::from(b'x')));
+        assert_eq!(login.state.lock().unwrap().username, "alicex");
+        login.stop();
+        assert!(login.state.lock().unwrap().password.0.is_empty());
+    }
+    #[test]
+    fn japanese_login_punctuation_matches_jis_keys() {
+        for (code, normal, shifted) in [
+            (3, '2', '"'),
+            (7, '6', '&'),
+            (12, '-', '='),
+            (13, '^', '~'),
+            (26, '@', '`'),
+            (27, '[', '{'),
+            (39, ';', '+'),
+            (40, ':', '*'),
+            (43, ']', '}'),
+            (0x73, '\\', '_'),
+            (0x7d, '\\', '|'),
+        ] {
+            assert_eq!(jp_character(code, false, false), Some(normal));
+            assert_eq!(jp_character(code, true, false), Some(shifted));
+        }
+        assert_eq!(jp_character(41, false, false), None);
+    }
+    #[test]
+    fn form_handles_jp_keyboard_focus_mouse_and_bounded_secrets() {
         let mut login = login("");
         for code in [30, 38, 23, 46, 18, 15] {
             key(&mut login, code);

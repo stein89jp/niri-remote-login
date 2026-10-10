@@ -602,8 +602,35 @@ fn pump(
     Ok(())
 }
 
+use crate::keyboard::UnicodeInput;
+
+fn unicode_keymap(character: char) -> String {
+    let symbol = match character {
+        '\u{8}' => "BackSpace".into(),
+        '\t' => "Tab".into(),
+        '\r' | '\n' => "Return".into(),
+        '\u{1b}' => "Escape".into(),
+        '\u{7f}' => "Delete".into(),
+        _ => format!("0x{:08x}", 0x01000000 | character as u32),
+    };
+    // A one-level map commits exact text, independently of Shift or CapsLock.
+    // The caller restores the physical keymap and modifiers after the tap.
+    format!(
+        r#"xkb_keymap {{
+        xkb_keycodes {{ minimum = 8; maximum = 255; <TEXT> = 255; }};
+        xkb_types {{ type "ONE_LEVEL" {{ modifiers = None; level_name[Level1] = "Any"; }}; }};
+        xkb_compatibility {{ }};
+        xkb_symbols {{ key <TEXT> {{ type = "ONE_LEVEL", [ {symbol} ] }}; }};
+    }};"#
+    )
+}
+
 struct Input {
     keyboard: ZwpVirtualKeyboardV1,
+    text_keyboard: ZwpVirtualKeyboardV1,
+    physical_keymap: std::fs::File,
+    physical_keymap_size: u32,
+    unicode: UnicodeInput,
     pointer: ZwlrVirtualPointerV1,
     xkb: xkb::State,
     keys: BTreeSet<u32>,
@@ -647,6 +674,7 @@ impl Input {
     fn key_event(&mut self, e: KeyboardEvent) {
         match e {
             KeyboardEvent::Pressed { code, extended } => {
+                self.unicode = UnicodeInput::default();
                 if let Some(k) = evdev_key(code, extended) {
                     self.key(k, true)
                 }
@@ -676,10 +704,42 @@ impl Input {
                 );
                 self.modifiers();
             }
-            // Unicode has no hardware-key identity. Reject it rather than mapping
-            // UTF-16 values to unrelated physical keys; IME support remains pending.
-            KeyboardEvent::UnicodePressed(_) | KeyboardEvent::UnicodeReleased(_) => {}
+            KeyboardEvent::UnicodePressed(unit) => {
+                if let Some(character) = self.unicode.press(unit) {
+                    if let Err(error) = self.text(character) {
+                        eprintln!("cannot inject Unicode keyboard input: {error}");
+                    }
+                }
+            }
+            // Unicode input describes committed text, rather than a held physical
+            // key. Each completed scalar is sent as a balanced tap immediately.
+            KeyboardEvent::UnicodeReleased(_) => {}
         }
+    }
+    fn text(&self, character: char) -> anyhow::Result<()> {
+        let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let km = xkb::Keymap::new_from_string(
+            &ctx,
+            unicode_keymap(character),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .ok_or_else(|| anyhow::anyhow!("Unicode XKB keymap unavailable"))?;
+        let mut file = tempfile::tempfile()?;
+        let mut text = km.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
+        text.push('\0');
+        file.write_all(text.as_bytes())?;
+        self.text_keyboard
+            .keymap(1, file.as_fd(), text.len() as u32);
+        self.text_keyboard.modifiers(0, 0, 0, 0);
+        self.text_keyboard.key(self.time(), 247, 1);
+        self.text_keyboard.key(self.time(), 247, 0);
+        // Niri's protocol adapter uses one seat keymap for virtual devices.
+        // Restore it in protocol order before any subsequent hardware event.
+        self.keyboard
+            .keymap(1, self.physical_keymap.as_fd(), self.physical_keymap_size);
+        self.modifiers();
+        Ok(())
     }
     fn move_to(&mut self, x: u32, y: u32) {
         let x = x.min(u32::from(self.target.width) - 1);
@@ -767,6 +827,7 @@ impl Input {
         self.pointer.frame();
     }
     fn release(&mut self) {
+        self.unicode = UnicodeInput::default();
         for k in self.keys.clone() {
             self.key(k, false);
         }
@@ -899,6 +960,11 @@ fn run(
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("missing virtual keyboard protocol"))?
         .create_virtual_keyboard(seat, &h, ());
+    let text_keyboard = s
+        .keyboard_manager
+        .as_ref()
+        .unwrap()
+        .create_virtual_keyboard(seat, &h, ());
     let pm = s
         .pointer_manager
         .as_ref()
@@ -912,13 +978,13 @@ fn run(
     let km = xkb::Keymap::new_from_names(
         &ctx,
         "evdev",
-        "pc105",
-        "us",
+        "jp106",
+        "jp",
         "",
         None,
         xkb::KEYMAP_COMPILE_NO_FLAGS,
     )
-    .ok_or_else(|| anyhow::anyhow!("XKB US keymap unavailable"))?;
+    .ok_or_else(|| anyhow::anyhow!("XKB Japanese jp106 keymap unavailable"))?;
     let mut keymap = tempfile::tempfile()?;
     let mut text = km.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
     text.push('\0');
@@ -926,6 +992,10 @@ fn run(
     keyboard.keymap(1, keymap.as_fd(), text.len() as u32);
     let mut input = Input {
         keyboard,
+        text_keyboard,
+        physical_keymap: keymap,
+        physical_keymap_size: text.len() as u32,
+        unicode: UnicodeInput::default(),
         pointer,
         xkb: xkb::State::new(&km),
         keys: BTreeSet::new(),
@@ -1053,6 +1123,7 @@ fn run(
     })();
     input.release();
     input.keyboard.destroy();
+    input.text_keyboard.destroy();
     input.pointer.destroy();
     // A successful flush only hands bytes to the socket. Await wl_display.sync
     // so Niri processes releases/destruction before this client socket closes;
@@ -1085,6 +1156,88 @@ mod lifecycle_tests {
     use super::*;
     use crate::bitmap;
     use std::io::Read;
+    #[test]
+    fn jp106_keymap_preserves_jis_punctuation_and_extra_keys() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let km = xkb::Keymap::new_from_names(
+            &context,
+            "evdev",
+            "jp106",
+            "jp",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        let mut state = xkb::State::new(&km);
+        for (evdev, character) in [
+            (26u32, "@"),
+            (27, "["),
+            (39, ";"),
+            (40, ":"),
+            (43, "]"),
+            (89, "\\"),
+            (124, "\\"),
+        ] {
+            assert_eq!(state.key_get_utf8((evdev + 8).into()), character);
+        }
+        state.update_key(50u32.into(), xkb::KeyDirection::Down);
+        for (evdev, character) in [(3u32, "\""), (89, "_"), (124, "|")] {
+            assert_eq!(state.key_get_utf8((evdev + 8).into()), character);
+        }
+    }
+    #[test]
+    fn unicode_input_decodes_utf16_and_recovers_from_malformed_pairs() {
+        let mut input = UnicodeInput::default();
+        assert_eq!(input.press(0x3042), Some('あ'));
+        assert_eq!(input.press(0xd83d), None);
+        assert_eq!(input.press(0xde00), Some('😀'));
+        assert_eq!(input.press(0xde00), None);
+        assert_eq!(input.press(0xd83d), None);
+        assert_eq!(input.press(b'a' as u16), Some('a'));
+        assert_eq!(input.press(0xde00), None);
+        assert_eq!(input.press(0xd800), None);
+        assert_eq!(input.press(0xd83d), None);
+        assert_eq!(input.press(0xde00), Some('😀'));
+        assert_eq!(input.press(0), None);
+    }
+    #[test]
+    fn unicode_keymap_produces_exact_text_without_modifiers() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        for character in ['a', 'A', '@', 'あ', '漢', '😀'] {
+            let km = xkb::Keymap::new_from_string(
+                &context,
+                unicode_keymap(character),
+                xkb::KEYMAP_FORMAT_TEXT_V1,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+            .unwrap();
+            let state = xkb::State::new(&km);
+            assert_eq!(state.key_get_utf8(255u32.into()), character.to_string());
+            assert_eq!(state.serialize_mods(xkb::STATE_MODS_EFFECTIVE), 0);
+        }
+        for (character, symbol) in [
+            ('\t', "Tab"),
+            ('\r', "Return"),
+            ('\n', "Return"),
+            ('\u{8}', "BackSpace"),
+            ('\u{1b}', "Escape"),
+            ('\u{7f}', "Delete"),
+        ] {
+            let km = xkb::Keymap::new_from_string(
+                &context,
+                unicode_keymap(character),
+                xkb::KEYMAP_FORMAT_TEXT_V1,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+            .unwrap();
+            let state = xkb::State::new(&km);
+            assert_eq!(
+                xkb::keysym_get_name(state.key_get_one_sym(255u32.into())),
+                symbol
+            );
+        }
+    }
     #[test]
     fn layout_accepts_portrait_and_odd_height_but_rejects_unsupported_sizes() {
         for (width, height, accepted) in [

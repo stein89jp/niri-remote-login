@@ -337,3 +337,40 @@ NVENC remain machine checks; these results do not claim those checks passed.
 
 Both headless compositor library regressions passed on the rebuilt source
 (`cargo test --locked --offline --no-default-features --lib backend::headless`).
+
+## Japanese layout and phone Unicode input (2026-10-11)
+
+Validation passed: 47 bridge library tests plus one frontend test, 22 Python
+tests (one optional transport test skipped), and the real-compositor RDP
+integration using both debug and release frontends. The release binary's host
+shared-library dependencies resolve successfully.
+
+The remote bridge now uses `evdev` / `jp106` / `jp`, matching the host's
+`/etc/X11/xorg.conf.d/00-keyboard.conf`. Login punctuation uses the same JIS
+positions. Japanese Ro, Yen, Hiragana/Katakana, Henkan and Muhenkan scan codes
+map to their Linux evdev keys.
+
+The FreeRDP fixture sends physical `abc123ABc`, JIS punctuation, Ro/Yen and
+conversion keys, then phone-style Unicode presses/releases containing Japanese
+and emoji with interleaved UTF-16 surrogate releases. The real Wayland fixture
+decodes `@"^&:[]` plus two backslashes and `Phone@"日本😀Aa@` exactly. This
+also exercises repeated Unicode presses, Backspace, Unicode Enter, Shift held
+across text injection, resumed physical typing, reconnect and disconnect
+release. Results: `artifacts/jp106-phone-keyboard-integration.json`.
+
+Unicode uses balanced taps through a temporary one-level keymap; the physical
+JP106 keymap and modifiers are restored after every scalar. Mobile IME
+composition happens in the client; remote IME composition is outside this
+change. Actual phone app and Windows hardware/client checks still require the
+user's devices. The automated test verifies both RDP event paths through the
+compositor into an application, rather than merely checking server receipt.
+
+Build the frontend using the repository's cached dependencies:
+
+```sh
+CARGO_HOME="$PWD/poc/.cargo-cache" cargo build --release --locked --offline --manifest-path bridge/Cargo.toml
+```
+
+System deployment requires root. An installed frontend continues using the
+old binary until it is updated and restarted. The package rebuild workflow in
+`docs/upgrade.md` includes the new `bridge/src/keyboard.rs` automatically.
