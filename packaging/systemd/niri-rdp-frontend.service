@@ -1,0 +1,35 @@
+[Unit]
+Description=Loopback Niri RDP login frontend
+Requires=niri-rdp-broker.service
+After=niri-rdp-broker.service
+
+[Service]
+Type=simple
+User=niri-rdp
+Group=niri-rdp
+EnvironmentFile=/etc/niri-rdp/frontend.conf
+LoadCredential=tls-cert:/etc/niri-rdp/tls/cert.pem
+LoadCredential=tls-key:/etc/niri-rdp/tls/key.pem
+ExecStart=/usr/lib/niri-rdp/niri-rdp-bridge
+Restart=on-failure
+RestartSec=3
+UMask=0077
+NoNewPrivileges=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+RestrictAddressFamilies=AF_UNIX AF_INET
+IPAddressDeny=any
+IPAddressAllow=localhost
+LimitCORE=0
+TasksMax=64
+MemoryMax=512M
+
+[Install]
+WantedBy=multi-user.target

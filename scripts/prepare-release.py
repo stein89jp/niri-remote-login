@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Create audited local-source makepkg bundles, never install or start services."""
+import argparse
+import gzip
+import hashlib
+import json
+from pathlib import Path
+import tarfile
+import shutil
+
+ROOT = Path(__file__).resolve().parents[1]
+VERSION = "0.1.0"
+INCLUDE = ("LICENSE", "README.md", "Makefile", "bridge", "broker", "docs", "checkpoints", "scripts", "packaging", "compositor/README.md", "compositor/CHECKPOINT.md", "compositor/pins.json", "compositor/patches", "lab", "poc", "prototype", "tests", "research")
+EXCLUDE = {"target", ".cargo-cache", "cargo-home", "__pycache__", ".git", "build", "private", "sysroot", "downloads", "results", "generated"}
+
+
+def selected_files():
+    for entry in INCLUDE:
+        path = ROOT / entry
+        if not path.exists():
+            raise RuntimeError(f"missing release input: {entry}")
+        files = [path] if path.is_file() else sorted(path.rglob("*"))
+        for item in files:
+            relative = item.relative_to(ROOT)
+            if any(part in EXCLUDE for part in relative.parts):
+                continue
+            if item.is_symlink():
+                raise RuntimeError(f"release input must not be a symlink: {relative}")
+            if item.is_file() and item.suffix not in {".pyc", ".o"}:
+                # Generated executables are not sources.
+                if item.read_bytes()[:4] == b"\x7fELF":
+                    continue
+                yield item
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--output", type=Path, default=ROOT / "artifacts" / "release")
+    args = parser.parse_args()
+    out = args.output.resolve()
+    out.mkdir(parents=True, exist_ok=True)
+    package = out / "niri-remote-login"
+    package.mkdir(exist_ok=True)
+    archive = package / f"niri-remote-login-{VERSION}.tar.gz"
+    manifest = {}
+    with archive.open("wb") as raw, gzip.GzipFile(filename="", mode="wb", fileobj=raw, mtime=0) as gz:
+        with tarfile.open(fileobj=gz, mode="w|") as tar:
+            for item in selected_files():
+                relative = item.relative_to(ROOT).as_posix()
+                manifest[relative] = hashlib.sha256(item.read_bytes()).hexdigest()
+                info = tar.gettarinfo(str(item), f"niri-remote-login-{VERSION}/{relative}")
+                info.uid = info.gid = 0
+                info.uname = info.gname = "root"
+                info.mtime = 0
+                with item.open("rb") as stream:
+                    tar.addfile(info, stream)
+    digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    template = (ROOT / "packaging/arch/niri-remote-login/PKGBUILD").read_text()
+    (package / "PKGBUILD").write_text(template.replace("@SOURCE_SHA256@", digest))
+    headless = out / "niri-rdp-headless"
+    headless.mkdir(exist_ok=True)
+    for item in (ROOT / "packaging/arch/niri-rdp-headless").iterdir():
+        if item.is_file():
+            shutil.copy2(item, headless / item.name)
+    patches = ROOT / "compositor/patches"
+    if patches.exists():
+        for item in patches.glob("*.patch"):
+            shutil.copy2(item, headless / item.name)
+    patch = headless / "0001-remote-headless-bounds-and-startup.patch"
+    if not patch.exists():
+        raise RuntimeError("missing required headless patch")
+    template = (headless / "PKGBUILD").read_text()
+    licenses = ROOT / "scripts/collect-licenses.py"
+    shutil.copy2(licenses, headless / licenses.name)
+    (headless / "PKGBUILD").write_text(template.replace(
+        "@PATCH_SHA256@", hashlib.sha256(patch.read_bytes()).hexdigest()).replace(
+        "@LICENSE_SCRIPT_SHA256@", hashlib.sha256(licenses.read_bytes()).hexdigest()))
+    (out / "source-manifest.json").write_text(json.dumps({
+        "version": VERSION, "archive_sha256": digest, "files": manifest,
+        "status": "source build bundle; installation and boot acceptance require separate Arch test machine",
+    }, indent=2) + "\n")
+    print(f"Prepared source packages in {out}; no installation performed")
+
+
+if __name__ == "__main__":
+    main()

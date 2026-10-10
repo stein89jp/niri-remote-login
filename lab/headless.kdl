@@ -1,0 +1,17 @@
+output "HEADLESS-1" {
+    scale 1
+    transform "normal"
+    position x=0 y=0
+}
+input {
+    keyboard {
+        xkb {
+            layout "us"
+        }
+    }
+    focus-follows-mouse
+}
+layout {
+    default-column-width { proportion 1.0; }
+    background-color "#203040"
+}

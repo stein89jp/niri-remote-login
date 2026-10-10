@@ -1,0 +1,2 @@
+u niri-rdp - "Niri RDP frontend" /var/empty /usr/bin/nologin
+g niri-rdp-users -

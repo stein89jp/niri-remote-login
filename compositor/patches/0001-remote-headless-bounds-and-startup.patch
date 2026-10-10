@@ -1,0 +1,211 @@
+diff --git a/src/backend/headless.rs b/src/backend/headless.rs
+index b45dd03c..2e1549e4 100644
+--- a/src/backend/headless.rs
++++ b/src/backend/headless.rs
+@@ -13,13 +13,13 @@ use std::time::Duration;
+ use anyhow::Context as _;
+ use niri_config::OutputName;
+ use smithay::backend::allocator::dmabuf::Dmabuf;
+-use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+ use smithay::backend::egl::native::EGLSurfacelessDisplay;
+ use smithay::backend::egl::{EGLContext, EGLDisplay};
+ use smithay::backend::renderer::element::RenderElementStates;
+ use smithay::backend::renderer::gles::GlesRenderer;
+ use smithay::backend::renderer::ImportDma;
+ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
++use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+ use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+ use smithay::utils::Size;
+ use smithay::wayland::presentation::Refresh;
+@@ -139,8 +139,7 @@ impl Headless {
+     }
+ 
+     pub fn remove_virtual_output(&mut self, niri: &mut Niri, name: &str) -> Result<(), String> {
+-        self.virtual_outputs
+-            .remove(niri, &self.ipc_outputs, name)
++        self.virtual_outputs.remove(niri, &self.ipc_outputs, name)
+     }
+ 
+     pub fn seat_name(&self) -> String {
+@@ -208,7 +207,8 @@ impl Headless {
+                 if output_state.unfinished_animations_remain {
+                     data.niri.queue_redraw(&output_clone);
+                 } else {
+-                    data.niri.send_frame_callbacks_for_virtual_output(&output_clone);
++                    data.niri
++                        .send_frame_callbacks_for_virtual_output(&output_clone);
+                 }
+                 TimeoutAction::Drop
+             })
+@@ -241,3 +241,80 @@ impl Default for Headless {
+         Self::new()
+     }
+ }
++
++#[cfg(test)]
++mod remote_tests {
++    use calloop::EventLoop;
++    use niri_config::Config;
++    use smithay::reexports::wayland_server::Display;
++
++    use crate::niri::State;
++
++    #[test]
++    fn virtual_output_rejection_is_atomic_and_capacity_recovers_after_removal() {
++        let event_loop = EventLoop::<State>::try_new().unwrap();
++        let mut state = State::new(
++            Config::default(),
++            event_loop.handle(),
++            event_loop.get_signal(),
++            Display::new().unwrap(),
++            true,
++            false,
++            false,
++        )
++        .unwrap();
++        for (width, height, rate) in [
++            (0, 480, 60),
++            (640, 0, 60),
++            (8193, 480, 60),
++            (640, 8193, 60),
++            (640, 480, 0),
++            (640, 480, 241),
++        ] {
++            assert!(state
++                .backend
++                .create_virtual_output(&mut state.niri, width, height, rate)
++                .is_err());
++            assert_eq!(state.niri.global_space.outputs().count(), 0);
++            assert!(state.backend.ipc_outputs().lock().unwrap().is_empty());
++        }
++        let mut names = Vec::new();
++        for _ in 0..4 {
++            names.push(
++                state
++                    .backend
++                    .create_virtual_output(&mut state.niri, 640, 480, 60)
++                    .unwrap(),
++            );
++        }
++        assert_eq!(names[0], "HEADLESS-1");
++        assert!(state
++            .backend
++            .create_virtual_output(&mut state.niri, 640, 480, 60)
++            .is_err());
++        assert_eq!(state.niri.global_space.outputs().count(), 4);
++        state
++            .backend
++            .remove_virtual_output(&mut state.niri, &names[0])
++            .unwrap();
++        assert!(state
++            .backend
++            .remove_virtual_output(&mut state.niri, &names[0])
++            .is_err());
++        let replacement = state
++            .backend
++            .create_virtual_output(&mut state.niri, 640, 480, 60)
++            .unwrap();
++        assert_eq!(replacement, "HEADLESS-5");
++        names.remove(0);
++        names.push(replacement);
++        for name in names {
++            state
++                .backend
++                .remove_virtual_output(&mut state.niri, &name)
++                .unwrap();
++        }
++        assert_eq!(state.niri.global_space.outputs().count(), 0);
++        assert!(state.backend.ipc_outputs().lock().unwrap().is_empty());
++    }
++}
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index d40c4288..2d78e368 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -6,8 +6,8 @@ use niri_config::{Config, ModKey, OutputName};
+ use smithay::backend::allocator::dmabuf::Dmabuf;
+ use smithay::backend::renderer::gles::GlesRenderer;
+ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+-use smithay::utils::Size;
+ use smithay::reexports::wayland_server::protocol::wl_surface::WlSurface;
++use smithay::utils::Size;
+ 
+ use crate::niri::Niri;
+ use crate::utils::id::IdCounter;
+@@ -82,14 +82,25 @@ impl VirtualOutputs {
+         height: u16,
+         refresh_rate: u32,
+     ) -> Result<String, String> {
++        // Bound allocations for remotely controlled output creation.  u16 alone
++        // permits outputs large enough to exhaust memory during SHM capture.
++        if width == 0 || height == 0 || width > 8192 || height > 8192 {
++            return Err("virtual output dimensions must be in 1..=8192".into());
++        }
++        if self.outputs.len() >= 4 {
++            return Err("at most four virtual outputs are supported".into());
++        }
+         if refresh_rate == 0 {
+             return Err("refresh rate must be greater than 0".into());
+         }
+-        if refresh_rate > 1000 {
+-            return Err("refresh rate must be 1000 Hz or less".into());
++        if refresh_rate > 240 {
++            return Err("refresh rate must be 240 Hz or less".into());
+         }
+ 
+-        self.counter += 1;
++        self.counter = self
++            .counter
++            .checked_add(1)
++            .ok_or_else(|| "virtual output identifier exhausted".to_string())?;
+         let n = self.counter;
+ 
+         let connector = format!("HEADLESS-{n}");
+@@ -97,8 +108,7 @@ impl VirtualOutputs {
+         let model = "virtual".to_string();
+         let serial = n.to_string();
+ 
+-        let refresh =
+-            i32::try_from(u64::from(refresh_rate).saturating_mul(1000)).unwrap_or(60_000);
++        let refresh = i32::try_from(u64::from(refresh_rate).saturating_mul(1000)).unwrap_or(60_000);
+ 
+         let output = Output::new(
+             connector.clone(),
+diff --git a/src/niri.rs b/src/niri.rs
+index a65e36cb..52b9ead3 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -743,12 +743,13 @@ impl State {
+ 
+         if headless && create_wayland_socket {
+             if let Backend::Headless(headless) = &mut state.backend {
+-                if let Err(err) = headless.add_renderer() {
+-                    warn!("failed to initialize headless renderer: {err:?}");
+-                }
++                headless
++                    .add_renderer()
++                    .context("failed to initialize headless renderer")?;
+                 headless
+                     .create_virtual_output(&mut state.niri, 1920, 1080, 60)
+-                    .unwrap();
++                    .map_err(anyhow::Error::msg)
++                    .context("failed to create default headless output")?;
+             }
+         }
+ 
+@@ -2443,7 +2444,14 @@ impl Niri {
+             .unwrap();
+ 
+         let socket_name = create_wayland_socket.then(|| {
+-            let socket_source = ListeningSocketSource::new_auto().unwrap();
++            // A remote headless session has a broker-owned private runtime directory.
++            // Bind a deterministic socket there; never discover a local desktop socket.
++            let socket_source = if matches!(backend, Backend::Headless(_)) {
++                ListeningSocketSource::with_name("wayland-0")
++            } else {
++                ListeningSocketSource::new_auto()
++            }
++            .expect("failed to bind Wayland socket");
+             let socket_name = socket_source.socket_name().to_os_string();
+             event_loop
+                 .insert_source(socket_source, move |client, _, state| {

@@ -1,0 +1,12 @@
+#!/bin/sh
+# Only the root broker launches this fixed executable after switching UID.
+set -eu
+: "${NIRI_RDP_RUNTIME_DIR:?broker private session directory missing}"
+# logind retains its genuine /run/user/UID registration. The compositor and
+# applications use a private runtime so no local Wayland or desktop bus is reused.
+export XDG_RUNTIME_DIR="$NIRI_RDP_RUNTIME_DIR"
+export NIRI_BACKEND=headless
+export LIBGL_ALWAYS_SOFTWARE=1
+export GALLIUM_DRIVER=llvmpipe
+unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET NIRI_SOCKET SSH_AUTH_SOCK
+exec /usr/lib/niri-rdp/niri-headless --config /etc/niri-rdp/headless.kdl

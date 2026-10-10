@@ -1,0 +1,84 @@
+{
+  "niri-wm/niri": {
+    "commit": "2c82b77a7116a1241ea2fd41dd008ff00b609aae",
+    "committed_at": "2026-10-08T06:32:00Z",
+    "files": {
+      "src/backend/mod.rs": {
+        "url": "https://raw.githubusercontent.com/niri-wm/niri/2c82b77a7116a1241ea2fd41dd008ff00b609aae/src/backend/mod.rs",
+        "bytes": 7187,
+        "sha256": "5281827910677965d65eceda9d0f7540d4bd43609ce608936b2435f411b54251"
+      },
+      "src/backend/headless.rs": {
+        "url": "https://raw.githubusercontent.com/niri-wm/niri/2c82b77a7116a1241ea2fd41dd008ff00b609aae/src/backend/headless.rs",
+        "bytes": 5646,
+        "sha256": "38e962c574a5f30ab3923aaed0318ccf835cac4ea67d6b7cc56e0128ef50d5e4"
+      },
+      "src/main.rs": {
+        "url": "https://raw.githubusercontent.com/niri-wm/niri/2c82b77a7116a1241ea2fd41dd008ff00b609aae/src/main.rs",
+        "bytes": 14462,
+        "sha256": "e9a2068bb144c210f726344cdd59b23317bca74fe8bd58f21c24f01a132f30b0"
+      },
+      "src/protocols/mod.rs": {
+        "url": "https://raw.githubusercontent.com/niri-wm/niri/2c82b77a7116a1241ea2fd41dd008ff00b609aae/src/protocols/mod.rs",
+        "bytes": 342,
+        "sha256": "ebe6c7b83a81bcc50dd1e717b7c66af6eb1a0985a25d717c7af446f42c868ee9"
+      },
+      "src/niri.rs": {
+        "url": "https://raw.githubusercontent.com/niri-wm/niri/2c82b77a7116a1241ea2fd41dd008ff00b609aae/src/niri.rs",
+        "bytes": 276234,
+        "sha256": "10adaf5b3beb365a3686d5cbe7ae51c7777051839db016dbdf9d7064b25c47e0"
+      },
+      "src/input/mod.rs": {
+        "url": "https://raw.githubusercontent.com/niri-wm/niri/2c82b77a7116a1241ea2fd41dd008ff00b609aae/src/input/mod.rs",
+        "bytes": 224025,
+        "sha256": "487b322317d928de33922bcf9d8fe80904abd1972cc279adffeb7b4086593ebf"
+      },
+      "src/ipc/server.rs": {
+        "url": "https://raw.githubusercontent.com/niri-wm/niri/2c82b77a7116a1241ea2fd41dd008ff00b609aae/src/ipc/server.rs",
+        "bytes": 36446,
+        "sha256": "89a57ace7dc8157cc6d1840ed835268763f6e82d0667a1314e6ad29114def651"
+      },
+      "niri-ipc/src/lib.rs": {
+        "url": "https://raw.githubusercontent.com/niri-wm/niri/2c82b77a7116a1241ea2fd41dd008ff00b609aae/niri-ipc/src/lib.rs",
+        "bytes": 78136,
+        "sha256": "5ab49874c580e1aa381ee1a714d9fc3caeb3a9f0f0768220e2415735ade93097"
+      },
+      "Cargo.toml": {
+        "url": "https://raw.githubusercontent.com/niri-wm/niri/2c82b77a7116a1241ea2fd41dd008ff00b609aae/Cargo.toml",
+        "bytes": 6146,
+        "sha256": "fb6559f3b4bf4dae8d16e494ffddacc2edcb693ba3656b9e3a94ca2b074e91dd"
+      }
+    }
+  },
+  "Devolutions/IronRDP": {
+    "commit": "bf019ca502d1e52616853a5ded68c885cec1e322",
+    "committed_at": "2026-10-09T15:24:45Z",
+    "files": {
+      "crates/ironrdp/examples/server.rs": {
+        "url": "https://raw.githubusercontent.com/Devolutions/IronRDP/bf019ca502d1e52616853a5ded68c885cec1e322/crates/ironrdp/examples/server.rs",
+        "bytes": 13317,
+        "sha256": "0e0a9c912fc199df50090f8d5d2e8277c83039dfda020e05ac74cabdd0366f79"
+      },
+      "crates/ironrdp-server/src/lib.rs": {
+        "url": "https://raw.githubusercontent.com/Devolutions/IronRDP/bf019ca502d1e52616853a5ded68c885cec1e322/crates/ironrdp-server/src/lib.rs",
+        "bytes": 3159,
+        "sha256": "486ad5c2cdd9cd90cb28c1c4fc4d3ae8480cc17f65481d5f3686ab9b4f7fdc1a"
+      },
+      "crates/ironrdp-server/src/server.rs": {
+        "url": "https://raw.githubusercontent.com/Devolutions/IronRDP/bf019ca502d1e52616853a5ded68c885cec1e322/crates/ironrdp-server/src/server.rs",
+        "bytes": 315281,
+        "sha256": "291be526244845451f5d89cede495757a6ac3c1c4b78ffce6a9ddcb2d81cedfc"
+      },
+      "crates/ironrdp-server/Cargo.toml": {
+        "url": "https://raw.githubusercontent.com/Devolutions/IronRDP/bf019ca502d1e52616853a5ded68c885cec1e322/crates/ironrdp-server/Cargo.toml",
+        "bytes": 3576,
+        "sha256": "1ec993dc6e69ba5e7d4721e911d1f0f8fe4fd2e5546f721b6b07a00bd0d97e90"
+      },
+      "crates/ironrdp-server/src/handler.rs": {
+        "url": "https://raw.githubusercontent.com/Devolutions/IronRDP/bf019ca502d1e52616853a5ded68c885cec1e322/crates/ironrdp-server/src/handler.rs",
+        "bytes": 12412,
+        "sha256": "e60afd0d02686adcea2c9e7a532bf15b9c9ce10a8fdcea4beae46a9a3dade70d"
+      }
+    }
+  }
+}

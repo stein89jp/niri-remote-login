@@ -1,0 +1,9 @@
+#%PAM-1.0
+# Dedicated remote login policy; never modify GDM, GRD or another PAM service.
+auth      include   system-remote-login
+account   include   system-remote-login
+# Password expiration/MFA conversations are deliberately rejected by this v1 broker.
+session   required  pam_loginuid.so
+session   optional  pam_keyinit.so force revoke
+session   include   system-auth
+session   required  pam_systemd.so type=wayland class=user desktop=niri

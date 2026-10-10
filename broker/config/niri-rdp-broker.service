@@ -1,0 +1,29 @@
+[Unit]
+Description=Niri Remote Login PAM session broker
+After=systemd-logind.service
+Requires=systemd-logind.service
+
+[Service]
+Type=simple
+User=root
+Group=niri-rdp
+ExecStart=/usr/lib/niri-rdp/niri-rdp-broker
+ExecStopPost=/usr/lib/niri-rdp/niri-rdp-broker --cleanup
+Restart=on-failure
+RestartSec=2
+RuntimeDirectory=niri-rdp
+RuntimeDirectoryMode=0711
+# Preserve crash session records until ExecStopPost handles them.
+RuntimeDirectoryPreserve=yes
+KillMode=control-group
+TimeoutStopSec=30
+LimitCORE=0
+UMask=0077
+PrivateTmp=yes
+# Session children inherit mount namespaces. Keep their homes writable.
+# A stricter broker mount namespace requires a separate worker launch service.
+# PAM opens a logind scope and performs credential switching: do not add
+# PrivateUsers, NoNewPrivileges, or restrictive capabilities without VM tests.
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,61 @@
+{
+  "schema": 1,
+  "selected": {
+    "repository": "https://github.com/niri-wm/niri",
+    "pull_request": 3953,
+    "revision": "0be60b742762905b7bee1ea67bb5a2fb00859bf0",
+    "archive_url": "https://codeload.github.com/niri-wm/niri/tar.gz/0be60b742762905b7bee1ea67bb5a2fb00859bf0",
+    "archive_sha256": "680374cae233d2ed1e0f8474aeb017e36872b30b9e291ce43b1521724b8fe2a9",
+    "cargo_lock_sha256": "e71d9d5b104d297bc1185cebb4d7eb203f374c668c5739e41927e15a0b1e668c",
+    "smithay_revision": "ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef",
+    "cargo_features": [],
+    "cargo_no_default_features": true,
+    "patches": [
+      "patches/0001-remote-headless-bounds-and-startup.patch"
+    ],
+    "patch_sha256": "ca40b7d756cc9b01ff75095392e8da382e6ceef2883ae7976cba288ededde4d8"
+  },
+  "alternative": {
+    "pull_request": 3800,
+    "revision": "7fd585dd44ed67644977dd9561bb6e8b3837f8f7",
+    "smithay_revision": "22571baa20d34d71092942dbb520c4e3fbbd6263",
+    "decision": "not selected: initializes seat0 libinput; broader GPU/portal integration than SHM baseline"
+  },
+  "baseline": "2c82b77a7116a1241ea2fd41dd008ff00b609aae",
+  "extracted_build_package": {
+    "name": "seatd",
+    "version": "0.9.3-1",
+    "filename": "seatd-0.9.3-1-x86_64.pkg.tar.zst",
+    "url": "https://geo.mirror.pkgbuild.com/extra/os/x86_64/seatd-0.9.3-1-x86_64.pkg.tar.zst",
+    "sha256": "b4b52430149e66aaeb4cb474f4b756b5c862adecf6e8ecbf358d67470d2b35de",
+    "host_installed": false
+  },
+  "lab_xdg_shell_protocol": {
+    "source_crate": "wayland-protocols",
+    "version": "0.32.12",
+    "path": "lab/xdg-shell.xml",
+    "sha256": "5084e76386f6c3959bee957a784c57de204be0de3f57533ce07b4be0617b171a"
+  },
+  "lab_read_only_arch_packages": {
+    "rust": "1:1.99.0-1",
+    "libinput": "1.32.0-1",
+    "libdisplay-info": "0.3.0-1",
+    "mesa": "1:26.2.4-1",
+    "libglvnd": "1.7.0-3",
+    "wayland": "1.26.0-1",
+    "libxkbcommon": "1.13.2-1",
+    "pango": "1:1.58.2-1",
+    "cairo": "1.18.6-1",
+    "pixman": "0.46.4-1",
+    "systemd-libs": "262-1",
+    "glib2": "2.90.1-1",
+    "glibc": "2.44+r50+g1848099f063e-1",
+    "gcc": "16.2.1+r23+gd564253eb6c8-1",
+    "pkgconf": "3.0.7-1",
+    "bubblewrap": "0.13.0-1"
+  },
+  "toolchain": {
+    "rustc": "rustc 1.99.0 (b940084d7 2026-09-28) (Arch Linux rust 1:1.99.0-1)",
+    "cargo": "cargo 1.99.0 (5f94df478 2026-08-27) (Arch Linux rust 1:1.99.0-1)"
+  }
+}

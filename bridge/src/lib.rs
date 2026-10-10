@@ -1,0 +1,161 @@
+//! Real desktop adapter. IronRDP owns every RDP wire operation.
+pub mod broker;
+pub mod wayland;
+
+use ironrdp_server::{BitmapUpdate, DesktopSize, PixelFormat, ServerError, ServerErrorKind};
+use std::{
+    net::{IpAddr, Ipv4Addr, SocketAddr},
+    num::{NonZeroU16, NonZeroUsize},
+};
+
+pub const LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33991);
+pub const MAX_DIMENSION: u32 = 4096;
+
+pub fn server_error(message: impl Into<String>) -> ServerError {
+    ServerError::new("niri-rdp bridge", ServerErrorKind::Reason(message.into()))
+}
+
+/// RDP set-1 scancodes become Linux evdev keycodes; E0 is not an extra key.
+pub fn evdev_key(code: u8, extended: bool) -> Option<u32> {
+    if !extended {
+        return match code {
+            1..=83 | 86..=88 => Some(u32::from(code)),
+            _ => None,
+        };
+    }
+    Some(match code {
+        0x1c => 96,
+        0x1d => 97,
+        0x35 => 98,
+        0x37 => 99,
+        0x38 => 100,
+        0x47 => 102,
+        0x48 => 103,
+        0x49 => 104,
+        0x4b => 105,
+        0x4d => 106,
+        0x4f => 107,
+        0x50 => 108,
+        0x51 => 109,
+        0x52 => 110,
+        0x53 => 111,
+        0x5b => 125,
+        0x5c => 126,
+        0x5d => 127,
+        _ => return None,
+    })
+}
+
+/// Validate compositor-provided memory layout before allocating or reading.
+pub fn buffer_length(width: u32, height: u32, stride: u32) -> anyhow::Result<usize> {
+    anyhow::ensure!(
+        (1..=MAX_DIMENSION).contains(&width) && (1..=MAX_DIMENSION).contains(&height),
+        "capture dimensions outside 1..4096"
+    );
+    anyhow::ensure!(
+        stride >= width * 4 && stride <= MAX_DIMENSION * 4,
+        "invalid capture stride"
+    );
+    (stride as usize)
+        .checked_mul(height as usize)
+        .ok_or_else(|| anyhow::anyhow!("capture overflow"))
+}
+
+/// Strip row padding, normalize upside-down SHM and scale the desktop contract.
+pub fn bitmap(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    inverted: bool,
+    target: DesktopSize,
+    abgr: bool,
+) -> anyhow::Result<BitmapUpdate> {
+    anyhow::ensure!(
+        bytes.len() == buffer_length(width, height, stride)?,
+        "SHM length mismatch"
+    );
+    anyhow::ensure!(
+        (1..=MAX_DIMENSION as u16).contains(&target.width)
+            && (1..=MAX_DIMENSION as u16).contains(&target.height),
+        "RDP dimensions outside 1..4096"
+    );
+    let out_stride = usize::from(target.width) * 4;
+    let mut data = vec![0; out_stride * usize::from(target.height)];
+    for y in 0..u32::from(target.height) {
+        let sy = y * height / u32::from(target.height);
+        let sy = if inverted { height - 1 - sy } else { sy };
+        for x in 0..u32::from(target.width) {
+            let sx = x * width / u32::from(target.width);
+            let src = (sy * stride + sx * 4) as usize;
+            let dst = y as usize * out_stride + x as usize * 4;
+            data[dst..dst + 4].copy_from_slice(&bytes[src..src + 4]);
+            if abgr {
+                data.swap(dst, dst + 2);
+            }
+            data[dst + 3] = 255;
+        }
+    }
+    Ok(BitmapUpdate {
+        x: 0,
+        y: 0,
+        width: NonZeroU16::new(target.width).unwrap(),
+        height: NonZeroU16::new(target.height).unwrap(),
+        format: PixelFormat::BgrA32,
+        data: data.into(),
+        stride: NonZeroUsize::new(out_stride).unwrap(),
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn scancode_extended_keys_are_distinct_and_unknown_is_rejected() {
+        assert_eq!(evdev_key(0x1d, false), Some(29));
+        assert_eq!(evdev_key(0x1d, true), Some(97));
+        assert_eq!(evdev_key(0x48, true), Some(103));
+        assert_eq!(evdev_key(0xff, true), None);
+        assert_eq!(evdev_key(0, false), None);
+    }
+    #[test]
+    fn shm_bounds_reject_malicious_dimensions_and_stride() {
+        for (w, h, s) in [
+            (0, 1, 4),
+            (4097, 1, 16388),
+            (1, 0, 4),
+            (4, 1, 15),
+            (1, 1, u32::MAX),
+        ] {
+            assert!(buffer_length(w, h, s).is_err());
+        }
+        assert_eq!(buffer_length(1920, 1080, 7680).unwrap(), 8_294_400);
+    }
+    #[test]
+    fn bitmap_normalizes_padding_inversion_and_abgr() {
+        let bytes = [
+            1, 2, 3, 0, 4, 5, 6, 0, 9, 9, 9, 9, 7, 8, 9, 0, 10, 11, 12, 0, 8, 8, 8, 8,
+        ];
+        let result = bitmap(
+            &bytes,
+            2,
+            2,
+            12,
+            true,
+            DesktopSize {
+                width: 2,
+                height: 2,
+            },
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            &result.data[..],
+            &[9, 8, 7, 255, 12, 11, 10, 255, 3, 2, 1, 255, 6, 5, 4, 255]
+        );
+    }
+    #[test]
+    fn listener_is_loopback_and_distinct_from_gnome_and_poc() {
+        assert_eq!(LISTEN_ADDR.to_string(), "127.0.0.1:33991");
+    }
+}

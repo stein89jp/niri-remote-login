@@ -1,0 +1,18 @@
+[package]
+name = "niri-rdp-bridge"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+publish = false
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+ironrdp-server = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", default-features = false, features = ["helper"] }
+tokio = { version = "1", features = ["macros", "rt", "time", "signal", "sync"] }
+wayland-client = "=0.31.14"
+wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }
+wayland-protocols-misc = { version = "=0.3.12", features = ["client"] }
+tempfile = "=3.20.0"
+xkbcommon = "=0.9.0"
+libc = "0.2"

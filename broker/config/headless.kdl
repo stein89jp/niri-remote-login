@@ -1,0 +1,16 @@
+// Private remote desktop: do not import host Niri/GNOME configuration.
+// The patched headless backend provides a 1920x1080 output with its own frame clock.
+output "HEADLESS-1" {
+    scale 1
+    transform "normal"
+}
+layout {
+    gaps 0
+    default-column-width { proportion 1.0; }
+}
+spawn-at-startup "foot"
+prefer-no-csd
+binds {
+    Mod+Return { spawn "foot"; }
+    Mod+Shift+Q { quit skip-confirmation=true; }
+}
