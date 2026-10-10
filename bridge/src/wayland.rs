@@ -55,10 +55,12 @@ struct Inner {
     size: DesktopSize,
     failed: Arc<Mutex<Option<String>>>,
     alive: Arc<AtomicBool>,
-    lease: Arc<Mutex<Option<UnixStream>>>,
+    // Retain ownership while handlers live; the worker closes it after teardown.
+    _lease: Arc<Mutex<Option<UnixStream>>>,
 }
 impl Drop for Inner {
     fn drop(&mut self) {
+        self.alive.store(false, Ordering::Release);
         let _ = self.commands.try_send(Command::Stop);
     }
 }
@@ -111,7 +113,7 @@ impl Desktop {
                 size: target,
                 failed,
                 alive,
-                lease,
+                _lease: lease,
             }),
         })
     }
@@ -131,7 +133,8 @@ impl Desktop {
     pub fn stop(&self) {
         self.release_all();
         self.inner.alive.store(false, Ordering::Release);
-        self.inner.lease.lock().unwrap().take();
+        // The worker owns lease teardown after releases have reached Niri.
+        // Closing it here lets the broker kill the compositor before that sync.
         let _ = self.inner.commands.try_send(Command::Stop);
     }
     pub fn release_all(&self) {
@@ -139,6 +142,13 @@ impl Desktop {
     }
     pub fn alive(&self) -> bool {
         self.inner.alive.load(Ordering::Acquire)
+    }
+    /// The concrete capture stream is Send, including when wrapped by an encoder.
+    pub fn updates_send(&self) -> Box<dyn RdpServerDisplayUpdates + Send> {
+        Box::new(Updates {
+            desktop: self.clone(),
+            rx: self.inner.frames.lock().unwrap().clone(),
+        })
     }
 }
 impl RdpServerInputHandler for Desktop {
@@ -179,10 +189,7 @@ impl RdpServerDisplay for Desktop {
         self.inner.size
     }
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
-        Ok(Box::new(Updates {
-            desktop: self.clone(),
-            rx: self.inner.frames.lock().unwrap().clone(),
-        }))
+        Ok(self.updates_send())
     }
 }
 
@@ -195,6 +202,7 @@ struct State {
     keyboard_manager: Option<ZwpVirtualKeyboardManagerV1>,
     synced: bool,
     outputs: Vec<(u32, wl_output::WlOutput, String, i32, bool)>,
+    selected_output: Option<u32>,
     output_removed: bool,
     dimensions: Option<(wl_shm::Format, u32, u32, u32)>,
     buffer_done: bool,
@@ -239,11 +247,30 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                 }
                 _ => {}
             },
-            wl_registry::Event::GlobalRemove { name } if s.outputs.iter().any(|o| o.0 == name) => {
-                s.output_removed = true;
-            }
+            wl_registry::Event::GlobalRemove { name } => s.remove_output(name),
             _ => {}
         }
+    }
+}
+impl State {
+    fn remove_output(&mut self, name: u32) {
+        self.output_removed |= self.selected_output == Some(name);
+        self.outputs.retain(|o| o.0 != name);
+    }
+    fn validate_output(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(!self.output_removed, "Wayland output removed");
+        if let Some(name) = self.selected_output {
+            let output = self
+                .outputs
+                .iter()
+                .find(|o| o.0 == name)
+                .ok_or_else(|| anyhow::anyhow!("Wayland output removed"))?;
+            anyhow::ensure!(
+                output.3 == 1 && output.4,
+                "bridge requires scale=1 normal transform"
+            );
+        }
+        Ok(())
     }
 }
 impl Dispatch<wl_output::WlOutput, ()> for State {
@@ -331,7 +358,7 @@ fn pump(
         }
     }
     q.dispatch_pending(s)?;
-    anyhow::ensure!(!s.output_removed, "Wayland output removed");
+    s.validate_output()?;
     Ok(())
 }
 
@@ -555,6 +582,7 @@ fn run(
         output.3 == 1 && output.4,
         "bridge requires scale=1 normal transform"
     );
+    s.selected_output = Some(output.0);
     let output = output.1.clone();
     let seat = s
         .seat
@@ -728,7 +756,7 @@ mod lifecycle_tests {
                     },
                     failed: Arc::new(Mutex::new(Some("broken compositor".into()))),
                     alive: Arc::new(AtomicBool::new(alive)),
-                    lease: Arc::new(Mutex::new(None)),
+                    _lease: Arc::new(Mutex::new(None)),
                 }),
             };
             drop(frames);
@@ -744,10 +772,10 @@ mod lifecycle_tests {
         }
     }
     #[test]
-    fn stop_closes_lease_even_when_handlers_retain_desktop_clones() {
+    fn stop_keeps_lease_until_worker_finishes_input_teardown() {
         let (lease, mut broker) = UnixStream::pair().unwrap();
         broker
-            .set_read_timeout(Some(Duration::from_secs(1)))
+            .set_read_timeout(Some(Duration::from_millis(50)))
             .unwrap();
         let (commands, _worker) = mpsc::sync_channel(256);
         let (_frames, rx) = tokio::sync::watch::channel(None);
@@ -761,15 +789,36 @@ mod lifecycle_tests {
                 },
                 failed: Arc::new(Mutex::new(None)),
                 alive: Arc::new(AtomicBool::new(true)),
-                lease: Arc::new(Mutex::new(Some(lease))),
+                _lease: Arc::new(Mutex::new(Some(lease))),
             }),
         };
         let retained = desktop.clone();
+        let worker_lease = desktop.inner._lease.clone();
         desktop.stop();
         let mut byte = [0; 1];
-        assert_eq!(broker.read(&mut byte).unwrap(), 0);
+        let error = broker.read(&mut byte).unwrap_err();
+        assert!(matches!(
+            error.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ));
         assert!(!retained.alive());
-        assert!(retained.inner.lease.lock().unwrap().is_none());
+        assert!(retained.inner._lease.lock().unwrap().is_some());
+        // Model the worker completing the compositor sync and returning.
+        worker_lease.lock().unwrap().take();
+        assert_eq!(broker.read(&mut byte).unwrap(), 0);
+        assert!(retained.inner._lease.lock().unwrap().is_none());
+    }
+    #[test]
+    fn unrelated_output_removal_does_not_end_capture() {
+        let mut state = State {
+            selected_output: Some(10),
+            ..State::default()
+        };
+        state.remove_output(11);
+        assert!(!state.output_removed);
+        state.remove_output(10);
+        assert!(state.output_removed);
+        assert!(state.validate_output().is_err());
     }
     #[test]
     fn broken_compositor_startup_closes_lease_and_never_returns_a_desktop() {

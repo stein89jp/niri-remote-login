@@ -1,9 +1,11 @@
 .PHONY: check check-transport release checkpoint
-BRIDGE_CARGO_HOME ?= $(CURDIR)/bridge/.cargo-cache
+DEFAULT_CARGO_HOME := $(if $(CARGO_HOME),$(CARGO_HOME),$(HOME)/.cargo)
+POC_CARGO_HOME ?= $(if $(wildcard $(CURDIR)/poc/.cargo-cache),$(CURDIR)/poc/.cargo-cache,$(DEFAULT_CARGO_HOME))
+BRIDGE_CARGO_HOME ?= $(if $(wildcard $(CURDIR)/bridge/.cargo-cache),$(CURDIR)/bridge/.cargo-cache,$(DEFAULT_CARGO_HOME))
 
 check:
 	python3 -m unittest discover -s tests -v
-	CARGO_HOME="$(CURDIR)/poc/.cargo-cache" cargo test --locked --offline --manifest-path poc/Cargo.toml
+	CARGO_HOME="$(POC_CARGO_HOME)" cargo test --locked --offline --manifest-path poc/Cargo.toml
 	python3 poc/tests/startup.py
 	$(MAKE) -C broker check
 	CARGO_HOME="$(BRIDGE_CARGO_HOME)" cargo test --locked --offline --manifest-path bridge/Cargo.toml

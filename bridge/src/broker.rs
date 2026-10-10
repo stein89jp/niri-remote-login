@@ -1,11 +1,11 @@
 //! A bounded local broker protocol; no passwords appear in command lines/logs.
-use crate::{server_error, wayland::Desktop};
+use crate::{server_error, video::Video, wayland::Desktop};
 use ironrdp_server::{
     BoundConnection, ConnectionBinder, CredentialDecision, CredentialValidationError,
     CredentialValidator, Credentials, DesktopSize, ServerResult,
 };
 use std::{
-    io::{Read, Write},
+    io::Write,
     os::{
         fd::{AsRawFd, FromRawFd, OwnedFd},
         unix::net::UnixStream,
@@ -43,40 +43,49 @@ pub fn open(path: &Path, username: &str, password: &str) -> anyhow::Result<Optio
     // Alignment is required by cmsghdr. Reserve room for several unexpected
     // descriptors so all received descriptors can be closed on rejection.
     let mut control = [0usize; 16];
-    let mut iov = libc::iovec {
-        iov_base: response.as_mut_ptr().cast(),
-        iov_len: response.len(),
-    };
-    let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
-    msg.msg_iov = &mut iov;
-    msg.msg_iovlen = 1;
-    msg.msg_control = control.as_mut_ptr().cast();
-    msg.msg_controllen = std::mem::size_of_val(&control);
-    // SAFETY: buffers remain live for recvmsg, and MSG_CMSG_CLOEXEC prevents
-    // accidentally inheriting broker-created sockets into child processes.
-    let n = unsafe { libc::recvmsg(lease.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
-    anyhow::ensure!(n > 0, "broker response unavailable");
     let mut fds: Vec<OwnedFd> = Vec::new();
-    unsafe {
-        let mut c = libc::CMSG_FIRSTHDR(&msg);
-        while !c.is_null() {
-            if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
-                let count = ((*c).cmsg_len - libc::CMSG_LEN(0) as usize)
-                    / std::mem::size_of::<libc::c_int>();
-                let ptr = libc::CMSG_DATA(c).cast::<libc::c_int>();
-                for i in 0..count {
-                    fds.push(OwnedFd::from_raw_fd(*ptr.add(i)));
-                }
+    let mut received = 0;
+    while received < response.len() {
+        let mut iov = libc::iovec {
+            iov_base: response[received..].as_mut_ptr().cast(),
+            iov_len: response.len() - received,
+        };
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = control.as_mut_ptr().cast();
+        msg.msg_controllen = std::mem::size_of_val(&control);
+        // Every fragment must use recvmsg: read_exact would silently discard
+        // SCM_RIGHTS attached to a later fragment of the stream response.
+        // SAFETY: buffers remain live, and received FDs become owned immediately.
+        let n = unsafe { libc::recvmsg(lease.as_raw_fd(), &mut msg, libc::MSG_CMSG_CLOEXEC) };
+        if n < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
-            c = libc::CMSG_NXTHDR(&msg, c);
+            return Err(error.into());
         }
-    }
-    anyhow::ensure!(
-        msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) == 0,
-        "truncated broker response"
-    );
-    if n < 5 {
-        lease.read_exact(&mut response[n as usize..])?;
+        anyhow::ensure!(n > 0, "broker response unavailable");
+        unsafe {
+            let mut c = libc::CMSG_FIRSTHDR(&msg);
+            while !c.is_null() {
+                if (*c).cmsg_level == libc::SOL_SOCKET && (*c).cmsg_type == libc::SCM_RIGHTS {
+                    let count = ((*c).cmsg_len - libc::CMSG_LEN(0) as usize)
+                        / std::mem::size_of::<libc::c_int>();
+                    let ptr = libc::CMSG_DATA(c).cast::<libc::c_int>();
+                    for i in 0..count {
+                        fds.push(OwnedFd::from_raw_fd(*ptr.add(i)));
+                    }
+                }
+                c = libc::CMSG_NXTHDR(&msg, c);
+            }
+        }
+        anyhow::ensure!(
+            msg.msg_flags & (libc::MSG_CTRUNC | libc::MSG_TRUNC) == 0,
+            "truncated broker response"
+        );
+        received += n as usize;
     }
     anyhow::ensure!(&response[..4] == b"NRB1", "invalid broker response magic");
     if response[4] == 1 {
@@ -96,14 +105,16 @@ pub struct Broker {
     path: PathBuf,
     pending: Mutex<Option<(String, Session)>>,
     output: String,
+    video: Option<Video>,
     active: Mutex<Option<Desktop>>,
 }
 impl Broker {
-    pub fn new(path: PathBuf, output: String) -> Self {
+    pub fn new(path: PathBuf, output: String, video: Option<Video>) -> Self {
         Self {
             path,
             pending: Mutex::new(None),
             output,
+            video,
             active: Mutex::new(None),
         }
     }
@@ -167,8 +178,12 @@ impl ConnectionBinder for Broker {
         .map_err(|_| server_error("desktop startup task failed"))?
         .map_err(|_| server_error("Wayland desktop failed"))?;
         *self.active.lock().unwrap() = Some(desktop.clone());
+        let display = match &self.video {
+            Some(video) => video.display(desktop.clone()),
+            None => Box::new(desktop.clone()),
+        };
         Ok(BoundConnection {
-            display: Box::new(desktop.clone()),
+            display,
             input: Box::new(desktop),
         })
     }
@@ -177,10 +192,11 @@ impl ConnectionBinder for Broker {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{os::unix::net::UnixListener, thread};
+    use std::{io::Read, os::unix::net::UnixListener, thread};
     fn fake(
         status: u8,
         fd: Option<OwnedFd>,
+        late_fd: bool,
     ) -> (
         tempfile::TempDir,
         PathBuf,
@@ -203,8 +219,17 @@ mod tests {
             assert_eq!(credentials, b"aliceexample");
             credentials.fill(0);
             let response = [b'N', b'R', b'B', b'1', status];
+            if late_fd {
+                client.write_all(&response[..2]).unwrap();
+                // Force the frontend to consume the prefix before SCM_RIGHTS
+                // arrives, exercising ancillary data on a later fragment.
+                thread::sleep(Duration::from_millis(50));
+            }
             let mut iov = libc::iovec {
-                iov_base: response.as_ptr().cast_mut().cast(),
+                iov_base: response[if late_fd { 2 } else { 0 }..]
+                    .as_ptr()
+                    .cast_mut()
+                    .cast(),
                 iov_len: 3,
             };
             let mut ctl = [0usize; 8];
@@ -225,7 +250,9 @@ mod tests {
                 }
             }
             assert_eq!(unsafe { libc::sendmsg(client.as_raw_fd(), &msg, 0) }, 3);
-            client.write_all(&response[3..]).unwrap();
+            if !late_fd {
+                client.write_all(&response[3..]).unwrap();
+            }
             drop(peer);
             let mut byte = [0; 1];
             assert_eq!(
@@ -238,24 +265,27 @@ mod tests {
     }
     #[test]
     fn fragmented_reply_retains_cloexec_fd_and_broker_lease() {
-        let (mut compositor, bridge) = UnixStream::pair().unwrap();
-        let fd: OwnedFd = bridge.into();
-        let (_dir, path, handle, _observer) = fake(0, Some(fd));
-        let mut session = open(&path, "alice", "example").unwrap().unwrap();
-        assert!(
-            unsafe { libc::fcntl(session.socket.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC
-                != 0
-        );
-        compositor.write_all(b"w").unwrap();
-        let mut b = [0];
-        session.socket.read_exact(&mut b).unwrap();
-        assert_eq!(&b, b"w");
-        drop(session);
-        handle.join().unwrap();
+        for late_fd in [false, true] {
+            let (mut compositor, bridge) = UnixStream::pair().unwrap();
+            let fd: OwnedFd = bridge.into();
+            let (_dir, path, handle, _observer) = fake(0, Some(fd), late_fd);
+            let mut session = open(&path, "alice", "example").unwrap().unwrap();
+            assert!(
+                unsafe { libc::fcntl(session.socket.as_raw_fd(), libc::F_GETFD) }
+                    & libc::FD_CLOEXEC
+                    != 0
+            );
+            compositor.write_all(b"w").unwrap();
+            let mut b = [0];
+            session.socket.read_exact(&mut b).unwrap();
+            assert_eq!(&b, b"w");
+            drop(session);
+            handle.join().unwrap();
+        }
     }
     #[test]
     fn rejection_creates_no_session() {
-        let (_dir, path, handle, _observer) = fake(1, None);
+        let (_dir, path, handle, _observer) = fake(1, None, false);
         assert!(open(&path, "alice", "example").unwrap().is_none());
         handle.join().unwrap();
     }

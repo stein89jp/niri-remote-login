@@ -3,7 +3,7 @@ use ironrdp_server::{
     DesktopSize, KeyboardEvent, MouseEvent, PostConnectionAction, RdpServer, RdpServerDisplay,
     RdpServerDisplayUpdates, RdpServerInputHandler, ServerError, ServerResult, TlsIdentityCtx,
 };
-use niri_rdp_bridge::{LISTEN_ADDR, broker::Broker, server_error, wayland::Desktop};
+use niri_rdp_bridge::{LISTEN_ADDR, broker::Broker, server_error, video::Video, wayland::Desktop};
 use std::{
     net::SocketAddr,
     os::unix::net::UnixStream,
@@ -45,6 +45,7 @@ struct Disposable {
     active: Arc<Mutex<Option<Desktop>>>,
     path: PathBuf,
     output: String,
+    video: Option<Video>,
 }
 #[async_trait::async_trait]
 impl ConnectionBinder for Disposable {
@@ -63,7 +64,10 @@ impl ConnectionBinder for Disposable {
         .map_err(|_| server_error("explicit disposable Wayland socket unavailable"))?;
         *self.active.lock().unwrap() = Some(desktop.clone());
         Ok(BoundConnection {
-            display: Box::new(desktop.clone()),
+            display: match &self.video {
+                Some(video) => video.display(desktop.clone()),
+                None => Box::new(desktop.clone()),
+            },
             input: Box::new(desktop),
         })
     }
@@ -113,10 +117,12 @@ async fn main() -> anyhow::Result<()> {
     let acceptor = identity.make_acceptor()?;
     let output = std::env::var("NIRI_RDP_OUTPUT").unwrap_or_else(|_| "HEADLESS-1".into());
     let mode = std::env::var("NIRI_RDP_MODE").unwrap_or_else(|_| "broker".into());
+    let video = Video::from_env()?;
     let mut server = if mode == "broker" {
         let broker = Arc::new(Broker::new(
             PathBuf::from("/run/niri-rdp/broker.sock"),
             output,
+            video.clone(),
         ));
         // PAM receives ClientInfo credentials within authenticated server TLS.
         // Arbitrary PAM passwords do not supply a server-side NLA/NTLM secret.
@@ -125,6 +131,7 @@ async fn main() -> anyhow::Result<()> {
             .with_tls(acceptor)
             .with_input_handler(Placeholder)
             .with_display_handler(Placeholder)
+            .with_gfx_factory(video.as_ref().map(|v| Box::new(v.clone()) as _))
             .with_connection_policy(ConnectionPolicy::Reject)
             .with_connection_handler(Some(Box::new(Lifecycle {
                 broker: Some(broker.clone()),
@@ -146,6 +153,7 @@ async fn main() -> anyhow::Result<()> {
             .with_hybrid(acceptor, identity.pub_key)
             .with_input_handler(Placeholder)
             .with_display_handler(Placeholder)
+            .with_gfx_factory(video.as_ref().map(|v| Box::new(v.clone()) as _))
             .with_connection_policy(ConnectionPolicy::Reject)
             .with_connection_handler(Some(Box::new(Lifecycle {
                 broker: None,
@@ -161,12 +169,16 @@ async fn main() -> anyhow::Result<()> {
             path,
             output,
             active,
+            video: video.clone(),
         })));
         server
     } else {
         anyhow::bail!("NIRI_RDP_MODE must be broker or disposable");
     };
     // Reconnect cookies would bypass a fresh PAM policy/account decision.
+    if let Some(video) = &video {
+        video.set_suppressed(server.display_suppressed_handle());
+    }
     server.set_auto_reconnect_cookie(None);
     println!("Niri RDP frontend on {LISTEN_ADDR} ({mode}); dedicated session only");
     tokio::select! {result=server.run()=>result?,result=tokio::signal::ctrl_c()=>result?}

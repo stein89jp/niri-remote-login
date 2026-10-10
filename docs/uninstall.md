@@ -20,6 +20,10 @@ Pacman preserves changed configuration as `.pacsave`; inspect it before removal.
 TLS identity files in `/etc/niri-rdp/tls` were created manually and are not
 package-owned. Remove those files and the remaining project configuration only
 after deciding to discard the experiment. Keep backups if rollback is intended.
+If you enabled NVIDIA encoding, its copied drop-in
+`/etc/systemd/system/niri-rdp-frontend.service.d/nvidia.conf` is also not
+package-owned. Remove that file when discarding the experiment, then run
+`sudo systemctl daemon-reload` again.
 The service user and `niri-rdp-users` group also remain; remove them only if they
 are unused. The dedicated human test account/home remains your choice; package
 removal never deletes user data or accounts.

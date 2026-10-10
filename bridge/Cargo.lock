@@ -1411,6 +1411,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "ironrdp-egfx"
+version = "0.3.0"
+source = "git+https://github.com/Devolutions/IronRDP?rev=bf019ca502d1e52616853a5ded68c885cec1e322#bf019ca502d1e52616853a5ded68c885cec1e322"
+dependencies = [
+ "bit_field",
+ "bitflags 2.13.2",
+ "ironrdp-core",
+ "ironrdp-dvc",
+ "ironrdp-graphics",
+ "ironrdp-pdu",
+ "tracing",
+]
+
+[[package]]
 name = "ironrdp-error"
 version = "0.2.0"
 source = "git+https://github.com/Devolutions/IronRDP?rev=bf019ca502d1e52616853a5ded68c885cec1e322#bf019ca502d1e52616853a5ded68c885cec1e322"
@@ -1564,6 +1578,7 @@ dependencies = [
  "ironrdp-displaycontrol",
  "ironrdp-dvc",
  "ironrdp-echo",
+ "ironrdp-egfx",
  "ironrdp-error",
  "ironrdp-graphics",
  "ironrdp-pdu",
@@ -1802,8 +1817,14 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "cc",
+ "ironrdp-core",
+ "ironrdp-dvc",
+ "ironrdp-egfx",
  "ironrdp-server",
+ "ironrdp-svc",
  "libc",
+ "pkg-config",
  "tempfile",
  "tokio",
  "wayland-client",

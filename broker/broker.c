@@ -119,7 +119,8 @@ static void cleanup(struct session *s) {
         kill(-s->worker, SIGTERM);
         for (unsigned int i = 0; i < 20; i++) {
             int status;
-            if (waitpid(s->worker, &status, WNOHANG) == s->worker) break;
+            pid_t result = waitpid(s->worker, &status, WNOHANG);
+            if (result == s->worker || (result < 0 && errno == ECHILD)) break;
             usleep(100000);
         }
         // Descendants can outlive their group leader.
@@ -143,9 +144,21 @@ static bool account_allowed(const struct passwd *pw) {
     if (!allowed) return false;
     gid_t target = allowed->gr_gid;
     int n = 64; gid_t groups[64];
-    if (getgrouplist(pw->pw_name, pw->pw_gid, groups, &n) < 0) return false;
-    for (int i = 0; i < n; i++) if (groups[i] == target) return true;
-    return false;
+    gid_t *list = groups;
+    if (getgrouplist(pw->pw_name, pw->pw_gid, groups, &n) < 0) {
+        // A small buffer is not a policy rejection. NSS reports the required
+        // count so accounts with many supplementary groups can be retried.
+        if (n <= 64 || (size_t)n > SIZE_MAX / sizeof(*list)) return false;
+        list = malloc((size_t)n * sizeof(*list));
+        if (!list) return false;
+        if (getgrouplist(pw->pw_name, pw->pw_gid, list, &n) < 0) {
+            free(list); return false;
+        }
+    }
+    bool found = false;
+    for (int i = 0; i < n; i++) if (list[i] == target) { found = true; break; }
+    if (list != groups) free(list);
+    return found;
 }
 static int graphical_sessions(uid_t uid) {
     char **sessions = NULL;

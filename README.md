@@ -12,6 +12,12 @@ The privileged broker is implemented and native-tested; **actual PAM/logind boot
 login, Windows mstsc, and physical-monitor-off validation remain pending**.
 This is not yet a demonstrated production remote-login service.
 
+The source now includes optional NVIDIA NVENC H.264 encoding on the Niri host
+(`NIRI_RDP_ENCODER=nvenc`) for AVC420-capable RDP clients. The default remains
+bitmap transport. See [NVIDIA setup](docs/install.md#optional-nvidia-encoding)
+and the [functionality review](docs/review.md). Existing 0.1.0 binary archives
+predate these changes; rebuild the frontend package to use the fixes and NVENC.
+
 - [Install/build on the separate test machine](docs/install.md)
 - [Actual-machine acceptance and pending gates](docs/acceptance.md)
 - [Uninstall](docs/uninstall.md) and [upgrade/rollback](docs/upgrade.md)

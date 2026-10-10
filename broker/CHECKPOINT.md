@@ -58,6 +58,23 @@ absence of an earlier login as an error. Query mode -1 includes closing sessions
   in the sandbox **blocked** by LeakSanitizer's ptrace limitation; not a passed
   sanitizer gate. Normal native binaries rebuilt and tested afterward.
 
+## Functionality review — 2026-10-10
+
+- Fixed authorization of accounts with more than 64 supplementary groups:
+  resize and retry `getgrouplist` instead of treating a short buffer as an
+  account-policy failure. Regression coverage includes allowed membership past
+  the initial buffer, denied membership, missing group and NSS lookup failure.
+- Avoid the two-second cleanup delay when startup/lifecycle polling already
+  reaped the compositor leader. Surviving process-group descendants are still
+  killed, covered by the existing native process cleanup regression.
+- `make -C broker all check`: **9 groups passed, 1 positive SO_PEERCRED check
+  skipped** because the execution sandbox denies that syscall.
+- ASan/UBSan native tests with `ASAN_OPTIONS=detect_leaks=0`: same result, no
+  sanitizer errors. LeakSanitizer was not run in this review.
+- Worker shell syntax passed. Unit verification outside the sandbox reported
+  missing installed `/usr/lib/niri-rdp` executables; source-checkout verification
+  does not validate installed service execution. No services were installed.
+
 ## Remaining acceptance work (pending, do not claim completed)
 
 1. Disposable Arch systemd boot with no local login; valid account must create

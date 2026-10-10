@@ -13,6 +13,8 @@ are in `scripts/headless-integration.py`; they do not substitute for this matrix
 | Authentication policy | Wrong password, unknown user, root, nonmember, locked/expired user, additional PAM prompt, account with local graphical session; confirm no app/session/private directory remains | Pending real PAM tests; native failure tests cover contracts |
 | Cold boot | Enable system frontend, reboot test machine, do not log in locally, connect via Windows tunnel; record `loginctl` identity and terminal `id` output | Pending |
 | Windows | mstsc displays dedicated Niri terminal and sends keyboard, pointer, wheel and modifiers; record TLS-only client properties and certificate verification | Pending |
+| NVIDIA encoding | Rebuild the current frontend, enable its NVIDIA drop-in, verify NVENC initialization and AVC420 graphics negotiation; decode changing frames, exercise input/reconnect, and record GPU encoder activity, bitrate and latency against bitmap mode | Release NVENC/FreeRDP namespace app/input/reconnect test passed; Windows, systemd permissions and complete-path performance pending |
+| Codec fallback and hardware failure | With NVENC enabled, a client without AVC420 graphics support receives bitmap updates; unavailable/denied NVIDIA hardware produces a clear frontend startup failure; restore bitmap mode and verify login | Release namespace bitmap fallback passed with NVENC configured; actual service/device-denial checks pending |
 | Physical monitor off | Keep test machine awake, power monitor off while moving typing in app remotely; record continued changing pixels/input, independent output and session identity | Pending |
 | Monitor disconnected | Disconnect physical display, retain remote session and repeat interaction; separately test boot without attached monitor | Pending |
 | Logout | Super+Shift+Q: RDP disconnects, PAM/logind session closes, all app/compositor/private D-Bus descendants exit, desktop directory removed | Pending real session checks |
@@ -28,6 +30,7 @@ loginctl list-sessions
 loginctl show-session SESSION_ID -p User -p Name -p Leader -p Service -p Type -p Class -p Remote -p Seat
 systemctl status niri-rdp-broker.service niri-rdp-frontend.service
 journalctl -b -u niri-rdp-broker.service -u niri-rdp-frontend.service --no-pager
+nvidia-smi dmon -s u
 ss -ltn 'sport = :33991'
 pgrep -a -u niri-remote-test
 find /run/niri-rdp/desktops -mindepth 1 -maxdepth 1 -type d
@@ -36,6 +39,9 @@ find /run/niri-rdp/desktops -mindepth 1 -maxdepth 1 -type d
 Expected after teardown: no project logind session, desktop directory, compositor,
 private D-Bus or test application. A still-connected SSH/TTY administrator is not
 an orphan project session. Broker socket and listener remain while services run.
+The `nvidia-smi` observation applies only when testing NVIDIA encoding; encoder
+activity during changing desktop content is useful hardware evidence, while an
+encoder listed by FFmpeg alone proves only that the software was built with it.
 Inspect service/UID before terminating any session. Monitor-off is not suspend;
 keep the test machine awake without modifying the working host's power policy.
 
@@ -43,5 +49,8 @@ Single-session frontend, US physical-key input, normal transform and scale 1 are
 the current contract. The frontend serves a fixed 1920×1080 desktop; the capture
 probe additionally verifies scaling to 640×480. Client resize is unsupported. No
 persistent reconnect, multi-monitor, clipboard, audio or Unicode/IME claim is made.
+The optional host encoder uses H.264 AVC420; it does not enable host-side NVDEC
+or ensure that the RDP client uses hardware decoding. Compositor rendering stays
+on llvmpipe in either transport mode. Record client decoding mode separately.
 Completion requires every requested actual-machine gate to pass and its evidence
 to be recorded; pending rows mean the boot-to-remote-login goal is incomplete.

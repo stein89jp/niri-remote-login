@@ -13,11 +13,13 @@ EXPECTED = {
                           "usr/share/licenses/niri-rdp-headless/THIRD-PARTY-NOTICES.txt"},
     "niri-remote-login": {
         "usr/lib/niri-rdp/niri-rdp-bridge", "usr/lib/niri-rdp/niri-rdp-broker",
+        "usr/lib/niri-rdp/encoder-probe",
         "usr/lib/niri-rdp/session-worker", "etc/pam.d/niri-rdp", "etc/niri-rdp/headless.kdl",
         "etc/niri-rdp/frontend.conf", "usr/lib/systemd/system/niri-rdp-broker.service",
         "usr/lib/systemd/system/niri-rdp-frontend.service", "usr/lib/sysusers.d/niri-rdp.conf",
         "usr/share/doc/niri-remote-login/install.md", "usr/share/doc/niri-remote-login/uninstall.md",
         "usr/share/doc/niri-remote-login/upgrade.md", "usr/share/doc/niri-remote-login/acceptance.md",
+        "usr/share/doc/niri-remote-login/nvidia-frontend.conf",
         "usr/share/licenses/niri-remote-login/LICENSE", "usr/share/licenses/niri-remote-login/THIRD-PARTY-NOTICES.txt",
     },
 }
@@ -74,7 +76,7 @@ def main():
     stage.mkdir(parents=True, exist_ok=True)
     for package in args.packages:
         subprocess.run(["bsdtar", "-xf", str(package.resolve()), "-C", str(stage)], check=True)
-    for binary in ("niri-headless", "niri-rdp-bridge", "niri-rdp-broker"):
+    for binary in ("niri-headless", "niri-rdp-bridge", "niri-rdp-broker", "encoder-probe"):
         path = stage / "usr/lib/niri-rdp" / binary
         if path.read_bytes()[:4] != b"\x7fELF" or not path.stat().st_mode & 0o111:
             raise RuntimeError(f"missing executable ELF: {binary}")

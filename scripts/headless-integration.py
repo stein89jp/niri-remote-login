@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import shutil
 import signal
 import socket
 import subprocess
@@ -38,9 +39,19 @@ def stop(process):
 
 
 def main():
-    if ROOT != Path("/work") or Path("/dev/dri").exists() or os.environ.get("DISPLAY"):
+    if (ROOT != Path("/work") or Path("/dev/dri").exists() or
+            Path("/dev/input").exists() or os.environ.get("DISPLAY")):
         raise RuntimeError("run only inside lab/run-isolated.sh with private devices")
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
+    encoder = os.environ.get("NIRI_RDP_LAB_ENCODER", "bitmap")
+    if encoder not in ("bitmap", "nvenc"):
+        raise RuntimeError("NIRI_RDP_LAB_ENCODER must be bitmap or nvenc")
+    if encoder == "nvenc" and os.environ.get("NIRI_RDP_LAB_NVENC") != "1":
+        raise RuntimeError("NVENC integration requires lab/run-isolated.sh --nvenc")
+    gfx_setting = os.environ.get("NIRI_RDP_LAB_GFX", "1")
+    if gfx_setting not in ("0", "1"):
+        raise RuntimeError("NIRI_RDP_LAB_GFX must be 0 or 1")
+    gfx = encoder == "nvenc" and gfx_setting == "1"
     username, password = "disposable-" + secrets.token_hex(8), secrets.token_hex(24)
     tls_contract = os.environ.get("NIRI_RDP_LAB_TLS_CONTRACT") == "1"
     # The namespace supplies only these explicit environment values.
@@ -76,6 +87,7 @@ def main():
             bridge_env = dict(env, NIRI_RDP_MODE="disposable", NIRI_RDP_CERT=str(private / "cert.pem"),
                               NIRI_RDP_KEY=str(private / "key.pem"), NIRI_RDP_USERNAME=username,
                               NIRI_RDP_PASSWORD=password, NIRI_RDP_WAYLAND_SOCKET=str(runtime / "wayland-0"))
+            bridge_env["NIRI_RDP_ENCODER"] = encoder
             fixture = None
             if tls_contract:
                 fixture = MockBroker(runtime, username, password)
@@ -99,9 +111,12 @@ def main():
                               NIRI_RDP_TEST_USERNAME=username, NIRI_RDP_TEST_PASSWORD=password)
             if tls_contract:
                 client_env.pop("NIRI_RDP_TEST_NLA")
+            if gfx:
+                client_env["NIRI_RDP_TEST_GFX"] = "1"
             bad = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")],
                                  env=dict(client_env, NIRI_RDP_TEST_PASSWORD=secrets.token_hex(24)),
                                  capture_output=True, text=True, timeout=25)
+            (private / "client-rejected.log").write_text(bad.stdout + bad.stderr)
             # TLS-only validation rejection currently appears as a transport
             # failure in FreeRDP. Require positive broker rejection evidence,
             # rather than accepting any failed connection as an auth test.
@@ -115,8 +130,12 @@ def main():
             for i in range(2):
                 good = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")], env=client_env,
                                       capture_output=True, text=True, timeout=25)
+                (private / f"client-{i+1}.log").write_text(good.stdout + good.stderr)
                 if good.returncode or "NIRI_RDP_APP_KEY_POINTER_RELEASE_OK" not in good.stdout:
-                    raise RuntimeError(f"real desktop RDP roundtrip {i} failed: {good.stderr}")
+                    raise RuntimeError(f"real desktop RDP roundtrip {i} failed: rc={good.returncode} "
+                                       f"{good.stdout} {good.stderr}")
+                if gfx and "NIRI_RDP_AVC420_DECODED_FRAMES" not in good.stdout:
+                    raise RuntimeError("NVENC roundtrip used bitmap fallback instead of decoded AVC420")
                 results[f"real_desktop_roundtrip_{i+1}"] = "passed"
                 time.sleep(0.3)
             log = (private / "app.log").read_text()
@@ -126,10 +145,11 @@ def main():
             if "FRAME" not in log:
                 raise RuntimeError("animated app did not reach frame callback checkpoint")
             results["wayland_application_events_and_animation"] = "passed"
-            results["no_physical_devices_or_inherited_display"] = "passed"
+            results["no_physical_input_or_dri_devices_or_inherited_display"] = "passed"
             held = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")],
                                   env=dict(client_env, NIRI_RDP_TEST_HOLD="1"),
                                   capture_output=True, text=True, timeout=25)
+            (private / "client-held.log").write_text(held.stdout + held.stderr)
             if held.returncode:
                 raise RuntimeError(f"held-input connection failed: {held.stderr}")
             time.sleep(0.5)
@@ -137,6 +157,7 @@ def main():
             # requires the disconnected virtual keyboard and pointer to release.
             released = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")], env=client_env,
                                       capture_output=True, text=True, timeout=25)
+            (private / "client-released.log").write_text(released.stdout + released.stderr)
             if released.returncode:
                 raise RuntimeError(f"disconnect did not restore app input state: {released.stderr}")
             results["held_key_and_button_disconnect_release"] = "passed"
@@ -153,10 +174,23 @@ def main():
                 time.sleep(0.05)
             niri.kill()
             niri.wait(timeout=5)
-            crashing.communicate(timeout=5)
+            crash_output, crash_error = crashing.communicate(timeout=5)
+            (private / "client-crash.log").write_text(crash_output + crash_error)
             if crashing.returncode != 2 or bridge.poll() is not None:
                 raise RuntimeError("compositor crash did not close the active RDP connection cleanly")
             results["compositor_crash_closes_active_rdp_frontend_survives"] = "passed"
+            if encoder == "nvenc":
+                bridge_log = (private / "bridge.log").read_text()
+                if "NVENC H.264 preflight passed" not in bridge_log:
+                    raise RuntimeError("requested NVENC encoder did not pass hardware preflight")
+                expected_graphics = 5 if gfx else 0
+                actual_graphics = bridge_log.count("RDP graphics using NVENC H.264 AVC420")
+                if actual_graphics != expected_graphics:
+                    raise RuntimeError(f"expected {expected_graphics} NVENC AVC420 sessions, "
+                                       f"observed {actual_graphics}")
+                key = ("nvenc_avc420_graphics_real_app_decode_input_reconnect" if gfx else
+                       "nvenc_bitmap_fallback_for_client_without_graphics")
+                results[key] = "passed"
             if fixture:
                 deadline = time.monotonic() + 3
                 while fixture.closed != fixture.accepted and time.monotonic() < deadline:
@@ -170,6 +204,11 @@ def main():
                 log.flush()
                 log.seek(0)
                 print(f"--- {Path(log.name).name} ---\n{log.read()[-6000:]}")
+            failure = ROOT / "artifacts/integration-failures" / secrets.token_hex(6)
+            failure.mkdir(parents=True)
+            for path in private.glob("*.log"):
+                shutil.copy2(path, failure / path.name)
+            print(f"Complete failure logs preserved in {failure}")
             raise
         finally:
             for proc in reversed(children):

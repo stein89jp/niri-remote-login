@@ -1,5 +1,6 @@
 #define _GNU_SOURCE
 #include <assert.h>
+#include <grp.h>
 #include <security/pam_appl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -7,6 +8,23 @@
 static int close_count, delete_count, end_count, order;
 static int peer_skipped;
 static int fail_step;
+static int group_count = 1, group_calls, group_member_index;
+static int group_lookup_missing, group_lookup_error;
+static struct group *fake_group(const char *name) {
+    assert(!strcmp(name, "niri-rdp-users"));
+    static struct group group = {.gr_gid = 4242};
+    return group_lookup_missing ? NULL : &group;
+}
+static int fake_groups(const char *user, gid_t primary, gid_t *groups, int *count) {
+    assert(!strcmp(user, "alice") && primary == 1000);
+    group_calls++;
+    if (group_lookup_error) return -1;
+    int capacity = *count;
+    *count = group_count;
+    for (int i = 0; i < capacity && i < group_count; i++)
+        groups[i] = i == group_member_index ? 4242U : 1000U;
+    return capacity < group_count ? -1 : group_count;
+}
 static struct pam_conv saved_conversation;
 static int fake_start(const char *service, const char *user, const struct pam_conv *conv, pam_handle_t **pam) {
     assert(!strcmp(service, "niri-rdp") && !strcmp(user, "alice"));
@@ -50,6 +68,8 @@ static int fake_end(pam_handle_t *pam, int status) {
 #define pam_authenticate fake_auth
 #define pam_acct_mgmt fake_account
 #define pam_get_item fake_get_item
+#define getgrnam fake_group
+#define getgrouplist fake_groups
 #define WORKER "/nonexistent/niri-rdp-worker-test"
 #define BROKER_TEST
 #include "broker.c"
@@ -172,6 +192,22 @@ static void test_launch_failure(void) {
     assert(close_count == 1 && delete_count == 1 && end_count == 1);
     puts("PASS fixed executable launch rejection closes opened PAM session and credentials");
 }
+static void test_group_authorization(void) {
+    struct passwd pw = {.pw_name="alice", .pw_uid=1000, .pw_gid=1000,
+        .pw_dir="/home/alice", .pw_shell="/bin/sh"};
+    group_count = 1; group_member_index = 0; group_calls = 0;
+    assert(account_allowed(&pw) && group_calls == 1);
+    group_count = 65; group_member_index = 64; group_calls = 0;
+    assert(account_allowed(&pw) && group_calls == 2);
+    group_member_index = -1; group_calls = 0;
+    assert(!account_allowed(&pw) && group_calls == 2);
+    group_lookup_error = 1; group_calls = 0;
+    assert(!account_allowed(&pw) && group_calls == 1);
+    group_lookup_error = 0; group_lookup_missing = 1; group_calls = 0;
+    assert(!account_allowed(&pw) && group_calls == 0);
+    group_lookup_missing = 0;
+    puts("PASS group authorization resizes supplementary-group buffer and fails closed on lookup errors");
+}
 static void test_peer(void) {
     int pair[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, pair) == 0);
     struct ucred credentials; socklen_t size = sizeof(credentials);
@@ -188,7 +224,7 @@ static void test_peer(void) {
 }
 int main(void) {
     test_request_bounds(); test_conversation(); test_rollback(); test_fd_transfer(); test_process_cleanup();
-    test_auth_failures(); test_launch_failure(); test_peer();
+    test_auth_failures(); test_launch_failure(); test_group_authorization(); test_peer();
     assert(valid_id("c42") && !valid_id("../gdm") && !valid_id(""));
-    printf("%d native broker groups passed; %d skipped (no PAM/logind session created)\n", 9-peer_skipped, peer_skipped); return 0;
+    printf("%d native broker groups passed; %d skipped (no PAM/logind session created)\n", 10-peer_skipped, peer_skipped); return 0;
 }

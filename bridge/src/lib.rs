@@ -1,5 +1,6 @@
 //! Real desktop adapter. IronRDP owns every RDP wire operation.
 pub mod broker;
+pub mod video;
 pub mod wayland;
 
 use ironrdp_server::{BitmapUpdate, DesktopSize, PixelFormat, ServerError, ServerErrorKind};
@@ -85,6 +86,19 @@ pub fn bitmap(
     for y in 0..u32::from(target.height) {
         let sy = y * height / u32::from(target.height);
         let sy = if inverted { height - 1 - sy } else { sy };
+        if u32::from(target.width) == width {
+            let src = (sy * stride) as usize;
+            let dst = y as usize * out_stride;
+            let row = &mut data[dst..dst + out_stride];
+            row.copy_from_slice(&bytes[src..src + out_stride]);
+            for pixel in row.as_chunks_mut::<4>().0 {
+                if abgr {
+                    pixel.swap(0, 2);
+                }
+                pixel[3] = 255;
+            }
+            continue;
+        }
         for x in 0..u32::from(target.width) {
             let sx = x * width / u32::from(target.width);
             let src = (sy * stride + sx * 4) as usize;
@@ -152,6 +166,44 @@ mod tests {
         assert_eq!(
             &result.data[..],
             &[9, 8, 7, 255, 12, 11, 10, 255, 3, 2, 1, 255, 6, 5, 4, 255]
+        );
+    }
+    #[test]
+    fn bitmap_row_copy_and_scaled_paths_preserve_pixel_contract() {
+        let bytes = [1, 2, 3, 0, 4, 5, 6, 17, 99, 99, 99, 99];
+        let direct = bitmap(
+            &bytes,
+            2,
+            1,
+            12,
+            false,
+            DesktopSize {
+                width: 2,
+                height: 1,
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(&direct.data[..], &[1, 2, 3, 255, 4, 5, 6, 255]);
+        let scaled = bitmap(
+            &bytes,
+            2,
+            1,
+            12,
+            false,
+            DesktopSize {
+                width: 4,
+                height: 2,
+            },
+            false,
+        )
+        .unwrap();
+        assert_eq!(
+            &scaled.data[..],
+            &[
+                1, 2, 3, 255, 1, 2, 3, 255, 4, 5, 6, 255, 4, 5, 6, 255, 1, 2, 3, 255, 1, 2, 3, 255,
+                4, 5, 6, 255, 4, 5, 6, 255
+            ]
         );
     }
     #[test]
