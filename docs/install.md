@@ -17,6 +17,36 @@ sudo usermod -aG niri-rdp-users "$USER"
 sudo systemctl enable --now niri-rdp-frontend.service
 ```
 
+For a fresh installation with an **NVENC-capable NVIDIA GPU and a working
+NVIDIA driver**, use this block instead of the one above:
+
+```sh
+sudo pacman -Syu --needed base-devel git
+git clone https://github.com/stein89jp/niri-remote-login.git
+cd niri-remote-login/packaging/arch/niri-rdp
+makepkg -si
+sudo usermod -aG niri-rdp-users "$USER"
+
+sudo install -d -m 755 /etc/systemd/system/niri-rdp-frontend.service.d
+sudo install -m 644 /usr/share/doc/niri-remote-login/nvidia-frontend.conf \
+  /etc/systemd/system/niri-rdp-frontend.service.d/nvidia.conf
+sudo systemctl daemon-reload
+
+sudo systemctl enable --now niri-rdp-frontend.service
+```
+
+The NVIDIA drop-in enables hardware video encoding with a default 60 fps capture
+budget and gives the frontend service GPU access. Your remote Linux account also
+needs GPU device access for hardware compositor rendering; see
+[Optional NVIDIA encoding](#optional-nvidia-encoding) for permissions and checks.
+
+If the frontend was already running when you added the NVIDIA drop-in, restart
+it to apply the change; `enable --now` does not restart an active service:
+
+```sh
+sudo systemctl restart niri-rdp-frontend.service
+```
+
 This single `niri-remote-login` package contains the patched headless compositor,
 RDP frontend, PAM/logind broker, defaults, and systemd units. Arch's package hooks
 create the `niri-rdp` service account and `niri-rdp-users` authorization group.
