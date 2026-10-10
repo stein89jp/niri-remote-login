@@ -77,7 +77,12 @@ driven by a failing interoperability test, rather than recreating protocol code.
 ## Authentication and session policy
 
 Use one dedicated account for the first real desktop test and initially reject
-accounts with another graphical session. Per-session private D-Bus and unique
+accounts with another graphical session. Broker-mode disconnect preserves the
+desktop for 45 seconds after broker-observed detachment; expiry fully logs out
+and cleans up the session. Fresh PAM authentication/account checks and group authorization permit
+resume of that same desktop, excluding its own logind session from the check.
+Logout, compositor exit or broker shutdown ends it. Installed-host resume
+validation remains pending. Per-session private D-Bus and unique
 sockets help, but `/run/user/$UID`, the systemd user manager, user files, portals,
 PipeWire and application single-instance behavior need explicit handling. A
 second desktop under the same UID is not independent security isolation.

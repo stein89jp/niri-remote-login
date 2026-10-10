@@ -279,9 +279,98 @@ static int desktop_fd(const char *private, uid_t uid, gid_t gid) {
     if (child > 0) while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
     return fd;
 }
+// Root-only handoff channel: only an already PAM-authorized broker child
+// can route a fresh frontend control stream to the holder of this UID.
+static int receive_handoff(int channel) {
+    unsigned char data[5];
+    struct iovec iov = {.iov_base=data, .iov_len=sizeof(data)};
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } control;
+    struct msghdr msg = {.msg_iov=&iov, .msg_iovlen=1,
+        .msg_control=control.bytes, .msg_controllen=sizeof(control.bytes)};
+    int fd = -1;
+    ssize_t n = recvmsg(channel, &msg, MSG_CMSG_CLOEXEC);
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    if (n == 5 && !(msg.msg_flags & (MSG_CTRUNC | MSG_TRUNC)) &&
+        !memcmp(data, "NRB1\0", 5) && c && c->cmsg_level == SOL_SOCKET &&
+        c->cmsg_type == SCM_RIGHTS && c->cmsg_len == CMSG_LEN(sizeof(int)))
+        memcpy(&fd, CMSG_DATA(c), sizeof(fd));
+    return fd;
+}
+static int resume_listener(const char *path) {
+    int listener = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    struct sockaddr_un address = {.sun_family=AF_UNIX};
+    if (strlen(path) >= sizeof(address.sun_path)) { close(listener); return -1; }
+    strcpy(address.sun_path, path);
+    unlink(path); // Caller holds the exclusive UID lock.
+    if (listener < 0 || bind(listener, (struct sockaddr *)&address, sizeof(address)) ||
+        chmod(path, 0600) || listen(listener, MAX_JOBS)) {
+        if (listener >= 0) close(listener);
+        return -1;
+    }
+    return listener;
+}
+static int forward_resume(const char *path, int frontend) {
+    int channel = socket(AF_UNIX, SOCK_SEQPACKET | SOCK_CLOEXEC, 0);
+    struct sockaddr_un address = {.sun_family=AF_UNIX};
+    if (strlen(path) >= sizeof(address.sun_path)) { close(channel); return -1; }
+    strcpy(address.sun_path, path);
+    int result = channel < 0 || connect(channel, (struct sockaddr *)&address, sizeof(address))
+        ? -1 : respond(channel, 0, frontend);
+    if (channel >= 0) close(channel);
+    return result;
+}
+static double monotonic_seconds(void) {
+    struct timespec now;
+    if (clock_gettime(CLOCK_MONOTONIC, &now)) return 0;
+    return (double)now.tv_sec + (double)now.tv_nsec / 1000000000.0;
+}
+static void serve_session_window(struct session *s, int fd, int listener,
+                          const char *private, uid_t uid, gid_t gid, unsigned int grace_seconds) {
+    double detached_until = 0;
+    while (!stopping) {
+        if (fd < 0 && monotonic_seconds() >= detached_until) break;
+        struct pollfd p[2] = {{.fd=fd, .events=POLLIN}, {.fd=listener, .events=POLLIN}};
+        int result = poll(p, 2, 200);
+        if ((result < 0 && errno != EINTR) || waitpid(s->worker, NULL, WNOHANG) == s->worker)
+            break;
+        // EOF starts the reconnect grace period, keeping PAM and applications alive.
+        if (p[0].revents) {
+            close(fd); fd = -1;
+            detached_until = monotonic_seconds() + (double)grace_seconds;
+        }
+        // Check expiry before accepting a handoff arriving at the deadline.
+        if (fd < 0 && monotonic_seconds() >= detached_until) break;
+        if (p[1].revents & POLLIN) {
+            int channel = accept4(listener, NULL, NULL, SOCK_CLOEXEC);
+            if (channel < 0) continue;
+            struct timeval timeout = {.tv_sec=1};
+            setsockopt(channel, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
+            int next = receive_handoff(channel);
+            close(channel);
+            if (next < 0) continue;
+            if (fd < 0 && monotonic_seconds() >= detached_until) {
+                respond(next, 1, -1); close(next); break;
+            }
+            // An attached desktop cannot be stolen by another connection.
+            if (fd >= 0) { respond(next, 1, -1); close(next); continue; }
+            int desktop = desktop_fd(private, uid, gid);
+            if (desktop < 0 || respond(next, 0, desktop)) {
+                if (desktop >= 0) close(desktop);
+                respond(next, 2, -1); close(next); continue;
+            }
+            close(desktop); fd = next;
+        }
+    }
+    if (fd >= 0) close(fd);
+}
+static void serve_session(struct session *s, int fd, int listener,
+                          const char *private, uid_t uid, gid_t gid) {
+    serve_session_window(s, fd, listener, private, uid, gid, 45);
+}
 static void handle_connection(int fd, int ready) {
     struct request r; struct session s = {0};
-    int lock = -1, desktop = -1; unsigned char failure = 3;
+    int lock = -1, desktop = -1, resume = -1; unsigned char failure = 3;
+    char resumepath[128] = {0};
     char private[128] = {0}; uid_t uid = 0; gid_t gid = 0;
     struct timeval timeout = {.tv_sec = 10};
     setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
@@ -301,7 +390,17 @@ static void handle_connection(int fd, int ready) {
     uid = pw->pw_uid; gid = pw->pw_gid;
     char lockpath[128]; snprintf(lockpath, sizeof(lockpath), ROOT "/user-%lu.lock", (unsigned long)uid);
     lock = open(lockpath, O_CREAT | O_RDWR | O_CLOEXEC | O_NOFOLLOW, 0600);
-    if (lock < 0 || flock(lock, LOCK_EX | LOCK_NB) || graphical_sessions(uid) != 0) goto out;
+    if (lock < 0) goto out;
+    snprintf(resumepath, sizeof(resumepath), ROOT "/sessions/user-%lu.sock", (unsigned long)uid);
+    if (flock(lock, LOCK_EX | LOCK_NB)) {
+        if ((errno != EWOULDBLOCK && errno != EAGAIN) || forward_resume(resumepath, fd)) goto out;
+        failure = 255;
+        if (write(ready, "R", 1) != 1) goto out;
+        goto out;
+    }
+    if (graphical_sessions(uid) != 0) goto out;
+    resume = resume_listener(resumepath);
+    if (resume < 0) goto out;
     failure = 2;
     if (pam_putenv(s.pam, "XDG_SESSION_TYPE=wayland") != PAM_SUCCESS ||
         pam_putenv(s.pam, "XDG_SESSION_CLASS=user") != PAM_SUCCESS ||
@@ -339,21 +438,19 @@ static void handle_connection(int fd, int ready) {
     if (write(ready, "R", 1) != 1) goto out;
     close(ready); ready = -1;
     close(desktop); desktop = -1; alarm(0);
-    while (!stopping) {
-        struct pollfd p = {.fd = fd, .events = POLLIN};
-        int result = poll(&p, 1, 200);
-        if (result > 0 || (result < 0 && errno != EINTR) ||
-            waitpid(s.worker, NULL, WNOHANG) == s.worker) break;
-    }
+    serve_session(&s, fd, resume, private, uid, gid);
+    fd = -1;
+
 out:
     alarm(0); wipe_request(&r);
     if (failure != 255) respond(fd, failure, -1);
+    if (resume >= 0) { close(resume); unlink(resumepath); }
     if (desktop >= 0) close(desktop);
     cleanup(&s);
     if (*private) remove_desktop(private, uid, gid);
     if (lock >= 0) close(lock);
     if (ready >= 0) close(ready);
-    close(fd);
+    if (fd >= 0) close(fd);
 }
 static int terminate_id(const char *id) {
     char *service = NULL;

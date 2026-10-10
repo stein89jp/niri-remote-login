@@ -123,7 +123,20 @@ your bindings, appearance, includes and startup applications. DankMaterialShell
 startup commands have not already launched a bar. Accounts without a Niri
 configuration receive `foot` and a bar: Super+Enter opens a terminal, Super+D
 opens Fuzzel, Super+Q closes a window, and Super+Shift+Q logs out.
-Disconnect ends the desktop; reconnect creates a fresh session. The compositor
+Disconnecting or losing the network preserves the desktop, open windows and
+applications for 45 seconds after the broker observes the connection detach. Reconnect with
+the same Linux account and authenticate again to resume it; held keys and mouse
+buttons are released when the old connection closes. When that grace window
+expires, the broker fully logs out the desktop and cleans up its applications
+and session; a subsequent login starts a fresh desktop after cleanup.
+Super+Shift+Q logs out and ends the desktop; compositor exit or stopping
+the broker also ends it. A frontend restart preserves the desktop only if you reconnect
+within the same 45-second grace window. After a silent network
+failure, the frontend may temporarily reject a reconnect while it still considers
+the old connection active; retry once it detects that connection has closed.
+Each resume rechecks PAM authentication, account policy and group authorization;
+a revoked or expired account cannot resume.
+The compositor
 tries headless GPU rendering automatically, preferring NVIDIA hardware, and falls
 back to surfaceless rendering when hardware is unavailable. Optional NVIDIA
 encoding is described below. This remains

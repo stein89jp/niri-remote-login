@@ -34,7 +34,11 @@ port are configurable in `/etc/niri-rdp/frontend.conf`.
 
 Stock `/usr/bin/niri` stays alongside the patched
 `/usr/lib/niri-rdp/niri-headless`. The remote session has its own display and uses your Niri
-configuration. Reconnect creates a new session. Client-selected resolution and
+configuration. A dropped connection preserves the desktop and applications;
+reconnect with the same Linux account within 45 seconds of broker-observed
+disconnection to resume after fresh authentication. After that grace window,
+the broker logs out the desktop; the next login starts a fresh one.
+Logout, compositor exit, or broker shutdown ends the desktop. Client-selected resolution and
 single-display live resizing are supported. Bitmap transport is the default;
 optional host NVIDIA NVENC H.264 encoding is available, with a 60 fps capture
 budget, reusable capture buffers and unchanged-frame suppression. The compositor

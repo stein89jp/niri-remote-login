@@ -10,7 +10,7 @@ are in `scripts/headless-integration.py`; they do not substitute for this matrix
 | Headless desktop bridge | Private namespace, no physical devices or inherited display; animated Wayland app, decoded RDP frame, key/pointer changes and releases | Automated real-app test passed |
 | TLS broker transport | TLS-only FreeRDP credentials, connected Wayland FD transfer and lease EOF for each connection | Passed with namespace test broker; no Linux-account/PAM proof |
 | Linux-account login | Valid dedicated account creates exactly one remote Wayland logind session of service `niri-rdp`, expected UID, no seat; invalid account/password creates none | Pending separate Arch machine |
-| RDP login screen | Connect without a ClientInfo password; see the login screen without a compositor/session, reject a bad password, accept the Linux account, verify masked pixels, input, and disconnect cleanup | Automated login tests; installed PAM and Windows checks pending |
+| RDP login screen | Connect without a ClientInfo password; see the login screen without a compositor/session, reject a bad password, accept the Linux account, verify masked pixels, input, and disconnect detachment | Automated login tests; installed PAM and Windows checks pending |
 | Authentication policy | Wrong password, unknown user, root, nonmember, locked/expired user, additional PAM prompt, account with local graphical session; confirm no app/session/private directory remains | Pending real PAM tests; native failure tests cover contracts |
 | Cold boot | Enable system frontend, reboot test machine, do not log in locally, connect directly using Windows Remote Desktop; record `loginctl` identity and terminal `id` output | Pending |
 | Windows | mstsc displays dedicated Niri terminal and sends keyboard, pointer, wheel and modifiers; test ordinary TLS negotiation, missing-password login screen, optional TLS-only profile, and certificate verification | Pending |
@@ -21,7 +21,9 @@ are in `scripts/headless-integration.py`; they do not substitute for this matrix
 | Monitor disconnected | Disconnect physical display, retain remote session and repeat interaction; separately test boot without attached monitor | Pending |
 | Logout | Super+Shift+Q: RDP disconnects, PAM/logind session closes, all app/compositor/private D-Bus descendants exit, desktop directory removed | Pending real session checks |
 | Compositor crash | SIGKILL test compositor PID; RDP closes promptly, broker cleans session/app/bus/directory; new login succeeds | Disposable RDP close tested; real broker cleanup pending |
-| Frontend/broker crash | Stop/SIGKILL each test service with active session; test `ExecStopPost` recovery and orphan scope teardown, restart and log in again | Pending |
+| Persistent reconnect | Drop the network or close mstsc with an open app; reconnect within 45 seconds of broker-observed detachment to the same account, verify identical logind session ID/compositor PID and application state; repeat with frontend restart and held keys/buttons | Native broker and real-app input checks; installed PAM/logind and Windows resume pending |
+| Resume authorization | Reject wrong password, expired/locked account and removed `niri-rdp-users` membership on resume; preserve the detached desktop without creating another session | Pending real PAM tests |
+| Frontend/broker crash | Frontend stop/SIGKILL retains desktop for reconnect within the 45-second grace window; broker stop/SIGKILL ends desktops. Test `ExecStopPost` recovery and orphan scope teardown, restart and log in again | Pending |
 | Input disconnect | Disconnect while key and button held; verify releases and no state carried into next connection | Automated real-app test passed |
 | GNOME preservation | Compare GRD/GDM enablement/listeners and local session before/after test-machine experiment; do not alter working host | Packages have no GNOME configuration or stock Niri replacement |
 
@@ -38,6 +40,12 @@ pgrep -a -u niri-remote-test
 find /run/niri-rdp/desktops -mindepth 1 -maxdepth 1 -type d
 ```
 
+Disconnect retains the desktop for 45 seconds after broker-observed detachment.
+Verify expiry fully closes the PAM/logind session and applications, and the next
+login starts a fresh desktop after cleanup. Rejected resume authentication must
+not extend the grace window. Also check cleanup after compositor logout/exit or
+broker shutdown.
+
 Expected after teardown: no project logind session, desktop directory, compositor,
 private D-Bus or test application. A still-connected SSH/TTY administrator is not
 an orphan project session. Broker socket and listener remain while services run.
@@ -51,7 +59,9 @@ Single-session frontend, US physical-key input, normal transform and scale 1 are
 the current contract. The frontend follows client-selected initial dimensions
 and supports live single-display resolution requests through Display Control.
 Rebuild both packages; see the [resolution contract](../bridge/README.md#dynamic-resolution). No
-persistent reconnect, multi-monitor, clipboard, audio or Unicode/IME claim is made.
+multi-monitor, clipboard, audio or Unicode/IME claim is made. Broker mode retains
+desktops for authenticated reconnect; installed PAM/logind and Windows validation
+of that behavior remains pending.
 The optional host encoder uses H.264 AVC420; it does not enable host-side NVDEC
 or ensure that the RDP client uses hardware decoding. Compositor rendering prefers
 hardware EGL devices with software fallback. Record the selected renderer and

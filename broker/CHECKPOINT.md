@@ -10,8 +10,13 @@
   existing graphical sessions and unsupported PAM multi-prompt flows.
 - Stock Niri/GNOME/GDM/GRD are untouched. Worker uses the coordinator's pinned
   maintained side-by-side `/usr/lib/niri-rdp/niri-headless` package.
-- Frontend retains the control stream; disconnect/logout/crash triggers lifecycle
-  cleanup. Parent/service logind cleanup supplements native process groups.
+- Frontend retains the control stream while attached; EOF now retains the desktop
+  for authenticated reconnect for 45 seconds after broker-observed detachment.
+  Expiry fully logs out and cleans up the desktop; the next login starts fresh. Fresh PAM authentication/account
+  checks and group authorization are required on resume; a root-only per-UID
+  holder socket binds the new Wayland connection to the retained desktop.
+  Logout/compositor exit/broker shutdown triggers lifecycle cleanup.
+  Parent/service logind cleanup supplements native process groups.
   Failed termination retains root-only records for 5s retries; logind can recover
   missing crash records. Async termination keeps directories until a later retry.
 - The working host receives no package installation, PAM change, service
@@ -81,7 +86,9 @@ absence of an earlier login as an error. Query mode -1 includes closing sessions
    the checked seatless remote logind session, UID worker and separate desktop.
 2. Actual wrong-password, denied/locked/expired account, malformed IPC and
    concurrent/same-UID graphical-session rejection with no resource leaks.
-3. Real launch failure, logout, disconnect, compositor/holder/broker SIGKILL and
+3. Disconnect/network loss/frontend restart must preserve session identity and
+   application state; reconnect must authenticate anew and reject revoked access.
+   Real launch failure, logout, compositor/holder/broker SIGKILL and
    service restart; assert session scope, bus/app descendants and private runtime
    cleanup. Especially audit crash during PAM registration and logind termination
    failures; intentional persistent user-manager units are outside native tests.

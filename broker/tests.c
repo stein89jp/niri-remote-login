@@ -5,6 +5,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <unistd.h>
+static int fake_setgroups(size_t count, const gid_t *groups) {
+    assert(count == 0 && groups == NULL); return 0;
+}
+static int fake_setgid(gid_t gid) { assert(gid == getgid()); return 0; }
+static int fake_setuid(uid_t uid) { assert(uid == getuid()); return 0; }
 static int close_count, delete_count, end_count, order;
 static int peer_skipped;
 static int fail_step;
@@ -70,6 +76,9 @@ static int fake_end(pam_handle_t *pam, int status) {
 #define pam_get_item fake_get_item
 #define getgrnam fake_group
 #define getgrouplist fake_groups
+#define setgroups fake_setgroups
+#define setgid fake_setgid
+#define setuid fake_setuid
 #define WORKER "/nonexistent/niri-rdp-worker-test"
 #define BROKER_TEST
 #include "broker.c"
@@ -222,9 +231,117 @@ static void test_peer(void) {
     close(pair[0]); close(pair[1]);
     puts("PASS SO_PEERCRED requires exact authorized frontend UID");
 }
+static int resume_response(int fd, unsigned char expected) {
+    struct pollfd p = {.fd=fd, .events=POLLIN};
+    assert(poll(&p, 1, 3000) == 1);
+    unsigned char bytes[5]; struct iovec iov = {.iov_base=bytes, .iov_len=sizeof(bytes)};
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } ancillary;
+    struct msghdr msg = {.msg_iov=&iov, .msg_iovlen=1,
+        .msg_control=ancillary.bytes, .msg_controllen=sizeof(ancillary.bytes)};
+    assert(recvmsg(fd, &msg, MSG_CMSG_CLOEXEC) == 5);
+    assert(!memcmp(bytes, "NRB1", 4) && bytes[4] == expected);
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    if (expected) { assert(c == NULL); return -1; }
+    assert(c && c->cmsg_type == SCM_RIGHTS);
+    int desktop; memcpy(&desktop, CMSG_DATA(c), sizeof(desktop));
+    return desktop;
+}
+static void test_resume_session(void) {
+    char directory[] = "/tmp/niri-rdp-resume-XXXXXX";
+    assert(mkdtemp(directory));
+    char path[128]; assert(snprintf(path, sizeof(path), "%s/resume", directory) > 0);
+    int listener = resume_listener(path); assert(listener >= 0);
+    struct stat st; assert(stat(path, &st) == 0 && (st.st_mode & 0777) == 0600);
+    struct sockaddr_un address = {.sun_family=AF_UNIX};
+    assert(snprintf(address.sun_path, sizeof(address.sun_path), "%s/wayland-0", directory) > 0);
+    int wayland = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0); assert(wayland >= 0);
+    assert(bind(wayland, (struct sockaddr *)&address, sizeof(address)) == 0);
+    assert(listen(wayland, 4) == 0);
+    int initial[2], notification[2], worker_stop[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, initial) == 0);
+    assert(pipe(notification) == 0 && pipe(worker_stop) == 0);
+    pid_t holder = fork(); assert(holder >= 0);
+    if (!holder) {
+        alarm(10); close(initial[0]); close(notification[0]); close(worker_stop[1]); close(wayland);
+        pid_t worker = fork(); assert(worker >= 0);
+        if (!worker) {
+            close(initial[1]); close(notification[1]); close(listener);
+            char byte; assert(read(worker_stop[0], &byte, 1) == 1); _exit(0);
+        }
+        close(worker_stop[0]);
+        assert(write(notification[1], &worker, sizeof(worker)) == (ssize_t)sizeof(worker));
+        close(notification[1]);
+        struct session s = {.worker=worker};
+        serve_session_window(&s, initial[1], listener, directory, getuid(), getgid(), 1);
+        close(listener); _exit(0);
+    }
+    close(initial[1]); close(notification[1]); close(worker_stop[0]); close(listener);
+    pid_t worker; assert(read_full(notification[0], &worker, sizeof(worker)) == 0);
+    close(notification[0]);
+    int retry[2]; assert(socketpair(AF_UNIX, SOCK_STREAM, 0, retry) == 0);
+    assert(forward_resume(path, retry[1]) == 0); close(retry[1]);
+    assert(resume_response(retry[0], 1) == -1); close(retry[0]);
+    close(initial[0]);
+    // Multiple detach/resume cycles must all use the same surviving worker and socket.
+    for (int cycle = 0; cycle < 3; cycle++) {
+        assert(socketpair(AF_UNIX, SOCK_STREAM, 0, retry) == 0);
+        assert(forward_resume(path, retry[1]) == 0); close(retry[1]);
+        int desktop = resume_response(retry[0], 0);
+        struct pollfd p = {.fd=wayland, .events=POLLIN}; assert(poll(&p, 1, 3000) == 1);
+        int peer = accept4(wayland, NULL, NULL, SOCK_CLOEXEC); assert(peer >= 0);
+        assert(kill(worker, 0) == 0 && waitpid(holder, NULL, WNOHANG) == 0);
+        assert(write(peer, "W", 1) == 1);
+        char byte; assert(read(desktop, &byte, 1) == 1 && byte == 'W');
+        // Total elapsed time exceeds one grace period; attaching resets each deadline.
+        usleep(600000);
+        close(peer); close(desktop); close(retry[0]);
+        usleep(200000);
+    }
+    assert(write(worker_stop[1], "X", 1) == 1); close(worker_stop[1]);
+    int status; assert(waitpid(holder, &status, 0) == holder);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(wayland); assert(unlink(path) == 0); assert(unlink(address.sun_path) == 0);
+    assert(rmdir(directory) == 0);
+    puts("PASS attached session rejects takeover; repeated detach/resume retains worker and desktop; worker exit ends holder");
+}
+static void test_detach_timeout(void) {
+    int initial[2], ready[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM, 0, initial) == 0 && pipe(ready) == 0);
+    pid_t holder = fork(); assert(holder >= 0);
+    if (!holder) {
+        alarm(6); close(initial[0]); close(ready[0]); reset_counts();
+        int worker_ready[2]; assert(pipe(worker_ready) == 0);
+        pid_t worker = fork(); assert(worker >= 0);
+        if (!worker) {
+            close(initial[1]); close(ready[1]); close(worker_ready[0]);
+            assert(setsid() >= 0);
+            assert(write(worker_ready[1], "R", 1) == 1); close(worker_ready[1]);
+            for (;;) pause();
+        }
+        close(worker_ready[1]); char byte;
+        assert(read(worker_ready[0], &byte, 1) == 1); close(worker_ready[0]);
+        assert(write(ready[1], &worker, sizeof(worker)) == (ssize_t)sizeof(worker)); close(ready[1]);
+        struct session s = {.worker=worker, .pam=(pam_handle_t *)1, .credentials=true, .opened=true};
+        serve_session_window(&s, initial[1], -1, "/unused", getuid(), getgid(), 1);
+        assert(kill(worker, 0) == 0);
+        cleanup(&s);
+        assert(s.worker == 0 && close_count == 1 && delete_count == 1 && end_count == 1);
+        assert(kill(worker, 0) == -1 && errno == ESRCH);
+        _exit(0);
+    }
+    close(initial[1]); close(ready[1]); pid_t worker;
+    assert(read_full(ready[0], &worker, sizeof(worker)) == 0); close(ready[0]);
+    close(initial[0]);
+    int status; assert(waitpid(holder, &status, 0) == holder);
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    assert(kill(worker, 0) == -1 && errno == ESRCH);
+    puts("PASS expired detach grace ends holder and cleans worker, PAM session and credentials");
+}
 int main(void) {
     test_request_bounds(); test_conversation(); test_rollback(); test_fd_transfer(); test_process_cleanup();
     test_auth_failures(); test_launch_failure(); test_group_authorization(); test_peer();
+    test_resume_session();
+    test_detach_timeout();
     assert(valid_id("c42") && !valid_id("../gdm") && !valid_id(""));
-    printf("%d native broker groups passed; %d skipped (no PAM/logind session created)\n", 10-peer_skipped, peer_skipped); return 0;
+    printf("%d native broker groups passed; %d skipped (no PAM/logind session created)\n", 12-peer_skipped, peer_skipped); return 0;
 }

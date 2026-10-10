@@ -21,7 +21,7 @@ Build the combined package (or both split packages) and inspect its contents. Re
 acceptance checks, including Windows and monitor power-off, before promoting it.
 Stock Niri's version changing does not justify automatically updating this fork.
 
-On the test installation, close remote sessions, stop the frontend and broker,
+On the test installation, log out of remote desktops, stop the frontend and broker,
 follow Arch's full-upgrade practice for repository libraries, and install the new
 combined package file with `pacman -U` (or both files for a split build). Review `.pacnew`/`.pacsave` changes;
 never blindly replace the dedicated PAM policy. Reload systemd, start the
@@ -62,6 +62,7 @@ an edited `/etc/niri-rdp/headless.kdl` and may place the new defaults in
 updated `binds` into your existing remote configuration before reconnecting.
 If you use `~/.config/niri-rdp/config.kdl`, that file takes precedence over the
 system defaults and must be updated separately. Existing remote sessions need a
-disconnect and fresh login to run new startup commands. The remote compositor
+logout and fresh login to run new startup commands. A disconnect now retains
+the existing desktop, so reconnecting does not rerun startup commands. The remote compositor
 has its own Wayland runtime and D-Bus bus; shared systemd desktop services are
 not started or given its environment.

@@ -19,9 +19,19 @@ Broker mode defaults to `0.0.0.0:33991` for direct Windows connections.
 `NIRI_RDP_LISTEN` accepts a numeric IPv4/IPv6 address and nonzero port. Disposable
 mode defaults to `127.0.0.1:33991` and rejects non-loopback configuration and peers.
 No UDP transport, preemption or reconnect cookie is enabled.
-Each TCP connection receives a new authenticated desktop; reconnect performs PAM
-again and creates a new session. Disconnect closes the broker lease and ends
-the session. A compositor crash terminates the capture stream with the library
+Each TCP connection authenticates through PAM. In broker mode, reconnecting with
+the same authorized Linux account resumes its retained desktop and applications.
+Disconnect closes the frontend Wayland connection and broker lease after held
+input is released; lease EOF detaches the frontend and starts a 45-second grace
+window. Reconnect before expiry to resume; otherwise the broker fully logs out
+and cleans up the desktop, and the next login creates a fresh one after cleanup.
+The timer starts when the broker observes detachment, including frontend exit.
+Logout, compositor exit or broker shutdown ends the desktop immediately.
+The single-connection reject policy can temporarily reject reconnect after a
+silent network loss until the old TCP connection is detected as closed; retry
+then. Installed Windows behavior remains pending validation.
+The disposable mode and namespace test broker do not prove persistent PAM-backed
+resume. A compositor crash terminates the capture stream with the library
 `Ok(None)` contract, ending the connection and releasing its broker lease; the frontend keeps accepting.
 
 The default `NIRI_RDP_MODE=broker` connects only to `/run/niri-rdp/broker.sock`.
@@ -39,7 +49,8 @@ clear the password; attempts have a two-second delay and the connection closes
 after five failures. The screen supports US physical keys and Unicode character
 events, Tab, Backspace, Enter, and mouse focus/sign-in. Password pixels contain
 a fixed mask, never the secret or its length. Disconnect cancels access to a
-pending session and releases its lease. The display/input adapters switch to the
+pending desktop binding and releases its lease; a desktop already created by the
+broker remains available for authenticated resume. The display/input adapters switch to the
 real desktop after successful login, including optional NVENC and live resizing.
 The login form uses the same negotiated graphics wrapper as the desktop and
 repaints once per second while waiting for input, so late client surface setup

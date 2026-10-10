@@ -33,12 +33,17 @@ output size. Accounts must have UID >= 1000, a login shell and membership in
 `niri-rdp-users`. The frontend account and root are rejected. The final identity
 returned by PAM is resolved and authorized; the originally requested identity
 is not trusted after PAM. A nonblocking per-UID lock prevents concurrent broker
-sessions. Existing X11/Wayland sessions, including closing sessions, reject
-login. The initial desktop should use a dedicated test account. A simultaneous
+desktops. A retained broker desktop can be resumed after fresh PAM authentication,
+account checks and group authorization; its own logind session is exempted from
+the existing-session check. Other X11/Wayland sessions, including closing
+sessions, reject login. The initial desktop should use a dedicated test account. A simultaneous
 local login can race this check; the broker cannot lock GDM or an unrelated
 login manager, and same-UID desktops are not an isolation boundary.
 
-Each connection has a separate privileged holder process. The dedicated
+Each desktop has a separate privileged holder process. Its per-UID resume socket
+is root-only and authenticates the root broker peer; the frontend cannot access
+it directly. The holder retains the original PAM session while detached.
+A resume request authenticates anew without opening another desktop session. The dedicated
 `niri-rdp` PAM policy includes Arch's remote-login auth/account policy and
 requires `pam_systemd`. Password-only PAM is supported; a second username or
 secret prompt across the handle's lifetime is rejected, including OTP/MFA and
@@ -86,9 +91,17 @@ validate ancillary metadata, and reject missing/excess descriptors. The broker
 connects to the new compositor as its target UID before passing the FD; the
 frontend never connects to the user's local Wayland socket or filesystem.
 
-Keep the control stream open for the desktop's lifetime. EOF, any additional
-byte, compositor exit, or service shutdown tears down the session. No reconnect
-or detach command exists in v1. Close all frontend-held descriptors on teardown.
+Keep the control stream open while attached to the desktop. EOF detaches the
+frontend and retains the desktop for a 45-second grace window measured from
+broker-observed detachment. If no authorized reconnect completes before expiry,
+the holder fully logs out and cleans up the desktop. A subsequent login starts
+a fresh desktop after cleanup. An ordinary v1 login within the grace window with
+the same account performs fresh authentication and authorization, then receives
+a new Wayland connection to that desktop. No client resume token or reconnect
+cookie bypasses authentication. Unexpected additional bytes detach the frontend
+and start the same 45-second grace window.
+Compositor exit, explicit compositor logout, or broker shutdown tears down the
+desktop. Close all frontend-held descriptors when detaching.
 
 ## Cleanup and failure behavior
 
@@ -130,7 +143,11 @@ to inspect the new session's User, Leader, Service, Type, Remote, Seat and VTNr.
 Expect the account UID, `niri-rdp`, `wayland`, Remote=yes, no seat and VTNr=0.
 Inspect its process cgroup and verify the compositor/app share that session
 scope; no compositor opens a physical DRM card or VT. After the control socket
-closes, verify the session and compositor/app/bus processes disappear and
+closes, verify the same session, compositor/app/bus processes and desktop remain.
+Reconnect and check the logind session ID, compositor PID and open application
+state are unchanged. Reject a wrong password and revoked group membership on
+resume without creating another session. Then log out of the compositor and
+verify the session and compositor/app/bus processes disappear and
 `/run/niri-rdp/desktops` and `/run/niri-rdp/sessions` contain no session resources.
 An unrelated SSH session or existing user manager can legitimately keep
 `/run/user/UID` alive; it must not be deleted manually by the broker.
