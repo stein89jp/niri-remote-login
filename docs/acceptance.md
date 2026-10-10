@@ -59,7 +59,10 @@ Single-session frontend, Japanese JP106 physical-key input, normal transform and
 the current contract. The frontend follows client-selected initial dimensions
 and supports live single-display resolution requests through Display Control.
 Rebuild both packages; see the [resolution contract](../bridge/README.md#dynamic-resolution). No
-multi-monitor, clipboard, audio or remote IME composition claim is made. Broker mode retains
+multi-monitor, clipboard or remote IME composition claim is made. Session audio
+has private PipeWire capture and RDP packet tests; installed-service playback
+through Windows mstsc, including reconnect, still requires actual-machine validation.
+Broker mode retains
 desktops for authenticated reconnect; installed PAM/logind and Windows validation
 of that behavior remains pending.
 The optional host encoder uses H.264 AVC420; it does not enable host-side NVDEC

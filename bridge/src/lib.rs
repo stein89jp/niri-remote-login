@@ -1,4 +1,5 @@
 //! Real desktop adapter. IronRDP owns every RDP wire operation.
+pub mod audio;
 pub mod broker;
 pub(crate) mod keyboard;
 pub mod login;

@@ -81,14 +81,19 @@ Use an AF_UNIX SOCK_STREAM socket. Send exactly:
 | Username | Length bytes | Linux ASCII account name, no NUL |
 | Password | Length bytes | UTF-8 password bytes, no NUL |
 
-The response is 5 bytes: `NRB1` and one status byte. Status 0 carries **one**
-SCM_RIGHTS Wayland connection FD in the first `recvmsg`; 1 means generic
+The response is 5 bytes: `NRB1` and one status byte. Status 0 carries **two ordered**
+SCM_RIGHTS descriptors: a Wayland connection and a raw stereo 48 kHz S16LE PCM
+stream from the private session's sink monitor. The frontend also accepts the
+legacy single-Wayland-FD reply for transport fixtures, with audio unavailable.
+The PCM socket waits for one ASCII `A` byte before starting capture; the frontend
+sends it after sound-format negotiation and authenticated desktop binding.
+Status 1 means generic
 authentication/account/policy rejection; 2 means backend/session startup failed;
 3 means malformed/unauthorized request or connection capacity exceeded. No
 human-readable credentials/errors are returned. The frontend must use
 `recvmsg`, preserve received FDs while finishing a fragmented 5-byte header,
 validate ancillary metadata, and reject missing/excess descriptors. The broker
-connects to the new compositor as its target UID before passing the FD; the
+connects to the compositor and PCM socket as its target UID before passing the FDs; the
 frontend never connects to the user's local Wayland socket or filesystem.
 
 Keep the control stream open while attached to the desktop. EOF detaches the

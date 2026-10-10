@@ -55,6 +55,14 @@ and private key. Existing certificates are preserved and validated. No separate
 release-preparation command, build VM, certificate-generation commands, or SSH
 tunnel is required. Services start only when you enable/start them.
 
+Remote-session playback uses a private PipeWire output and travels inside the
+encrypted RDP connection. The package includes the required PipeWire,
+PipeWire-Pulse, WirePlumber and Pulse client utilities. In Windows mstsc, select
+**Local Resources → Remote audio → Settings → Play on this computer**; saved
+`.rdp` profiles use `audiomode:i:0`. The remote output is **Remote Desktop Audio**.
+After upgrading, end any retained remote desktop and reconnect so the new session
+starts its private audio services. See the [audio contract](../bridge/README.md#session-audio).
+
 The compositor installs at `/usr/lib/niri-rdp/niri-headless`, alongside stock
 `/usr/bin/niri`. It launches a separate remote desktop. It does not share your
 existing local desktop or import its Niri configuration.

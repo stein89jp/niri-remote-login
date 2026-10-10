@@ -55,6 +55,7 @@ pub struct Login {
     path: PathBuf,
     output: String,
     video: Option<Video>,
+    audio: crate::audio::Audio,
 }
 impl Login {
     pub fn new(
@@ -93,7 +94,12 @@ impl Login {
             path,
             output,
             video,
+            audio: Default::default(),
         }
+    }
+    pub fn with_audio(mut self, audio: crate::audio::Audio) -> Self {
+        self.audio = audio;
+        self
     }
     pub fn bound(&self) -> BoundConnection {
         BoundConnection {
@@ -104,6 +110,7 @@ impl Login {
     pub fn stop(&self) {
         let mut state = self.state.lock().unwrap();
         state.stopped = true;
+        self.audio.clear();
         state.password.clear();
         if let Some(desktop) = state.desktop.take() {
             desktop.stop();
@@ -142,6 +149,7 @@ impl Login {
         let path = self.path.clone();
         let output = self.output.clone();
         let changed = self.changed.clone();
+        let audio = self.audio.clone();
         // PAM and compositor startup may block; neither runs in the RDP loop.
         std::thread::spawn(move || {
             let result = broker::open(&path, &username, &password.0).and_then(|session| {
@@ -154,14 +162,16 @@ impl Login {
                 {
                     return Ok(None);
                 }
-                Desktop::start(session.socket, output, size, Some(session.lease)).map(Some)
+                let desktop = Desktop::start(session.socket, output, size, Some(session.lease))?;
+                Ok(Some((desktop, session.audio)))
             });
             drop(password);
             if let Some(state) = state.upgrade() {
                 let mut state = state.lock().unwrap();
                 state.busy = false;
                 match result {
-                    Ok(Some(mut desktop)) if !state.stopped => {
+                    Ok(Some((mut desktop, audio_socket))) if !state.stopped => {
+                        audio.attach(audio_socket);
                         // Preserve lock state and modifiers held while signing in.
                         let synchronized_caps =
                             if let Some(KeyboardEvent::Synchronize(flags)) = &state.synchronize {
@@ -194,7 +204,7 @@ impl Login {
                         }
                         state.desktop = Some(desktop);
                     }
-                    Ok(Some(desktop)) => desktop.stop(),
+                    Ok(Some((desktop, _))) => desktop.stop(),
                     _ => {
                         state.failed = true;
                         state.retry_at = Instant::now() + Duration::from_secs(2);

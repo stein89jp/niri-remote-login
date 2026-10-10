@@ -208,8 +208,34 @@ are required; unsupported layouts fail closed. Unicode events commit exact text 
 Japanese and UTF-16 surrogate pairs (emoji). Each character is a balanced tap; the
 physical keymap and held modifiers are restored afterward. Phone-side IME
 composition can submit committed text this way. Arbitrary layouts, Pause/E1,
-remote IME composition, clipboard, audio
+remote IME composition, clipboard
 and lock-screen behavior remain work.
+
+## Session audio
+
+Broker sessions redirect application playback to the RDP client over the
+TLS-protected `rdpsnd` channel. Each desktop starts its own PipeWire,
+PipeWire-Pulse and WirePlumber instances, with a virtual default output named
+**Remote Desktop Audio**. Hardware discovery is disabled on that private graph.
+Applications use its private runtime and Pulse socket; the frontend receives
+only a broker-authorized raw PCM descriptor, without access to the user's runtime.
+This follows GNOME Remote Login's session-playback model: capture an audio sink
+and send it through RDP ([GNOME implementation](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dvc-audio-playback.c)).
+
+Playback is stereo 48 kHz, signed 16-bit little-endian PCM, in 20 ms blocks
+(about 1.54 Mbit/s before framing). A client must enable remote playback and
+accept this format. No microphone redirection is provided. Audio starts after
+successful Linux authentication, including submission through the login form.
+Disconnect closes capture; authenticated reconnect opens a fresh monitor of the
+retained desktop. At most four waves await confirmation, and capture continues
+draining during client stalls so stale samples do not accumulate in memory.
+Disposable compositor mode has no audio backend.
+
+`python3 -m unittest tests.test_audio -v` runs real private PipeWire playback,
+captures a tone and repeats after reconnect. Rust tests negotiate the sound
+channel, decode the PCM Wave2 PDU, verify the client's format index, and check
+backpressure and disconnect cleanup. Installed-service and Windows mstsc sound
+playback remain actual-machine acceptance checks.
 
 ## Dynamic resolution
 
@@ -243,7 +269,8 @@ commands above with the current debug or release frontend and rebuilt compositor
 
 Broker transport is bounded `NRB1 + BE16(username length) + BE16(password length)
 + UTF-8 credentials`, no NUL; username 1..64, password 1..512 bytes. Reply is
-`NRB1 + status`: 0 plus exactly one CLOEXEC SCM_RIGHTS Wayland FD; 1 auth/policy
+`NRB1 + status`: 0 plus two ordered CLOEXEC SCM_RIGHTS FDs (Wayland, PCM); the PCM
+socket starts capture after receiving one ASCII `A` readiness byte. Status 1 is auth/policy
 rejected; 2 startup/backend failure; 3 malformed/unauthorized request. The broker
 lease remains open until the authenticated backend drops. No filesystem access
 to the target user's runtime is needed by the frontend. Broker receive supports

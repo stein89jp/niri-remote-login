@@ -250,7 +250,7 @@ static int launch(struct session *s, const struct passwd *pw, const char *runtim
     }
     return s->worker > 0 ? 0 : -1;
 }
-static int desktop_fd(const char *private, uid_t uid, gid_t gid) {
+static int session_socket_fd(const char *private, uid_t uid, gid_t gid, const char *name) {
     int pair[2];
     if (socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, pair)) return -1;
     pid_t child = fork();
@@ -259,7 +259,7 @@ static int desktop_fd(const char *private, uid_t uid, gid_t gid) {
         if (setgroups(0, NULL) || setgid(gid) || setuid(uid)) _exit(1);
         int fd = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
         struct sockaddr_un address = {.sun_family = AF_UNIX};
-        int size = snprintf(address.sun_path, sizeof(address.sun_path), "%s/wayland-0", private);
+        int size = snprintf(address.sun_path, sizeof(address.sun_path), "%s/%s", private, name);
         if (fd < 0 || size < 0 || (size_t)size >= sizeof(address.sun_path) ||
             connect(fd, (struct sockaddr *)&address, sizeof(address))) _exit(1);
         _exit(respond(pair[1], 0, fd) ? 1 : 0);
@@ -278,6 +278,28 @@ static int desktop_fd(const char *private, uid_t uid, gid_t gid) {
     close(pair[0]);
     if (child > 0) while (waitpid(child, NULL, 0) < 0 && errno == EINTR) {}
     return fd;
+}
+static int desktop_fd(const char *private, uid_t uid, gid_t gid) {
+    return session_socket_fd(private, uid, gid, "wayland-0");
+}
+// Ordered capabilities: compositor followed by raw stereo S16LE 48 kHz PCM.
+static int respond_session(int fd, int desktop, const char *private, uid_t uid, gid_t gid) {
+    int audio = session_socket_fd(private, uid, gid, "audio-0");
+    if (audio < 0) return -1;
+    int descriptors[2] = {desktop, audio};
+    unsigned char reply[5] = {'N','R','B','1',0};
+    struct iovec iov = {.iov_base=reply, .iov_len=sizeof(reply)};
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(descriptors))]; } control;
+    memset(&control, 0, sizeof(control));
+    struct msghdr msg = {.msg_iov=&iov, .msg_iovlen=1,
+        .msg_control=control.bytes, .msg_controllen=sizeof(control.bytes)};
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    c->cmsg_level = SOL_SOCKET; c->cmsg_type = SCM_RIGHTS;
+    c->cmsg_len = CMSG_LEN(sizeof(descriptors));
+    memcpy(CMSG_DATA(c), descriptors, sizeof(descriptors));
+    int result = sendmsg(fd, &msg, MSG_NOSIGNAL) == (ssize_t)sizeof(reply) ? 0 : -1;
+    close(audio);
+    return result;
 }
 // Root-only handoff channel: only an already PAM-authorized broker child
 // can route a fresh frontend control stream to the holder of this UID.
@@ -354,7 +376,7 @@ static void serve_session_window(struct session *s, int fd, int listener,
             // An attached desktop cannot be stolen by another connection.
             if (fd >= 0) { respond(next, 1, -1); close(next); continue; }
             int desktop = desktop_fd(private, uid, gid);
-            if (desktop < 0 || respond(next, 0, desktop)) {
+            if (desktop < 0 || respond_session(next, desktop, private, uid, gid)) {
                 if (desktop >= 0) close(desktop);
                 respond(next, 2, -1); close(next); continue;
             }
@@ -433,7 +455,7 @@ static void handle_connection(int fd, int ready) {
         if (waitpid(s.worker, NULL, WNOHANG) == s.worker) goto out;
         usleep(100000);
     }
-    if (desktop < 0 || respond(fd, 0, desktop)) goto out;
+    if (desktop < 0 || respond_session(fd, desktop, private, uid, gid)) goto out;
     failure = 255; // A success response must never be followed by another header.
     if (write(ready, "R", 1) != 1) goto out;
     close(ready); ready = -1;

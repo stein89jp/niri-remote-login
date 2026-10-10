@@ -18,6 +18,7 @@ use std::{
 pub struct Session {
     pub socket: UnixStream,
     pub lease: UnixStream,
+    pub audio: Option<UnixStream>,
 }
 pub fn open(path: &Path, username: &str, password: &str) -> anyhow::Result<Option<Session>> {
     anyhow::ensure!(
@@ -92,10 +93,19 @@ pub fn open(path: &Path, username: &str, password: &str) -> anyhow::Result<Optio
         return Ok(None);
     }
     anyhow::ensure!(response[4] == 0, "broker session creation failed");
-    anyhow::ensure!(fds.len() == 1, "broker must supply exactly one Wayland FD");
+    anyhow::ensure!(
+        (1..=2).contains(&fds.len()),
+        "broker must supply Wayland and optional PCM FDs"
+    );
     lease.set_read_timeout(None)?;
     lease.set_write_timeout(None)?;
+    let audio = if fds.len() == 2 {
+        Some(UnixStream::from(fds.pop().unwrap()))
+    } else {
+        None
+    };
     Ok(Some(Session {
+        audio,
         socket: UnixStream::from(fds.pop().unwrap()),
         lease,
     }))
@@ -108,6 +118,7 @@ pub struct Broker {
     video: Option<Video>,
     active: Mutex<Option<Desktop>>,
     login: Mutex<Option<Login>>,
+    audio: crate::audio::Audio,
 }
 fn requires_login_screen(credentials: &Credentials) -> bool {
     credentials.password.is_empty()
@@ -125,12 +136,18 @@ impl Broker {
             video,
             active: Mutex::new(None),
             login: Mutex::new(None),
+            audio: Default::default(),
         }
+    }
+    pub fn with_audio(mut self, audio: crate::audio::Audio) -> Self {
+        self.audio = audio;
+        self
     }
     pub fn discard(&self) {
         if let Some(login) = self.login.lock().unwrap().take() {
             login.stop();
         }
+        self.audio.clear();
         self.pending.lock().unwrap().take();
         if let Some(desktop) = self.active.lock().unwrap().take() {
             desktop.stop();
@@ -187,6 +204,7 @@ impl ConnectionBinder for Broker {
                     ""
                 },
             );
+            let login = login.with_audio(self.audio.clone());
             let bound = login.bound();
             *self.login.lock().unwrap() = Some(login);
             return Ok(bound);
@@ -201,12 +219,14 @@ impl ConnectionBinder for Broker {
             return Err(server_error("authenticated session identity mismatch"));
         }
         let output = self.output.clone();
+        let audio_socket = session.audio;
         let desktop = tokio::task::spawn_blocking(move || {
             Desktop::start(session.socket, output, size, Some(session.lease))
         })
         .await
         .map_err(|_| server_error("desktop startup task failed"))?
         .map_err(|_| server_error("Wayland desktop failed"))?;
+        self.audio.attach(audio_socket);
         *self.active.lock().unwrap() = Some(desktop.clone());
         let display = match &self.video {
             Some(video) => video.display(desktop.clone()),
@@ -295,7 +315,7 @@ mod tests {
     }
     fn fake(
         status: u8,
-        fd: Option<OwnedFd>,
+        fds: Vec<OwnedFd>,
         late_fd: bool,
     ) -> (
         tempfile::TempDir,
@@ -336,17 +356,18 @@ mod tests {
             let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
             msg.msg_iov = &mut iov;
             msg.msg_iovlen = 1;
-            if let Some(fd) = fd.as_ref() {
+            if !fds.is_empty() {
+                let size = (std::mem::size_of::<libc::c_int>() * fds.len()) as u32;
                 msg.msg_control = ctl.as_mut_ptr().cast();
-                msg.msg_controllen =
-                    unsafe { libc::CMSG_SPACE(std::mem::size_of::<libc::c_int>() as u32) } as usize;
+                msg.msg_controllen = unsafe { libc::CMSG_SPACE(size) } as usize;
                 unsafe {
                     let c = libc::CMSG_FIRSTHDR(&msg);
                     (*c).cmsg_level = libc::SOL_SOCKET;
                     (*c).cmsg_type = libc::SCM_RIGHTS;
-                    (*c).cmsg_len =
-                        libc::CMSG_LEN(std::mem::size_of::<libc::c_int>() as u32) as usize;
-                    *libc::CMSG_DATA(c).cast::<libc::c_int>() = fd.as_raw_fd();
+                    (*c).cmsg_len = libc::CMSG_LEN(size) as usize;
+                    for (index, fd) in fds.iter().enumerate() {
+                        *libc::CMSG_DATA(c).cast::<libc::c_int>().add(index) = fd.as_raw_fd();
+                    }
                 }
             }
             assert_eq!(unsafe { libc::sendmsg(client.as_raw_fd(), &msg, 0) }, 3);
@@ -368,7 +389,7 @@ mod tests {
         for late_fd in [false, true] {
             let (mut compositor, bridge) = UnixStream::pair().unwrap();
             let fd: OwnedFd = bridge.into();
-            let (_dir, path, handle, _observer) = fake(0, Some(fd), late_fd);
+            let (_dir, path, handle, _observer) = fake(0, vec![fd], late_fd);
             let mut session = open(&path, "alice", "example").unwrap().unwrap();
             assert!(
                 unsafe { libc::fcntl(session.socket.as_raw_fd(), libc::F_GETFD) }
@@ -384,8 +405,42 @@ mod tests {
         }
     }
     #[test]
+    fn audio_handoff_preserves_fd_order_and_cloexec_on_fragmented_response() {
+        for late_fd in [false, true] {
+            let (mut compositor, wayland) = UnixStream::pair().unwrap();
+            let (mut monitor, audio) = UnixStream::pair().unwrap();
+            let (_dir, path, handle, _) = fake(0, vec![wayland.into(), audio.into()], late_fd);
+            let mut session = open(&path, "alice", "example").unwrap().unwrap();
+            let mut audio = session.audio.take().unwrap();
+            assert_ne!(
+                unsafe { libc::fcntl(audio.as_raw_fd(), libc::F_GETFD) } & libc::FD_CLOEXEC,
+                0
+            );
+            compositor.write_all(b"W").unwrap();
+            monitor.write_all(b"A").unwrap();
+            let mut byte = [0];
+            session.socket.read_exact(&mut byte).unwrap();
+            assert_eq!(&byte, b"W");
+            audio.read_exact(&mut byte).unwrap();
+            assert_eq!(&byte, b"A");
+            drop(audio);
+            drop(session);
+            handle.join().unwrap();
+        }
+    }
+    #[test]
+    fn excess_capabilities_are_rejected() {
+        let mut descriptors = Vec::new();
+        for _ in 0..3 {
+            descriptors.push(UnixStream::pair().unwrap().0.into());
+        }
+        let (_dir, path, handle, _) = fake(0, descriptors, false);
+        assert!(open(&path, "alice", "example").is_err());
+        handle.join().unwrap();
+    }
+    #[test]
     fn rejection_creates_no_session() {
-        let (_dir, path, handle, _observer) = fake(1, None, false);
+        let (_dir, path, handle, _observer) = fake(1, vec![], false);
         assert!(open(&path, "alice", "example").unwrap().is_none());
         handle.join().unwrap();
     }

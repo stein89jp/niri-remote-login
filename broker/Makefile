@@ -17,6 +17,7 @@ install: niri-rdp-broker
 	@case "$(DESTDIR)" in /*) ;; *) printf '%s\n' 'Set an absolute staging DESTDIR; direct host installation is disabled.' >&2; exit 1 ;; esac
 	install -Dm755 niri-rdp-broker "$(DESTDIR)/usr/lib/niri-rdp/niri-rdp-broker"
 	install -Dm755 config/session-worker "$(DESTDIR)/usr/lib/niri-rdp/session-worker"
+	install -Dm755 config/session-audio "$(DESTDIR)/usr/lib/niri-rdp/session-audio"
 	install -Dm755 config/session-desktop "$(DESTDIR)/usr/lib/niri-rdp/session-desktop"
 	install -Dm644 config/niri-rdp.pam "$(DESTDIR)/etc/pam.d/niri-rdp"
 	install -Dm644 config/headless.kdl "$(DESTDIR)/etc/niri-rdp/headless.kdl"

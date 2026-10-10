@@ -235,7 +235,7 @@ static int resume_response(int fd, unsigned char expected) {
     struct pollfd p = {.fd=fd, .events=POLLIN};
     assert(poll(&p, 1, 3000) == 1);
     unsigned char bytes[5]; struct iovec iov = {.iov_base=bytes, .iov_len=sizeof(bytes)};
-    union { struct cmsghdr align; char bytes[CMSG_SPACE(sizeof(int))]; } ancillary;
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(2 * sizeof(int))]; } ancillary;
     struct msghdr msg = {.msg_iov=&iov, .msg_iovlen=1,
         .msg_control=ancillary.bytes, .msg_controllen=sizeof(ancillary.bytes)};
     assert(recvmsg(fd, &msg, MSG_CMSG_CLOEXEC) == 5);
@@ -243,7 +243,9 @@ static int resume_response(int fd, unsigned char expected) {
     struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
     if (expected) { assert(c == NULL); return -1; }
     assert(c && c->cmsg_type == SCM_RIGHTS);
-    int desktop; memcpy(&desktop, CMSG_DATA(c), sizeof(desktop));
+    assert(c->cmsg_len == CMSG_LEN(2 * sizeof(int)));
+    int descriptors[2]; memcpy(descriptors, CMSG_DATA(c), sizeof(descriptors));
+    int desktop = descriptors[0]; close(descriptors[1]);
     return desktop;
 }
 static void test_resume_session(void) {
@@ -257,6 +259,10 @@ static void test_resume_session(void) {
     int wayland = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0); assert(wayland >= 0);
     assert(bind(wayland, (struct sockaddr *)&address, sizeof(address)) == 0);
     assert(listen(wayland, 4) == 0);
+    int audio = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0); assert(audio >= 0);
+    assert(snprintf(address.sun_path, sizeof(address.sun_path), "%s/audio-0", directory) > 0);
+    assert(bind(audio, (struct sockaddr *)&address, sizeof(address)) == 0);
+    assert(listen(audio, 4) == 0);
     int initial[2], notification[2], worker_stop[2];
     assert(socketpair(AF_UNIX, SOCK_STREAM, 0, initial) == 0);
     assert(pipe(notification) == 0 && pipe(worker_stop) == 0);
@@ -287,6 +293,7 @@ static void test_resume_session(void) {
         assert(socketpair(AF_UNIX, SOCK_STREAM, 0, retry) == 0);
         assert(forward_resume(path, retry[1]) == 0); close(retry[1]);
         int desktop = resume_response(retry[0], 0);
+        int audio_peer = accept4(audio, NULL, NULL, SOCK_CLOEXEC); assert(audio_peer >= 0); close(audio_peer);
         struct pollfd p = {.fd=wayland, .events=POLLIN}; assert(poll(&p, 1, 3000) == 1);
         int peer = accept4(wayland, NULL, NULL, SOCK_CLOEXEC); assert(peer >= 0);
         assert(kill(worker, 0) == 0 && waitpid(holder, NULL, WNOHANG) == 0);
@@ -300,6 +307,8 @@ static void test_resume_session(void) {
     assert(write(worker_stop[1], "X", 1) == 1); close(worker_stop[1]);
     int status; assert(waitpid(holder, &status, 0) == holder);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+    close(audio); assert(unlink(address.sun_path) == 0);
+    assert(snprintf(address.sun_path, sizeof(address.sun_path), "%s/wayland-0", directory) > 0);
     close(wayland); assert(unlink(path) == 0); assert(unlink(address.sun_path) == 0);
     assert(rmdir(directory) == 0);
     puts("PASS attached session rejects takeover; repeated detach/resume retains worker and desktop; worker exit ends holder");

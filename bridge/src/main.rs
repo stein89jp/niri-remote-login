@@ -125,12 +125,16 @@ async fn main() -> anyhow::Result<()> {
     let acceptor = identity.make_acceptor()?;
     let output = std::env::var("NIRI_RDP_OUTPUT").unwrap_or_else(|_| "HEADLESS-1".into());
     let video = Video::from_env()?;
+    let audio = niri_rdp_bridge::audio::Audio::default();
     let mut server = if mode == "broker" {
-        let broker = Arc::new(Broker::new(
-            PathBuf::from("/run/niri-rdp/broker.sock"),
-            output,
-            video.clone(),
-        ));
+        let broker = Arc::new(
+            Broker::new(
+                PathBuf::from("/run/niri-rdp/broker.sock"),
+                output,
+                video.clone(),
+            )
+            .with_audio(audio.clone()),
+        );
         // PAM receives ClientInfo credentials within authenticated server TLS.
         // Arbitrary PAM passwords do not supply a server-side NLA/NTLM secret.
         let mut server = RdpServer::builder()
@@ -143,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
                 height: 4096,
             }))
             .with_gfx_factory(video.as_ref().map(|v| Box::new(v.clone()) as _))
+            .with_sound_factory(Some(Box::new(audio.factory())))
             .with_connection_policy(ConnectionPolicy::Reject)
             .with_connection_handler(Some(Box::new(Lifecycle {
                 broker: Some(broker.clone()),

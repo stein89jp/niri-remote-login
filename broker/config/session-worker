@@ -21,6 +21,18 @@ case "$renderer" in
 esac
 export NIRI_RDP_RENDERER="$renderer"
 unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET NIRI_SOCKET SSH_AUTH_SOCK
+export PIPEWIRE_RUNTIME_DIR="$NIRI_RDP_RUNTIME_DIR"
+export PIPEWIRE_REMOTE=pipewire-0
+export PULSE_SERVER="unix:$NIRI_RDP_RUNTIME_DIR/pulse/native"
+/usr/lib/niri-rdp/session-audio &
+audio_pid=$!
+attempt=0
+while [ ! -S "$NIRI_RDP_RUNTIME_DIR/audio-0" ]; do
+    kill -0 "$audio_pid" || { echo 'remote audio startup failed' >&2; exit 1; }
+    attempt=$((attempt + 1))
+    [ "$attempt" -lt 150 ] || { echo 'remote audio startup timed out' >&2; exit 1; }
+    sleep 0.1
+done
 # Reuse the user's desktop settings without starting the shared user services.
 config=/etc/niri-rdp/headless.kdl
 remote_config="${XDG_CONFIG_HOME:-$HOME/.config}/niri-rdp/config.kdl"

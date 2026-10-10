@@ -71,6 +71,8 @@ class HostSetupTests(unittest.TestCase):
             executable.chmod(0o755)
             worker = (ROOT / "broker/config/session-worker").read_text()
             worker = worker.replace("/etc/niri-rdp/renderer.conf", str(config))
+            worker = worker.replace("/usr/lib/niri-rdp/session-audio &", "true &")
+            worker = worker.replace('while [ ! -S "$NIRI_RDP_RUNTIME_DIR/audio-0" ]; do', 'while false; do')
             worker = worker.replace("/usr/lib/niri-rdp/niri-headless", str(executable))
             environment = dict(os.environ, NIRI_RDP_RUNTIME_DIR=str(directory),
                                HOME=str(directory),
