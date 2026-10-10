@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Disposable Arch userspace. No host DISPLAY, runtime directory, physical input,
 # network, service manager, home, PAM files or writable /usr are visible.
-# --nvenc explicitly exposes only NVIDIA encoder device nodes.
+# --nvenc exposes NVIDIA devices but keeps software compositor rendering.
+# --nvidia-renderer also exposes render nodes and requires hardware rendering.
 set -euo pipefail
 repo=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)
 args=(--unshare-all --die-with-parent --new-session --ro-bind /usr /usr
@@ -15,7 +16,8 @@ args=(--unshare-all --die-with-parent --new-session --ro-bind /usr /usr
       --setenv GALLIUM_DRIVER llvmpipe --setenv XKB_CONFIG_ROOT /usr/share/X11/xkb
       --setenv LD_LIBRARY_PATH /work/lab/sysroot/usr/lib)
 [[ ! -d /etc/fonts ]] || args+=(--ro-bind /etc/fonts /etc/fonts)
-if [[ ${1:-} == --nvenc ]]; then
+if [[ ${1:-} == --nvenc || ${1:-} == --nvidia-renderer ]]; then
+    gpu_mode=$1
     shift
     shopt -s nullglob
     devices=(/dev/nvidia*)
@@ -31,5 +33,16 @@ if [[ ${1:-} == --nvenc ]]; then
     # compositor stays on llvmpipe. Driver metadata is read-only.
     args+=(--ro-bind /sys /sys)
     args+=(--setenv NIRI_RDP_LAB_NVENC 1)
+    if [[ $gpu_mode == --nvidia-renderer ]]; then
+        # Render nodes support GPU commands without modesetting/DRM master.
+        # Never expose /dev/dri/card*, physical input or a local desktop socket.
+        for device in /dev/dri/renderD*; do
+            [[ -c "$device" ]] || continue
+            args+=(--dev-bind "$device" "$device")
+        done
+        args+=(--unsetenv LIBGL_ALWAYS_SOFTWARE --unsetenv GALLIUM_DRIVER
+               --setenv NIRI_RDP_RENDERER hardware
+               --setenv NIRI_RDP_LAB_NVIDIA_RENDERER 1)
+    fi
 fi
 exec bwrap "${args[@]}" /usr/bin/bash -c 'mkdir -m 700 /tmp/niri-rdp-runtime; exec "$@"' bash "$@"

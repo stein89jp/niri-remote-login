@@ -53,7 +53,8 @@ and supports live single-display resolution requests through Display Control.
 Rebuild both packages; see the [resolution contract](../bridge/README.md#dynamic-resolution). No
 persistent reconnect, multi-monitor, clipboard, audio or Unicode/IME claim is made.
 The optional host encoder uses H.264 AVC420; it does not enable host-side NVDEC
-or ensure that the RDP client uses hardware decoding. Compositor rendering stays
-on llvmpipe in either transport mode. Record client decoding mode separately.
+or ensure that the RDP client uses hardware decoding. Compositor rendering prefers
+hardware EGL devices with software fallback. Record the selected renderer and
+client decoding mode separately; capture still uses SHM and CPU color conversion.
 Completion requires every requested actual-machine gate to pass and its evidence
 to be recorded; pending rows mean the boot-to-remote-login goal is incomplete.

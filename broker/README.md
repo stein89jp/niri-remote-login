@@ -55,7 +55,11 @@ only `/usr/bin/dbus-run-session -- /usr/lib/niri-rdp/session-worker` after
 setting account groups and UID/GID. The environment is constructed afresh;
 only PAM's validated runtime path and session ID are carried over. The worker
 uses a private runtime directory for Niri and its applications, a private bus,
-`NIRI_BACKEND=headless`, forced llvmpipe software rendering, and the maintained side-by-side Niri binary. It does not
+`NIRI_BACKEND=headless`, automatic headless EGL hardware rendering with a
+surfaceless fallback, and the maintained side-by-side Niri binary. The root-owned
+`/etc/niri-rdp/renderer.conf` selects `auto` (default), `hardware` (require GPU),
+or `software` (force llvmpipe). GPU access uses the account's existing device
+permissions; the broker does not acquire DRM master or grant extra groups. It does not
 use `niri --session`, import environment into the user manager, or start
 `graphical-session.target`. The per-UID runtime and user manager still exist as
 required by logind; this is not a separate Unix security boundary.

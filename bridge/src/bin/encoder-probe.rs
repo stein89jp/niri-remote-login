@@ -5,24 +5,41 @@ use std::{
     io::Write,
     time::{Duration, Instant},
 };
+fn setting(name: &str, default: u32, maximum: u32) -> anyhow::Result<u32> {
+    let value = match std::env::var(name) {
+        Ok(value) => value.parse::<u32>()?,
+        Err(std::env::VarError::NotPresent) => default,
+        Err(error) => return Err(error.into()),
+    };
+    anyhow::ensure!(
+        (1..=maximum).contains(&value),
+        "{name} must be within 1..{maximum}"
+    );
+    Ok(value)
+}
 fn main() -> anyhow::Result<()> {
     let mut args = std::env::args_os().skip(1);
     let path = args
         .next()
         .ok_or_else(|| anyhow::anyhow!("usage: encoder-probe OUTPUT.h264"))?;
     anyhow::ensure!(args.next().is_none(), "usage: encoder-probe OUTPUT.h264");
-    let mut encoder = Encoder::nvenc(1920, 1080)?;
+    let width = setting("NIRI_RDP_PROBE_WIDTH", 1920, 4096)?;
+    let height = setting("NIRI_RDP_PROBE_HEIGHT", 1080, 4096)?;
+    let frames = setting("NIRI_RDP_PROBE_FRAMES", 30, 10000)?;
+    let mut encoder = Encoder::nvenc(width as u16, height as u16)?;
     // Refuse to overwrite an existing recording.
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path)?;
     let mut encoding_time = Duration::ZERO;
-    for frame in 0..30u32 {
-        let mut pixels = vec![0; 1920 * 1080 * 4];
-        for y in 0..1080u32 {
-            for x in 0..1920u32 {
-                let i = ((y * 1920 + x) * 4) as usize;
+    let mut samples = Vec::with_capacity(frames as usize);
+    let mut bytes = 0usize;
+    let mut pixels = vec![0; (width * height * 4) as usize];
+    for frame in 0..frames {
+        for y in 0..height {
+            for x in 0..width {
+                let i = ((y * width + x) * 4) as usize;
                 pixels[i..i + 4].copy_from_slice(&[
                     (x / 8) as u8,
                     (y / 4) as u8,
@@ -33,26 +50,40 @@ fn main() -> anyhow::Result<()> {
         }
         let image = bitmap(
             &pixels,
-            1920,
-            1080,
-            7680,
+            width,
+            height,
+            width * 4,
             false,
             DesktopSize {
-                width: 1920,
-                height: 1080,
+                width: width as u16,
+                height: height as u16,
             },
             false,
         )?;
         let started = Instant::now();
         let encoded = encoder.encode(&image, frame == 0)?;
-        encoding_time += started.elapsed();
+        let elapsed = started.elapsed();
+        encoding_time += elapsed;
+        samples.push(elapsed);
+        bytes += encoded.len();
         file.write_all(&encoded)?;
     }
-    println!("NVENC: encoded 30 changing 1920x1080 desktop frames (1920x1088 H.264 bitstream)");
+    println!(
+        "NVENC: encoded {frames} changing {width}x{height} desktop frames ({}x{} H.264 bitstream)",
+        width.div_ceil(16) * 16,
+        height.div_ceil(16) * 16
+    );
     println!(
         "Synthetic encoding: {:.2} ms/frame ({:.1} frames/s); excludes capture and transport",
-        encoding_time.as_secs_f64() * 1000.0 / 30.0,
-        30.0 / encoding_time.as_secs_f64()
+        encoding_time.as_secs_f64() * 1000.0 / f64::from(frames),
+        f64::from(frames) / encoding_time.as_secs_f64()
+    );
+    samples.sort_unstable();
+    println!(
+        "Encoding latency: median {:.2} ms, p95 {:.2} ms, max {:.2} ms; {bytes} bytes",
+        samples[samples.len() / 2].as_secs_f64() * 1000.0,
+        samples[(samples.len() * 95 / 100).min(samples.len() - 1)].as_secs_f64() * 1000.0,
+        samples.last().unwrap().as_secs_f64() * 1000.0
     );
     Ok(())
 }

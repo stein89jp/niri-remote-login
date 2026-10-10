@@ -2,6 +2,7 @@
 """Real Niri/app/RDP test; run inside lab/run-isolated.sh, never a host desktop."""
 import json
 import os
+import re
 from pathlib import Path
 import secrets
 import selectors
@@ -106,7 +107,16 @@ def resize_roundtrip(environment, ipc_path, log_path):
 
 
 def main():
-    if (ROOT != Path("/work") or Path("/dev/dri").exists() or
+    gpu_rendering = os.environ.get("NIRI_RDP_LAB_NVIDIA_RENDERER") == "1"
+    dri = Path("/dev/dri")
+    if dri.exists():
+        if not gpu_rendering or any(
+            entry.is_symlink() or not entry.is_char_device() or
+            not (entry.name.startswith("renderD") and entry.name[7:].isdigit())
+            for entry in dri.iterdir()
+        ):
+            raise RuntimeError("DRM access must contain only render nodes in explicit NVIDIA renderer mode")
+    if (ROOT != Path("/work") or
             Path("/dev/input").exists() or os.environ.get("DISPLAY")):
         raise RuntimeError("run only inside lab/run-isolated.sh with private devices")
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
@@ -114,7 +124,7 @@ def main():
     if encoder not in ("bitmap", "nvenc"):
         raise RuntimeError("NIRI_RDP_LAB_ENCODER must be bitmap or nvenc")
     if encoder == "nvenc" and os.environ.get("NIRI_RDP_LAB_NVENC") != "1":
-        raise RuntimeError("NVENC integration requires lab/run-isolated.sh --nvenc")
+        raise RuntimeError("NVENC integration requires lab/run-isolated.sh --nvenc or --nvidia-renderer")
     gfx_setting = os.environ.get("NIRI_RDP_LAB_GFX", "1")
     if gfx_setting not in ("0", "1"):
         raise RuntimeError("NIRI_RDP_LAB_GFX must be 0 or 1")
@@ -126,7 +136,8 @@ def main():
         raise RuntimeError("NIRI_RDP_LAB_LOGIN_SCREEN requires NIRI_RDP_LAB_TLS_CONTRACT=1")
     # The namespace supplies only these explicit environment values.
     env = {k: os.environ[k] for k in ("PATH", "HOME", "XDG_RUNTIME_DIR", "LD_LIBRARY_PATH",
-                                    "LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER", "XKB_CONFIG_ROOT")
+                                    "LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER", "XKB_CONFIG_ROOT",
+                                    "NIRI_RDP_RENDERER")
            if k in os.environ}
     env["NIRI_BACKEND"] = "headless"
     with socket.socket() as port:
@@ -154,12 +165,30 @@ def main():
             wait_for(runtime / "wayland-0", niri)
             ipc_path = runtime / f"niri.wayland-0.{niri.pid}.sock"
             wait_for(ipc_path, niri)
+            if os.environ.get("NIRI_RDP_LAB_NVIDIA_RENDERER") == "1":
+                # Wayland/IPC sockets are created before EGL initialization.
+                # Wait for the renderer rather than treating socket creation as
+                # evidence that GPU startup has already finished.
+                deadline = time.monotonic() + 15
+                while True:
+                    renderer_log = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", (private / "niri.log").read_text())
+                    if all(marker in renderer_log for marker in (
+                        "headless renderer: hardware EGL device", "nvidia=true",
+                        "headless renderer: advertised hardware DMA-BUF formats",
+                    )):
+                        break
+                    if niri.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError("requested NVIDIA renderer and DMA-BUF support were not confirmed")
+                    time.sleep(0.05)
+                results["nvidia_renderer"] = "hardware EGL device and application DMA-BUF formats confirmed"
             app = launch([str(ROOT / "lab/dynamic-app")], dict(env, WAYLAND_DISPLAY="wayland-0"), "app.log")
             time.sleep(1)
             bridge_env = dict(env, NIRI_RDP_MODE="disposable", NIRI_RDP_CERT=str(private / "cert.pem"),
                               NIRI_RDP_KEY=str(private / "key.pem"), NIRI_RDP_USERNAME=username,
                               NIRI_RDP_PASSWORD=password, NIRI_RDP_WAYLAND_SOCKET=str(runtime / "wayland-0"))
             bridge_env["NIRI_RDP_ENCODER"] = encoder
+            if fps := os.environ.get("NIRI_RDP_LAB_FPS"):
+                bridge_env["NIRI_RDP_FPS"] = fps
             fixture = None
             if tls_contract:
                 fixture = MockBroker(runtime, username, password)
@@ -225,7 +254,10 @@ def main():
             if "FRAME" not in log:
                 raise RuntimeError("animated app did not reach frame callback checkpoint")
             results["wayland_application_events_and_animation"] = "passed"
-            results["no_physical_input_or_dri_devices_or_inherited_display"] = "passed"
+            if gpu_rendering:
+                results["no_physical_input_or_drm_modesetting_or_inherited_display"] = "passed; DRM render nodes only"
+            else:
+                results["no_physical_input_or_dri_devices_or_inherited_display"] = "passed"
             held = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")],
                                   env=dict(client_env, NIRI_RDP_TEST_HOLD="1"),
                                   capture_output=True, text=True, timeout=25)

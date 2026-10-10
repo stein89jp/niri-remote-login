@@ -62,7 +62,11 @@ Capture uses `zwlr_screencopy_manager_v1` into bounded anonymous SHM files,
 accepting XRGB/ARGB/XBGR/ABGR8888, converting row padding and vertical inversion,
 and normalizing frames into the negotiated RDP desktop. The native headless
 output is resized to that same pixel size before capture. The worker retains only the
-latest frame and captures at most 30 fps. Wayland dispatch/capture waits have
+latest frame and reuses a mapped SHM buffer until its layout changes. Native BGR
+frames need one owned snapshot copy; padded, inverted or RGB frames are normalized.
+`NIRI_RDP_FPS` bounds capture to 1..60 fps (default 60 with NVENC, 30 with bitmap).
+Capture time counts toward the frame budget and input wakes the worker between
+captures, including at low frame rates. Wayland dispatch/capture waits have
 bounded deadlines. Output removal or capture failure closes the connection.
 
 ## Desktop codecs
@@ -71,19 +75,38 @@ bounded deadlines. Output removal or capture failure closes the connection.
 `NIRI_RDP_ENCODER=nvenc` to encode the captured BGR0 desktop frames with
 FFmpeg's `h264_nvenc` and send H.264 AVC420 over the negotiated RDP graphics
 channel. Clients without the required graphics/codec capabilities receive bitmap
-updates. The remote desktop still renders with llvmpipe and captures through SHM;
+updates. The patched headless compositor prefers hardware EGL devices, including
+NVIDIA, and advertises DMA-BUF formats for GPU applications. Its `auto` policy
+falls back to surfaceless rendering if hardware is unavailable; the session
+worker's `software` policy forces llvmpipe. Capture still reads pixels through SHM.
 NVENC accelerates the frontend's video encoding independently of compositor
 rendering. FFmpeg's software scaler converts the captured pixels to full-range
 BT.709 NV12 before NVENC encoding, as required by AVC420. This path does not use
 NVDEC; the RDP client decodes the video.
+
+Color conversion uses up to four FFmpeg workers for larger desktops. A padded
+BGR staging frame enables parallel conversion; small or single-core frames use
+direct conversion with only the final rows copied to SIMD-safe scratch memory.
+NVENC uses its fastest preset, ultra-low-latency tuning, no B frames/lookahead,
+single-pass bounded VBR and a one-frame VBV buffer.
+
+Unchanged desktop pixels skip conversion, GPU upload and transmission. Capture
+heartbeats continue so decoder recovery, minimize/resume and channel negotiation
+can request a new IDR even on a static desktop. Encoding keeps one pending task
+and graphics backpressure bounds unacknowledged frames. Set
+`NIRI_RDP_BITRATE_MBPS=1..100` to tune H.264 quality/network use (default 12 Mbps).
+See [installation](../docs/install.md#optional-nvidia-encoding) for GPU access and
+renderer policy configuration. This remains a SHM capture path with CPU color
+conversion; it does not claim zero-copy GPU capture and encoding.
 
 Explicit NVENC mode validates the hardware encoder at startup and fails with an
 error if initialization is unavailable. It requires an NVENC-capable NVIDIA GPU,
 driver userspace libraries compatible with FFmpeg's NVENC API version, and access
 to the GPU device nodes. The packaged default systemd unit uses `PrivateDevices`
 and therefore needs the optional `nvidia-frontend.conf` drop-in described in
-[installation](../docs/install.md). The remote-login account does not need GPU
-groups. The bridge uses prebuilt FFmpeg libraries and does not require the CUDA
+[installation](../docs/install.md). Hardware compositor rendering also requires
+the remote-login account to have access to its GPU device nodes. The bridge uses
+prebuilt FFmpeg libraries and does not require the CUDA
 toolkit or Video Codec SDK to build or run.
 
 The release frontend passed actual NVENC AVC420 encoding and FreeRDP decoding
@@ -113,6 +136,26 @@ align the coded height to 16 pixels; RDP region masks crop them to the logical
 1920×1080 desktop. The package installs
 the probe as `/usr/lib/niri-rdp/encoder-probe`; the installation guide shows how
 to run it with the frontend service account's GPU access.
+
+The probe reports mean, median, p95 and maximum encoding latency plus output
+bytes. Optional `NIRI_RDP_PROBE_WIDTH` and `NIRI_RDP_PROBE_HEIGHT` accept 1..4096,
+and `NIRI_RDP_PROBE_FRAMES` accepts 1..10000; defaults preserve the command above.
+Use `NIRI_RDP_FPS=60` to test a 60 fps encoding budget. The warmed-up native
+benchmark in `scripts/encoder-bench.c` excludes capture/transport and measures
+180 changing frames after 20 warm-up frames:
+
+```sh
+cc -O3 scripts/encoder-bench.c -o /tmp/niri-rdp-encoder-bench \
+  $(pkg-config --cflags --libs libavcodec libavutil libswscale)
+/tmp/niri-rdp-encoder-bench 0 1920 1080 60 12000000
+/tmp/niri-rdp-encoder-bench 0 3840 2160 60 12000000
+```
+
+Actual NVIDIA compositor rendering plus client decoding can be validated with
+`lab/run-isolated.sh --nvidia-renderer` in place of `--nvenc` in the integration
+command below. It exposes NVIDIA and DRM render nodes, verifies NVIDIA EGL
+selection and DMA-BUF advertisement, and hides physical input and DRM modesetting
+nodes. `--nvenc` retains software compositor rendering for comparison.
 
 The real desktop integration client also needs FreeRDP's client addon library
 to load the graphics channel and its AVC420 decoder. Build it in the prepared

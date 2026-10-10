@@ -36,7 +36,9 @@ Stock `/usr/bin/niri` stays alongside the patched
 `/usr/lib/niri-rdp/niri-headless`. The remote session has its own desktop and
 configuration. Reconnect creates a new session. Client-selected resolution and
 single-display live resizing are supported. Bitmap transport is the default;
-optional host NVIDIA NVENC H.264 encoding is available.
+optional host NVIDIA NVENC H.264 encoding is available, with a 60 fps capture
+budget, reusable capture buffers and unchanged-frame suppression. The compositor
+prefers hardware EGL rendering, including NVIDIA, with software fallback.
 
 This remains **experimental**. Disposable Niri/RDP integration has demonstrated
 changing application frames, keyboard/pointer input, authentication rejection,

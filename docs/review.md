@@ -1,11 +1,18 @@
 # Functionality and NVIDIA review — 2026-10-10
 
 The functionality review below records the earlier fixes and NVIDIA host
-encoding work. The current combined `niri-remote-login-0.1.0-4` package also adds
+encoding work. The combined `niri-remote-login-0.1.0-4` package also added
 direct network listening, first-start TLS setup, and an RDP login screen; see
 [the latest validation](validation.md#simplified-arch-host-installation-2026-10-10). The existing 0.1.0 binary archives are unchanged; rebuild the frontend
 package from this source to use the fixes. The current build folder installs the compositor and frontend together. Installation steps are in
 [install.md](install.md#optional-nvidia-encoding).
+
+The current `0.1.0-5` source adds NVIDIA-first EGL compositor rendering,
+application DMA-BUF advertisement, reusable mapped capture buffers, native BGR
+snapshots, a configurable 60 fps NVENC capture budget, unchanged-frame encoding
+suppression and lower-copy native color conversion. The sections below retain
+the earlier implementation's measurements; current evidence and reproduction
+commands are in [the NVIDIA performance validation](validation.md#nvidia-performance-2026-10-10).
 
 | Failure | Resulting change | Regression evidence |
 | --- | --- | --- |
@@ -50,7 +57,8 @@ Tests check decoded YUV values directly so an automatic decoder range conversion
 cannot conceal an encoder mismatch.
 
 The opt-in packaged systemd drop-in exposes NVIDIA devices to the frontend.
-The Niri worker still renders through llvmpipe and uses SHM capture. This is
+At the time of that encoding review, the Niri worker rendered through llvmpipe
+and used SHM capture. This was
 hardware video encoding, with CPU capture/copy work remaining. NVIDIA calls
 the host encoder NVENC and the video decoder NVDEC; the decoder runs on the
 remote RDP client. See [NVIDIA's FFmpeg guide](https://docs.nvidia.com/video-technologies/video-codec-sdk/13.1/ffmpeg-with-nvidia-gpu/index.html).
@@ -78,7 +86,7 @@ with aligned 1920×1088 H.264 4:2:0 output, full range and BT.709 metadata.
 A release probe measured 6.79 ms per frame (147.2 synthetic frames/s), including
 pixel conversion and encoding, excluding capture, input, transport, client decoding
 and display. This measures the encoder's capacity on that GPU, not end-to-end
-desktop frame rate or latency. The bridge's capture limit remains 30 fps.
+desktop frame rate or latency. That implementation's capture limit was 30 fps.
 
 The final release passed full NVENC-over-RDP validation through TLS with a
 namespace test broker and a FreeRDP client. The test requires actual AVC420

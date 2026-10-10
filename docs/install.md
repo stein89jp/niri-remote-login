@@ -89,13 +89,16 @@ identity requires restarting both services so the frontend loads new credentials
 
 The defaults launch `foot`. Super+Enter opens a terminal; Super+Shift+Q logs out.
 Disconnect ends the desktop; reconnect creates a fresh session. The compositor
-renders with llvmpipe; optional NVIDIA encoding is described below. This remains
+tries headless GPU rendering automatically, preferring NVIDIA hardware, and falls
+back to surfaceless rendering when hardware is unavailable. Optional NVIDIA
+encoding is described below. This remains
 experimental: real PAM/logind, installed-service boot, Windows, and physical
 monitor tests are tracked in [acceptance](acceptance.md).
 
 ## Configuration and troubleshooting
 
-Review `/etc/niri-rdp/frontend.conf`, `/etc/niri-rdp/headless.kdl`, and
+Review `/etc/niri-rdp/frontend.conf`, `/etc/niri-rdp/headless.kdl`,
+`/etc/niri-rdp/renderer.conf`, and
 `/etc/pam.d/niri-rdp`. `NIRI_RDP_LISTEN` accepts a numeric IP address and port,
 including bracketed IPv6. To use the standard RDP port on a host where it is free,
 set `NIRI_RDP_LISTEN=0.0.0.0:3389`. To retain tunnel-only access, set
@@ -149,6 +152,30 @@ Use [uninstall](uninstall.md) and [upgrade](upgrade.md) for removal and maintena
 
 ## Optional NVIDIA encoding
 
+The compositor now uses EGL device rendering to support NVIDIA headless graphics,
+without a local desktop or display server. NVIDIA documents the
+[EGL device platform](https://developer.nvidia.com/docs/drive/drive-os/6.0.6/public/drive-os-linux-sdk/api_reference/EGL_EXT_platform_device.html).
+The logged-in account needs permission to use the GPU's render node and NVIDIA
+device nodes. Inspect their ownership on the test machine; if group access is
+needed, add the remote login account to the appropriate `render`/`video` groups
+and create a fresh remote session. The frontend drop-in below affects the encoding
+service account; it does not grant compositor GPU access to remote login accounts.
+
+`/etc/niri-rdp/renderer.conf` contains one word: `auto` (default), `hardware`, or
+`software`. Set `hardware` during GPU validation so missing drivers or permissions
+fail compositor startup rather than quietly using the fallback. Set `software`
+to force the previous llvmpipe behavior. Changes apply to new sessions. Inspect
+the broker journal for `headless renderer: hardware EGL device` and the render
+node path and `nvidia=true` to verify NVIDIA selection. The isolated lab has
+validated actual NVIDIA rendering with NVENC and FreeRDP decoding on an RTX
+4070 Ti; installed session permissions and end-to-end throughput still need
+the [actual-machine checks](acceptance.md).
+
+`NIRI_RDP_FPS` in `frontend.conf` limits capture/transmission to 1–60 frames per
+second (default 60 for NVENC, 30 for bitmap). `NIRI_RDP_BITRATE_MBPS` accepts
+1–100 megabits per second (default 12). Reduce the frame rate
+or bitrate for limited networks; increasing bitrate can improve AVC420 quality.
+
 The default `NIRI_RDP_ENCODER=bitmap` sends bitmap updates. A rebuilt frontend
 supports `NIRI_RDP_ENCODER=nvenc`, which passes captured desktop frames to
 FFmpeg's `h264_nvenc` encoder and sends H.264 through the RDP graphics channel
@@ -158,8 +185,8 @@ on the RDP client, whose hardware acceleration depends on its own GPU and client
 The current combined package includes NVENC; the archived
 `0.1.0-1` frontend binaries contain neither these fixes nor NVENC support.
 The frontend converts captured pixels to full-range BT.709 on the CPU before
-hardware H.264 encoding; compositor rendering and capture also remain on the
-tested software/SHM path.
+hardware H.264 encoding. Compositor rendering can run on the GPU, while capture
+still reads pixels through SHM; this is not a zero-copy GPU capture/encode path.
 
 On the separate test installation, use an NVENC-capable NVIDIA GPU, a working
 NVIDIA driver with its userspace libraries, and an FFmpeg build providing

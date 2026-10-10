@@ -1,5 +1,93 @@
 # Validation record
 
+## NVIDIA performance, 2026-10-10
+
+The `0.1.0-5` source prefers NVIDIA hardware EGL compositor rendering, advertises
+DMA-BUF formats to applications, reuses mapped SHM capture buffers, and avoids
+encoding/transmitting unchanged desktops. NVENC capture defaults to a 60 fps
+budget; frame rate and bitrate are configurable. Large frames use up to four
+FFmpeg color-conversion workers with padded staging; small frames use direct
+conversion with bounded scratch padding. Both paths preserve full-range BT.709
+and 16-aligned coded dimensions. NVENC uses single-pass bounded VBR with a
+one-frame VBV, no B frames/lookahead, and two encoder surfaces.
+
+On this host's NVIDIA GeForce RTX 4070 Ti, driver 615.71.09, the warmed-up native
+benchmark measured the following. Each run encodes 180 changing frames after
+20 warm-up frames, including CPU color conversion and NVENC submission, at
+12 Mbps. The original uses 30 fps; comparisons below use the same nominal rate.
+
+| Logical desktop | Original mean / p95 | Updated mean / p95 |
+| --- | --- | --- |
+| 1920×1080 | 8.07 / 16.44 ms | 3.69 / 4.79 ms |
+| 3840×2160 | 21.37 / 22.48 ms | 11.62 / 12.26 ms |
+
+At a nominal 60 fps, the updated 4K path measured 11.45 ms mean and 12.33 ms p95.
+The host was also running other GPU applications; earlier 1080p baseline runs
+averaged 5.75–5.83 ms, so the noisy 8.07 ms baseline should not be treated as a
+stable speedup ratio. These are synthetic encoding measurements, excluding
+capture/readback, input, network, client decoding and display. They do not prove
+end-to-end 4K60. The CPU snapshot microbenchmark also improved: native 1080p BGR
+copy took 0.34–0.43 ms versus 0.93–1.05 ms for the previous normalization path.
+The release probe additionally encoded and decoded 30 actual 3840×2160 H.264
+frames without errors; FFprobe confirmed full range and BT.709. Its mean was
+12.27 ms/frame and p95 14.90 ms, without the native benchmark's warm-up exclusion.
+Recording: `artifacts/nvidia-performance-4k.h264`.
+
+The release bridge passed the isolated real-desktop suite with confirmed NVIDIA
+EGL selection (`nvidia=true`) and DMA-BUF advertisement, actual FreeRDP AVC420
+decoding, login-screen authentication/rejection, native initial resolution,
+live portrait/landscape and odd-height resizing, application input, reconnects,
+held-input release, compositor crash, frontend survival and accepted broker
+lease EOF. Receipt: `artifacts/nvidia-performance-gpu-integration.json`.
+The namespace fixture supplies a real Wayland FD but does not authenticate
+through PAM. The test application's buffers use SHM; DMA-BUF advertisement is
+verified, while a real GPU application's import/throughput remains an installed
+session check.
+
+GPU rendering with an AVC-disabled client also passed bitmap fallback with
+`NIRI_RDP_FPS=1`, including input, resizing and disconnect responsiveness.
+Receipt: `artifacts/nvidia-performance-fallback-low-fps.json`. A software-rendered
+NVENC suite passed during development as well:
+`artifacts/nvidia-performance-nvenc-integration.json`.
+
+All 38 bridge library tests and the frontend test passed, including unchanged
+frame recovery and tiny/odd-sized H.264 decoding. Python discovery passed 17
+tests with the opt-in legacy transport test skipped. Its native regression
+exercises 710 guarded-buffer cases across NV12/YUV420P, tiny/odd and large
+dimensions, worker boundaries, edge padding, full-range BT.709 samples and frame
+reference release. All 10 broker test groups and both maintained compositor
+lifecycle tests passed. Release builds, fresh pinned patch application,
+makepkg source checksum verification and portable source export passed.
+Clippy passed with four existing lint categories allowed; strict Clippy still
+reports existing login condition/style and capture-state tuple-complexity lints.
+No host package or service was installed or changed.
+
+Reproduce after building the patched compositor and release bridge:
+
+```sh
+cc -O3 scripts/encoder-bench.c -o /tmp/niri-rdp-encoder-bench \
+  $(pkg-config --cflags --libs libavcodec libavutil libswscale)
+/tmp/niri-rdp-encoder-bench 0 1920 1080 60 12000000
+/tmp/niri-rdp-encoder-bench 0 3840 2160 60 12000000
+lab/run-isolated.sh --nvidia-renderer env NIRI_RDP_LAB_ENCODER=nvenc \
+  NIRI_RDP_LAB_TLS_CONTRACT=1 NIRI_RDP_LAB_LOGIN_SCREEN=1 \
+  NIRI_RDP_LAB_BRIDGE=bridge/target/release/niri-rdp-bridge \
+  NIRI_RDP_LAB_REPORT=artifacts/nvidia-performance-gpu-integration.json \
+  python3 scripts/headless-integration.py
+lab/run-isolated.sh --nvidia-renderer env NIRI_RDP_LAB_ENCODER=nvenc \
+  NIRI_RDP_LAB_GFX=0 NIRI_RDP_LAB_FPS=1 NIRI_RDP_LAB_TLS_CONTRACT=1 \
+  NIRI_RDP_LAB_BRIDGE=bridge/target/release/niri-rdp-bridge \
+  NIRI_RDP_LAB_REPORT=artifacts/nvidia-performance-fallback-low-fps.json \
+  python3 scripts/headless-integration.py
+```
+
+Capture/readback and BT.709 conversion still cross CPU memory; this is not a
+zero-copy GPU capture/encode pipeline. Installed PAM/logind, service account GPU
+permissions, Windows mstsc, physical-monitor and complete-path latency/throughput
+remain [actual-machine acceptance](acceptance.md) gates. Rebuild both compositor
+and frontend, and enable the packaged NVIDIA frontend drop-in as described in
+[installation](install.md#optional-nvidia-encoding).
+
 Additional implementation evidence is tracked in
 [compositor checkpoint](../compositor/CHECKPOINT.md),
 [bridge checkpoint](../bridge/CHECKPOINT.md),

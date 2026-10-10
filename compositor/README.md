@@ -23,6 +23,24 @@ library-managed RDP and the real compositor/app capture/input bridge.
 The broker's worker launches with `NIRI_BACKEND=headless`, a private runtime
 directory as `XDG_RUNTIME_DIR`, and `--config /etc/niri-rdp/headless.kdl`.
 It must never inherit a local display socket or run Niri with `--session`.
+`/etc/niri-rdp/renderer.conf` selects `auto`, `hardware`, or `software`. `auto`
+tries non-software EGL devices first, preferring NVIDIA devices that advertise
+`EGL_NV_device_cuda`, then uses the surfaceless fallback. This uses Smithay's
+`EGL_EXT_platform_device` support, which NVIDIA provides for headless rendering;
+it needs no local display server, VT, seat, or DRM master. `hardware` fails startup
+if no device can initialize instead of silently falling back. `software` retains
+the original llvmpipe settings in the worker. Driver libraries and device access
+must be available to the logged-in account. Logs identify the selected path.
+Hardware rendering advertises linux-dmabuf formats and render-node feedback so
+accelerated applications can submit GPU buffers to the compositor. The RDP bridge
+still captures the final output through SHM and uploads it for NVENC.
+The software namespace lab does not validate actual NVIDIA rendering performance.
+
+On a disposable NVIDIA-capable test machine,
+`lab/run-isolated.sh --nvidia-renderer env NIRI_RDP_LAB_ENCODER=nvenc python3 scripts/headless-integration.py`
+requires hardware EGL, verifies NVIDIA identification and DMA-BUF advertisement,
+and tests SHM capture/input with the NVENC RDP path. It exposes NVIDIA nodes and
+DRM render nodes only, preserving isolation from physical modesetting devices.
 The patch creates private `wayland-0` and HEADLESS-1 initially at 1920×1080, 60 Hz;
 scale=1 and transform=normal are enforced by the supplied config. Capture uses
 existing wlr SHM screencopy; input uses existing virtual keyboard/pointer

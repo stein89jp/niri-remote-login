@@ -45,8 +45,8 @@ and the component checkpoints for exact sources and executed evidence.
 
 Keep phase 1–3 integration in a disposable Arch VM with a dedicated account.
 Do not replace the host's Niri package, GDM, GRD, PAM stack, or working desktop.
-Software/surfaceless rendering is the first fallback; GPU rendering through a
-render node is an optional later path. Validate render-node access under the
+The patched compositor prefers hardware EGL devices, including NVIDIA, with
+surfaceless fallback. An explicit software policy forces llvmpipe. Validate GPU device access under the
 remote session UID; a seatless session must not assume local-seat device ACLs.
 Display independence must not depend on seat0 being active. The eventual boot service is a system service; starting a
 user service or enabling linger alone is not equivalent to opening a login

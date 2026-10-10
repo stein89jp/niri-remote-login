@@ -23,6 +23,49 @@ setup = load("host_setup", "niri-rdp-setup.py")
 
 
 class HostSetupTests(unittest.TestCase):
+    def run_worker(self, policy):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            config = directory / "renderer.conf"
+            if policy is not None:
+                config.write_text(policy + "\n")
+            executable = directory / "niri-headless"
+            executable.write_text("#!/bin/sh\nexec /usr/bin/env\n")
+            executable.chmod(0o755)
+            worker = (ROOT / "broker/config/session-worker").read_text()
+            worker = worker.replace("/etc/niri-rdp/renderer.conf", str(config))
+            worker = worker.replace("/usr/lib/niri-rdp/niri-headless", str(executable))
+            environment = dict(os.environ, NIRI_RDP_RUNTIME_DIR=str(directory),
+                               DISPLAY=":0", WAYLAND_DISPLAY="local-wayland",
+                               LIBGL_ALWAYS_SOFTWARE="1", GALLIUM_DRIVER="llvmpipe")
+            return subprocess.run(["/bin/sh", "-c", worker], env=environment,
+                                  text=True, capture_output=True)
+
+    def test_worker_auto_and_hardware_allow_gpu_without_local_desktop(self):
+        for policy in (None, "auto", "hardware"):
+            with self.subTest(policy=policy):
+                result = self.run_worker(policy)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                environment = dict(line.split("=", 1) for line in result.stdout.splitlines())
+                self.assertEqual(environment["NIRI_RDP_RENDERER"], policy or "auto")
+                for key in ("LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER", "DISPLAY", "WAYLAND_DISPLAY"):
+                    self.assertNotIn(key, environment)
+                self.assertEqual(environment["XDG_RUNTIME_DIR"], environment["NIRI_RDP_RUNTIME_DIR"])
+
+    def test_worker_explicit_software_retains_fallback(self):
+        result = self.run_worker("software")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = dict(line.split("=", 1) for line in result.stdout.splitlines())
+        self.assertEqual(environment["LIBGL_ALWAYS_SOFTWARE"], "1")
+        self.assertEqual(environment["GALLIUM_DRIVER"], "llvmpipe")
+        self.assertEqual(environment["NIRI_RDP_RENDERER"], "software")
+
+    def test_worker_rejects_invalid_policy_without_executing_shell_text(self):
+        result = self.run_worker("auto; echo unsafe")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("must contain auto, hardware or software", result.stderr)
+
     def test_certificate_identity_rejects_openssl_syntax_injection(self):
         for value in ("host,IP:1.2.3.4", "host/CN=other", "-host", "", "a..b"):
             with self.subTest(value=value), self.assertRaises(ValueError):

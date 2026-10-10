@@ -6,7 +6,19 @@ set -eu
 # applications use a private runtime so no local Wayland or desktop bus is reused.
 export XDG_RUNTIME_DIR="$NIRI_RDP_RUNTIME_DIR"
 export NIRI_BACKEND=headless
-export LIBGL_ALWAYS_SOFTWARE=1
-export GALLIUM_DRIVER=llvmpipe
+# This root-owned file contains one policy word, never executable shell code.
+renderer=auto
+if [ -f /etc/niri-rdp/renderer.conf ]; then
+    IFS= read -r renderer < /etc/niri-rdp/renderer.conf || {
+        echo 'cannot read /etc/niri-rdp/renderer.conf' >&2
+        exit 1
+    }
+fi
+case "$renderer" in
+    auto|hardware) unset LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER ;;
+    software) export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe ;;
+    *) echo 'renderer.conf must contain auto, hardware or software' >&2; exit 1 ;;
+esac
+export NIRI_RDP_RENDERER="$renderer"
 unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET NIRI_SOCKET SSH_AUTH_SOCK
 exec /usr/lib/niri-rdp/niri-headless --config /etc/niri-rdp/headless.kdl

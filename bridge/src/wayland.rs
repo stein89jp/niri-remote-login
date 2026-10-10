@@ -1,5 +1,5 @@
 //! One worker owns the Wayland queue and its bounded SHM buffers.
-use crate::{bitmap, buffer_length, evdev_key};
+use crate::{buffer_length, capture_bitmap, evdev_key};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{
     DesktopSize, DisplayUpdate, KeyboardEvent, MouseButton, MouseEvent, RdpServerDisplay,
@@ -8,7 +8,7 @@ use ironrdp_server::{
 use std::{
     collections::BTreeSet,
     fs::File,
-    io::{Read, Seek, SeekFrom, Write},
+    io::Write,
     os::{
         fd::{AsFd, AsRawFd},
         unix::net::UnixStream,
@@ -784,6 +784,71 @@ fn wl_seat_button_pressed() -> wayland_client::protocol::wl_pointer::ButtonState
     wayland_client::protocol::wl_pointer::ButtonState::Pressed
 }
 
+/// Keep one SHM allocation and Wayland buffer for the current capture layout.
+/// The compositor writes it only between copy and ready; conversion finishes
+/// before it is submitted again, so no Rust slice overlaps a compositor write.
+struct CaptureBuffer {
+    layout: (wl_shm::Format, u32, u32, u32),
+    buffer: wl_buffer::WlBuffer,
+    pool: wl_shm_pool::WlShmPool,
+    mapping: *mut libc::c_void,
+    length: usize,
+    _file: File,
+}
+impl CaptureBuffer {
+    fn new(
+        shm: &wl_shm::WlShm,
+        layout: (wl_shm::Format, u32, u32, u32),
+        h: &QueueHandle<State>,
+    ) -> anyhow::Result<Self> {
+        let (format, width, height, stride) = layout;
+        let length = buffer_length(width, height, stride)?;
+        let file = tempfile::tempfile()?;
+        file.set_len(length as u64)?;
+        // SAFETY: file is at least length bytes and remains open for this mapping.
+        let mapping = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                length,
+                libc::PROT_READ,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        anyhow::ensure!(
+            mapping != libc::MAP_FAILED,
+            "capture mmap failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let pool = shm.create_pool(file.as_fd(), length as i32, h, ());
+        let buffer =
+            pool.create_buffer(0, width as i32, height as i32, stride as i32, format, h, ());
+        Ok(Self {
+            layout,
+            buffer,
+            pool,
+            mapping,
+            length,
+            _file: file,
+        })
+    }
+    /// Call only after ready and before the next copy request.
+    fn bytes(&self) -> &[u8] {
+        // SAFETY: mapping covers length readable bytes for this object's lifetime.
+        // Its caller observes the screencopy ready barrier before reading.
+        unsafe { std::slice::from_raw_parts(self.mapping.cast(), self.length) }
+    }
+}
+impl Drop for CaptureBuffer {
+    fn drop(&mut self) {
+        self.buffer.destroy();
+        self.pool.destroy();
+        // SAFETY: this object owns the exact mapping returned by mmap.
+        unsafe { libc::munmap(self.mapping, self.length) };
+    }
+}
+
 fn run(
     socket: UnixStream,
     name: &str,
@@ -874,8 +939,13 @@ fn run(
         .capture
         .clone()
         .ok_or_else(|| anyhow::anyhow!("missing screencopy protocol"))?;
+    let frame_interval =
+        Duration::from_secs_f64(1.0 / f64::from(crate::performance::frame_rate()?));
     let result = (|| -> anyhow::Result<()> {
         let mut first = true;
+        let mut shared: Option<CaptureBuffer> = None;
+        let mut next_capture = Instant::now();
+        let mut pending_command = None;
         loop {
             if !alive.load(Ordering::Acquire) {
                 return Ok(());
@@ -886,7 +956,10 @@ fn run(
                 if !alive.load(Ordering::Acquire) {
                     return Ok(());
                 }
-                match commands.try_recv() {
+                match pending_command
+                    .take()
+                    .map_or_else(|| commands.try_recv(), Ok)
+                {
                     Ok(Command::Resize(next)) if next != target => {
                         resize_output(&c, &mut q, &mut s, name, next, &alive)?;
                         target = next;
@@ -905,6 +978,20 @@ fn run(
                     Err(mpsc::TryRecvError::Empty) => break,
                 }
             }
+            let delay = next_capture.saturating_duration_since(Instant::now());
+            if !delay.is_zero() {
+                // Deliver newly injected input even if the next capture is far away.
+                c.flush()?;
+                // Low frame-rate settings must still deliver input immediately
+                // and observe shutdown promptly, even without compositor events.
+                match commands.recv_timeout(delay.min(Duration::from_millis(50))) {
+                    Ok(command) => pending_command = Some(command),
+                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Disconnected) => return Ok(()),
+                }
+                continue;
+            }
+            let frame_started = Instant::now();
             s.dimensions = None;
             s.buffer_done = false;
             s.ready = false;
@@ -928,17 +1015,18 @@ fn run(
                 wl_shm::Format::Abgr8888 | wl_shm::Format::Xbgr8888 => true,
                 _ => anyhow::bail!("unsupported SHM format"),
             };
-            let len = buffer_length(w, height, stride)?;
-            let mut file: File = tempfile::tempfile()?;
-            file.set_len(len as u64)?;
-            let pool = s
-                .shm
-                .as_ref()
-                .ok_or_else(|| anyhow::anyhow!("missing SHM"))?
-                .create_pool(file.as_fd(), len as i32, &h, ());
-            let buffer =
-                pool.create_buffer(0, w as i32, height as i32, stride as i32, format, &h, ());
-            frame.copy(&buffer);
+            let layout = (format, w, height, stride);
+            if shared.as_ref().is_none_or(|buffer| buffer.layout != layout) {
+                shared = Some(CaptureBuffer::new(
+                    s.shm
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("missing SHM"))?,
+                    layout,
+                    &h,
+                )?);
+            }
+            let buffer = shared.as_ref().unwrap();
+            frame.copy(&buffer.buffer);
             input.size = (w, height);
             while !s.ready {
                 if !alive.load(Ordering::Acquire) {
@@ -950,20 +1038,17 @@ fn run(
                     "capture failed or timed out"
                 );
             }
-            let mut bytes = vec![0; len];
-            file.seek(SeekFrom::Start(0))?;
-            file.read_exact(&mut bytes)?;
-            let image = bitmap(&bytes, w, height, stride, s.inverted, target, abgr)?;
+            let image =
+                capture_bitmap(buffer.bytes(), w, height, stride, s.inverted, target, abgr)?;
             frames.send_replace(Some(Arc::new(DisplayUpdate::Bitmap(image))));
             frame.destroy();
-            buffer.destroy();
-            pool.destroy();
             if first {
                 let _ = ready.send(Ok(()));
                 first = false;
             }
-            // At most 30 full frames per second, retaining only the newest one.
-            std::thread::sleep(Duration::from_millis(33));
+            // Include negotiation/readback time in the budget so a 60 Hz setting
+            // does not become 30 Hz merely because capture takes one output tick.
+            next_capture = frame_started + frame_interval;
         }
     })();
     input.release();
@@ -998,6 +1083,8 @@ impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> for State {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    use crate::bitmap;
+    use std::io::Read;
     #[test]
     fn layout_accepts_portrait_and_odd_height_but_rejects_unsupported_sizes() {
         for (width, height, accepted) in [

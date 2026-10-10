@@ -25,6 +25,8 @@ unsafe extern "C" {
         width: c_int,
         height: c_int,
         software: c_int,
+        fps: c_int,
+        bitrate: c_int,
         error: *mut c_char,
         length: usize,
     ) -> *mut c_void;
@@ -67,6 +69,8 @@ impl Encoder {
                 width.into(),
                 height.into(),
                 software.into(),
+                crate::performance::frame_rate()? as c_int,
+                crate::performance::bitrate()? as c_int,
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -102,7 +106,7 @@ impl Encoder {
                 && image.y == 0
                 && image.width.get() == self.width
                 && image.height.get() == self.height
-                && image.format == PixelFormat::BgrA32,
+                && matches!(image.format, PixelFormat::BgrA32 | PixelFormat::BgrX32),
             "H.264 requires a full BGR desktop frame"
         );
         let stride = image.stride.get();
@@ -146,6 +150,9 @@ struct Shared {
 pub struct Video(Arc<Mutex<Shared>>);
 impl Video {
     pub fn from_env() -> anyhow::Result<Option<Self>> {
+        // Reject invalid capture settings before accepting client connections.
+        crate::performance::frame_rate()?;
+        crate::performance::bitrate()?;
         match std::env::var("NIRI_RDP_ENCODER")
             .as_deref()
             .unwrap_or("bitmap")
@@ -199,6 +206,7 @@ impl Video {
             surface: None,
             start: Instant::now(),
             force_idr: true,
+            last_image: None,
             ended: false,
             generation: state.generation.clone(),
             known_generation: state.generation.load(Ordering::SeqCst),
@@ -272,12 +280,24 @@ struct VideoUpdates {
     surface: Option<u16>,
     start: Instant,
     force_idr: bool,
+    // Bytes is reference counted: retaining one input adds no full-frame copy.
+    last_image: Option<BitmapUpdate>,
     ended: bool,
     generation: Arc<AtomicU64>,
     known_generation: u64,
     suppressed: Arc<AtomicBool>,
 }
 impl VideoUpdates {
+    fn unchanged(&self, image: &BitmapUpdate) -> bool {
+        !self.force_idr
+            && self.last_image.as_ref().is_some_and(|previous| {
+                previous.width == image.width
+                    && previous.height == image.height
+                    && previous.format == image.format
+                    && previous.stride == image.stride
+                    && previous.data == image.data
+            })
+    }
     fn submit(&mut self, data: &[u8], width: u16, height: u16) -> ServerResult<()> {
         let mut gfx = self.handle.lock().unwrap();
         if !gfx.is_ready() || !gfx.supports_avc420() {
@@ -373,6 +393,7 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                 DisplayUpdate::Bitmap(image) => image,
                 DisplayUpdate::Resize(size) => {
                     self.encoder.lock().unwrap().take();
+                    self.last_image = None;
                     self.surface = None;
                     self.force_idr = true;
                     let mut gfx = self.handle.lock().unwrap();
@@ -407,7 +428,14 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                     continue;
                 }
             }
+            // Continue consuming capture heartbeats so capability recovery,
+            // minimize/resume and backpressure still wake on a static desktop.
+            // Avoid conversion, GPU upload and wire traffic for identical pixels.
+            if self.unchanged(&image) {
+                continue;
+            }
             let (width, height) = (image.width.get(), image.height.get());
+            self.last_image = Some(image.clone());
             let encoder = self.encoder.clone();
             let force_idr = self.force_idr;
             // Encoder initialization and GPU submission run off the input/network thread.
@@ -507,6 +535,7 @@ mod tests {
                 surface: None,
                 start: Instant::now(),
                 force_idr: true,
+                last_image: None,
                 ended: false,
                 generation: state.generation.clone(),
                 known_generation: 0,
@@ -560,6 +589,32 @@ mod tests {
         assert!(stream.encoder.lock().unwrap().is_none());
         assert!(stream.pending.is_none());
         assert!(events.try_recv().is_err());
+    }
+    #[test]
+    fn unchanged_desktop_skips_encoding_but_recovery_and_resize_require_a_frame() {
+        let (mut stream, _) = updates(vec![]);
+        let DisplayUpdate::Bitmap(image) = image() else {
+            unreachable!()
+        };
+        stream.last_image = Some(image.clone());
+        assert!(
+            !stream.unchanged(&image),
+            "initial/recovery IDR must not be skipped"
+        );
+        stream.force_idr = false;
+        assert!(stream.unchanged(&image));
+        let mut changed = image.clone();
+        changed.data = vec![128; changed.data.len()].into();
+        assert!(!stream.unchanged(&changed));
+        let DisplayUpdate::Bitmap(resized) = sized_image(32, 128) else {
+            unreachable!()
+        };
+        assert!(!stream.unchanged(&resized));
+        stream.force_idr = true;
+        assert!(
+            !stream.unchanged(&image),
+            "dropped reference or resume needs a fresh IDR"
+        );
     }
     #[tokio::test(flavor = "current_thread")]
     async fn resize_releases_encoder_and_old_graphics_surfaces() {
@@ -644,7 +699,7 @@ mod tests {
     #[test]
     fn dimension_changes_recreate_encoder_and_odd_sizes_are_padded() {
         let mut encoder = None;
-        for (width, height) in [(64, 64), (63, 61), (80, 48)] {
+        for (width, height) in [(64, 64), (63, 61), (80, 48), (1, 1), (1, 17), (17, 1)] {
             let DisplayUpdate::Bitmap(image) = sized_image(width, height) else {
                 unreachable!()
             };

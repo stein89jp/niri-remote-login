@@ -1,6 +1,8 @@
 /* Small FFmpeg ABI boundary. FFmpeg owns NVENC loading and H.264 encoding. */
 #include <libavcodec/avcodec.h>
 #include <libavutil/opt.h>
+#include <libavutil/mem.h>
+#include <libavutil/cpu.h>
 #include <libswscale/swscale.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -13,6 +15,9 @@ struct niri_video {
     AVFrame *rgb;
     AVPacket *packet;
     struct SwsContext *scale;
+    uint8_t *tail;
+    int tail_stride;
+    int direct_height;
     int64_t pts;
     int width, height;
 };
@@ -20,6 +25,7 @@ struct niri_video {
 void niri_video_free(struct niri_video *v) {
     if (!v) return;
     sws_freeContext(v->scale);
+    av_free(v->tail);
     av_packet_free(&v->packet);
     av_frame_free(&v->frame);
     av_frame_free(&v->rgb);
@@ -34,8 +40,13 @@ static void error_text(char *error, size_t length, const char *step, int code) {
 }
 
 /* software is used by regression tests only; production always requests NVENC. */
-struct niri_video *niri_video_new(int width, int height, int software,
+struct niri_video *niri_video_new(int width, int height, int software, int fps, int bitrate,
                                  char *error, size_t length) {
+    if (width < 1 || height < 1 || width > 4096 || height > 4096 ||
+        fps < 1 || fps > 60 || bitrate < 1000000 || bitrate > 100000000) {
+        snprintf(error, length, "invalid H.264 dimensions, framerate or bitrate");
+        return NULL;
+    }
     const AVCodec *codec = avcodec_find_encoder_by_name(software ? "libx264" : "h264_nvenc");
     if (!codec) {
         snprintf(error, length, "FFmpeg lacks %s", software ? "libx264" : "h264_nvenc");
@@ -54,13 +65,13 @@ struct niri_video *niri_video_new(int width, int height, int software,
        the padding; the SPS must not crop the coded dimensions instead. */
     c->width = (width + 15) & ~15;
     c->height = (height + 15) & ~15;
-    c->time_base = (AVRational){1, 30};
-    c->framerate = (AVRational){30, 1};
+    c->time_base = (AVRational){1, fps};
+    c->framerate = (AVRational){fps, 1};
     /* NVENC's packed RGB conversion is fixed to limited-range BT.601.
        RDP AVC420 requires full-range BT.709, so convert explicitly first. */
     c->pix_fmt = software ? AV_PIX_FMT_YUV420P : AV_PIX_FMT_NV12;
-    c->bit_rate = 12000000;
-    c->gop_size = 60;
+    c->bit_rate = bitrate;
+    c->gop_size = 2 * fps;
     c->max_b_frames = 0;
     c->thread_count = 1;
     c->color_range = AVCOL_RANGE_JPEG;
@@ -73,6 +84,15 @@ struct niri_video *niri_video_new(int width, int height, int software,
     av_dict_set(&options, "tune", software ? "zerolatency" : "ull", 0);
     av_dict_set(&options, "profile", "high", 0);
     if (!software) {
+        /* FFmpeg otherwise defaults to VBR with a two-second VBV and an
+           unspecified maximum rate. A one-frame VBV constrains interactive
+           transport bursts; bounded VBR saves bandwidth on simple frames. */
+        c->rc_max_rate = bitrate;
+        c->rc_buffer_size = bitrate / fps;
+        av_dict_set(&options, "rc", "vbr", 0);
+        av_dict_set(&options, "multipass", "disabled", 0);
+        /* This interface submits and drains one frame at a time. */
+        av_dict_set(&options, "surfaces", "2", 0);
         av_dict_set(&options, "zerolatency", "1", 0);
         av_dict_set(&options, "rc-lookahead", "0", 0);
         av_dict_set(&options, "delay", "0", 0);
@@ -95,16 +115,59 @@ struct niri_video *niri_video_new(int width, int height, int software,
         goto fail;
     }
     {
-        v->rgb = av_frame_alloc();
-        if (!v->rgb) goto fail;
-        v->rgb->format = AV_PIX_FMT_BGR0;
-        v->rgb->width = c->width;
-        v->rgb->height = c->height;
-        if (av_frame_get_buffer(v->rgb, 32) < 0) goto fail;
-        v->scale = sws_getContext(c->width, c->height, AV_PIX_FMT_BGR0,
-                                  c->width, c->height, c->pix_fmt,
-                                  SWS_FAST_BILINEAR, NULL, NULL, NULL);
-        if (!v->scale) goto fail;
+        /* sws_scale() does not use libswscale's workers. For larger desktops,
+           a padded BGR staging frame enables sws_scale_frame()'s parallel
+           conversion, which outweighs the copy cost at 1080p and 4K. */
+#if LIBSWSCALE_VERSION_MAJOR >= 6
+        int threads = av_cpu_count();
+        if (threads > 4) threads = 4;
+        if (width * height >= 640 * 480 && threads > 1) {
+            v->scale = sws_alloc_context();
+            if (!v->scale) goto fail;
+            if (av_opt_set_int(v->scale, "srcw", width, 0) < 0 ||
+                av_opt_set_int(v->scale, "srch", height, 0) < 0 ||
+                av_opt_set_int(v->scale, "dstw", width, 0) < 0 ||
+                av_opt_set_int(v->scale, "dsth", height, 0) < 0 ||
+                av_opt_set_int(v->scale, "src_format", AV_PIX_FMT_BGR0, 0) < 0 ||
+                av_opt_set_int(v->scale, "dst_format", c->pix_fmt, 0) < 0 ||
+                av_opt_set_int(v->scale, "sws_flags", SWS_FAST_BILINEAR, 0) < 0 ||
+                av_opt_set_int(v->scale, "threads", threads, 0) < 0) {
+                /* Keep compatibility with FFmpeg builds without workers. */
+                sws_freeContext(v->scale);
+                v->scale = NULL;
+            } else {
+                result = sws_init_context(v->scale, NULL, NULL);
+                if (result < 0) {
+                    error_text(error, length, "initialize parallel color conversion", result);
+                    goto fail;
+                }
+                v->rgb = av_frame_alloc();
+                if (!v->rgb) goto fail;
+                v->rgb->format = AV_PIX_FMT_BGR0;
+                v->rgb->width = width;
+                v->rgb->height = height;
+                result = av_frame_get_buffer(v->rgb, 32);
+                if (result < 0) {
+                    error_text(error, length, "allocate color conversion frame", result);
+                    goto fail;
+                }
+            }
+        }
+#endif
+        if (!v->scale) {
+            /* Small/single-core frames avoid staging a full BGR desktop.
+               SIMD readers need a chroma pair plus 64 bytes after a direct
+               slice; convert those final rows from padded scratch instead. */
+            v->scale = sws_getContext(width, height, AV_PIX_FMT_BGR0,
+                                      width, height, c->pix_fmt,
+                                      SWS_FAST_BILINEAR, NULL, NULL, NULL);
+            if (!v->scale) goto fail;
+            v->tail_stride = width * 4 + 64;
+            int tail_rows = 2 + (64 + width * 4 - 1) / (width * 4);
+            v->direct_height = height > tail_rows ? (height - tail_rows) & ~1 : 0;
+            v->tail = av_mallocz((size_t)v->tail_stride * (height - v->direct_height) + 64);
+            if (!v->tail) goto fail;
+        }
         const int *coefficients = sws_getCoefficients(SWS_CS_ITU709);
         if (sws_setColorspaceDetails(v->scale, coefficients, 1, coefficients, 1,
                                      0, 1 << 16, 1 << 16) < 0) goto fail;
@@ -115,34 +178,81 @@ fail:
     return NULL;
 }
 
+/* Replicate the final sample/row into RDP's 16-aligned coded dimensions.
+   step is two for interleaved NV12 chroma, one for luma or planar chroma. */
+static void pad_plane(uint8_t *data, int stride, int width, int height,
+                      int padded_width, int padded_height, int step) {
+    if (width < padded_width) {
+        for (int y = 0; y < height; ++y) {
+            uint8_t *row = data + (size_t)y * stride;
+            for (int x = width; x < padded_width; x += step)
+                memcpy(row + x, row + width - step, step);
+        }
+    }
+    for (int y = height; y < padded_height; ++y)
+        memcpy(data + (size_t)y * stride, data + (size_t)(height - 1) * stride,
+               padded_width);
+}
+
 /* Returned packet memory remains owned by v until the next call or free. */
 int niri_video_encode(struct niri_video *v, const uint8_t *pixels, int stride,
                       int force_idr, const uint8_t **data, char *error, size_t length) {
     int result = av_frame_make_writable(v->frame);
     if (result < 0) goto fail;
-    AVFrame *rgb = v->scale ? v->rgb : v->frame;
-    if (v->scale) {
-        result = av_frame_make_writable(rgb);
+#if LIBSWSCALE_VERSION_MAJOR >= 6
+    if (v->rgb) {
+        result = av_frame_make_writable(v->rgb);
         if (result < 0) goto fail;
-    }
-    for (int y = 0; y < v->height; ++y) {
-        uint8_t *row = rgb->data[0] + (size_t)y * rgb->linesize[0];
-        memcpy(row, pixels + (size_t)y * stride, (size_t)v->width * 4);
-        for (int x = v->width; x < v->codec->width; ++x)
-            memcpy(row + (size_t)x * 4, row + (size_t)(v->width - 1) * 4, 4);
-    }
-    for (int y = v->height; y < v->codec->height; ++y)
-        memcpy(rgb->data[0] + (size_t)y * rgb->linesize[0],
-               rgb->data[0] + (size_t)(v->height - 1) * rgb->linesize[0],
-               (size_t)v->codec->width * 4);
-    if (v->scale) {
-        result = sws_scale(v->scale, (const uint8_t * const *)rgb->data,
-                           rgb->linesize, 0, v->codec->height,
+        for (int row = 0; row < v->height; ++row)
+            memcpy(v->rgb->data[0] + (size_t)row * v->rgb->linesize[0],
+                   pixels + (size_t)row * stride, (size_t)v->width * 4);
+        /* The storage includes the coded padding, but conversion must retain
+           the logical dimensions so pixels are never stretched. */
+        AVFrame output = *v->frame;
+        output.extended_data = output.data;
+        output.width = v->width;
+        output.height = v->height;
+        result = sws_scale_frame(v->scale, &output, v->rgb);
+        if (result < 0) goto fail;
+    } else
+#endif
+    {
+        const uint8_t *source[4] = {pixels, NULL, NULL, NULL};
+        const int strides[4] = {stride, 0, 0, 0};
+        int direct_height = v->direct_height;
+        int tail_height = v->height - direct_height;
+        int converted = 0;
+        if (direct_height > 0) {
+            result = sws_scale(v->scale, source, strides, 0, direct_height,
+                               v->frame->data, v->frame->linesize);
+            if (result < 0) goto fail;
+            converted = result;
+        }
+        for (int row = 0; row < tail_height; ++row)
+            memcpy(v->tail + (size_t)row * v->tail_stride,
+                   pixels + (size_t)(direct_height + row) * stride, (size_t)v->width * 4);
+        const uint8_t *tail_source[4] = {v->tail, NULL, NULL, NULL};
+        const int tail_strides[4] = {v->tail_stride, 0, 0, 0};
+        result = sws_scale(v->scale, tail_source, tail_strides, direct_height, tail_height,
                            v->frame->data, v->frame->linesize);
-        if (result != v->codec->height) {
+        if (result < 0) goto fail;
+        if (converted + result != v->height) {
             result = AVERROR(EINVAL);
             goto fail;
         }
+    }
+    pad_plane(v->frame->data[0], v->frame->linesize[0], v->width, v->height,
+              v->codec->width, v->codec->height, 1);
+    int chroma_width = (v->width + 1) / 2;
+    int chroma_height = (v->height + 1) / 2;
+    if (v->codec->pix_fmt == AV_PIX_FMT_NV12) {
+        pad_plane(v->frame->data[1], v->frame->linesize[1], chroma_width * 2,
+                  chroma_height, v->codec->width, v->codec->height / 2, 2);
+    } else {
+        for (int plane = 1; plane <= 2; ++plane)
+            pad_plane(v->frame->data[plane], v->frame->linesize[plane],
+                      chroma_width, chroma_height, v->codec->width / 2,
+                      v->codec->height / 2, 1);
     }
     v->frame->pts = v->pts++;
     v->frame->pict_type = force_idr ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_NONE;

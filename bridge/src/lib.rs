@@ -1,6 +1,7 @@
 //! Real desktop adapter. IronRDP owns every RDP wire operation.
 pub mod broker;
 pub mod login;
+pub mod performance;
 pub mod video;
 pub mod wayland;
 
@@ -90,6 +91,40 @@ pub fn buffer_length(width: u32, height: u32, stride: u32) -> anyhow::Result<usi
         .ok_or_else(|| anyhow::anyhow!("capture overflow"))
 }
 
+/// Native BGR SHM already has the wire/encoder pixel order. Its unused alpha
+/// byte can remain untouched when the bitmap declares BgrX32.
+pub(crate) fn capture_bitmap(
+    bytes: &[u8],
+    width: u32,
+    height: u32,
+    stride: u32,
+    inverted: bool,
+    target: DesktopSize,
+    abgr: bool,
+) -> anyhow::Result<BitmapUpdate> {
+    if !inverted
+        && !abgr
+        && width == u32::from(target.width)
+        && height == u32::from(target.height)
+        && stride == width * 4
+    {
+        anyhow::ensure!(
+            bytes.len() == buffer_length(width, height, stride)?,
+            "SHM length mismatch"
+        );
+        return Ok(BitmapUpdate {
+            x: 0,
+            y: 0,
+            width: NonZeroU16::new(target.width).unwrap(),
+            height: NonZeroU16::new(target.height).unwrap(),
+            format: PixelFormat::BgrX32,
+            data: bytes.to_vec().into(),
+            stride: NonZeroUsize::new(stride as usize).unwrap(),
+        });
+    }
+    bitmap(bytes, width, height, stride, inverted, target, abgr)
+}
+
 /// Strip row padding, normalize upside-down SHM and scale the desktop contract.
 pub fn bitmap(
     bytes: &[u8],
@@ -110,15 +145,17 @@ pub fn bitmap(
         "RDP dimensions outside 1..4096"
     );
     let out_stride = usize::from(target.width) * 4;
-    let mut data = vec![0; out_stride * usize::from(target.height)];
+    // Every output byte is supplied below; avoid zero-filling a second full
+    // desktop allocation before copying the compositor's pixels into it.
+    let mut data = Vec::with_capacity(out_stride * usize::from(target.height));
     for y in 0..u32::from(target.height) {
         let sy = y * height / u32::from(target.height);
         let sy = if inverted { height - 1 - sy } else { sy };
         if u32::from(target.width) == width {
             let src = (sy * stride) as usize;
-            let dst = y as usize * out_stride;
-            let row = &mut data[dst..dst + out_stride];
-            row.copy_from_slice(&bytes[src..src + out_stride]);
+            let dst = data.len();
+            data.extend_from_slice(&bytes[src..src + out_stride]);
+            let row = &mut data[dst..];
             for pixel in row.as_chunks_mut::<4>().0 {
                 if abgr {
                     pixel.swap(0, 2);
@@ -130,8 +167,8 @@ pub fn bitmap(
         for x in 0..u32::from(target.width) {
             let sx = x * width / u32::from(target.width);
             let src = (sy * stride + sx * 4) as usize;
-            let dst = y as usize * out_stride + x as usize * 4;
-            data[dst..dst + 4].copy_from_slice(&bytes[src..src + 4]);
+            let dst = data.len();
+            data.extend_from_slice(&bytes[src..src + 4]);
             if abgr {
                 data.swap(dst, dst + 2);
             }
@@ -195,6 +232,27 @@ mod tests {
             &result.data[..],
             &[9, 8, 7, 255, 12, 11, 10, 255, 3, 2, 1, 255, 6, 5, 4, 255]
         );
+    }
+    #[test]
+    fn native_capture_preserves_pixels_and_declares_unused_alpha() {
+        let bytes = [1, 2, 3, 0, 4, 5, 6, 17];
+        let target = DesktopSize {
+            width: 2,
+            height: 1,
+        };
+        let native = capture_bitmap(&bytes, 2, 1, 8, false, target, false).unwrap();
+        assert_eq!(native.format, PixelFormat::BgrX32);
+        assert_eq!(&native.data[..], &bytes);
+        // Snapshot ownership must survive the reusable SHM buffer's next write.
+        let mut shm = bytes.to_vec();
+        let owned = capture_bitmap(&shm, 2, 1, 8, false, target, false).unwrap();
+        shm.fill(99);
+        assert_eq!(&owned.data[..], &bytes);
+        let padded = [1, 2, 3, 0, 4, 5, 6, 17, 99, 99, 99, 99];
+        let normalized = capture_bitmap(&padded, 2, 1, 12, false, target, false).unwrap();
+        assert_eq!(normalized.format, PixelFormat::BgrA32);
+        assert_eq!(&normalized.data[..], &[1, 2, 3, 255, 4, 5, 6, 255]);
+        assert!(capture_bitmap(&bytes[..4], 2, 1, 8, false, target, false).is_err());
     }
     #[test]
     fn bitmap_row_copy_and_scaled_paths_preserve_pixel_contract() {

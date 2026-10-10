@@ -13,7 +13,7 @@
     "patches": [
       "patches/0001-remote-headless-bounds-and-startup.patch"
     ],
-    "patch_sha256": "91b0840ab9c2f71810f4b8f1673317ca86f0894a1022bf35664429793b72bc27"
+    "patch_sha256": "4c8e2a67b2d91b1c5a3ce980b9e9862e634ac301b610800a365b28ee21059e48"
   },
   "alternative": {
     "pull_request": 3800,
