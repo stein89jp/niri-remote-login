@@ -7,6 +7,7 @@ Requires=systemd-logind.service
 Type=simple
 User=root
 Group=niri-rdp
+ExecStartPre=/usr/lib/niri-rdp/prepare-tls
 ExecStart=/usr/lib/niri-rdp/niri-rdp-broker
 ExecStopPost=/usr/lib/niri-rdp/niri-rdp-broker --cleanup
 Restart=on-failure

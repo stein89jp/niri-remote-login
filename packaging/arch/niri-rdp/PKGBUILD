@@ -1,0 +1,148 @@
+# Build the complete host package directly from a repository checkout:
+#   cd packaging/arch/niri-rdp && makepkg -si
+# Local inputs are copied and checksum-verified by makepkg, never built in place.
+# Export a portable source bundle with makepkg --allsource.
+pkgname=niri-remote-login
+pkgver=0.1.0
+pkgrel=4
+pkgdesc='Niri remote desktop host with a PAM/logind broker and dedicated headless compositor'
+arch=('x86_64')
+# Niri is GPL-3.0-or-later; the bridge links Arch's GPL-licensed FFmpeg.
+license=('MIT' 'GPL-3.0-only' 'GPL-3.0-or-later')
+options=('!debug' '!lto')
+depends=('pam' 'systemd' 'systemd-libs' 'dbus' 'wayland' 'libxkbcommon'
+         'xkeyboard-config' 'foot' 'ttf-dejavu' 'ffmpeg' 'seatd' 'libinput'
+         'libdisplay-info' 'mesa' 'libglvnd' 'pango' 'cairo' 'pixman'
+         'openssl' 'python')
+makedepends=('rust>=1.94' 'cargo' 'git' 'gcc' 'pkgconf')
+provides=('niri-rdp-headless=26.04.remote1-2')
+conflicts=('niri-rdp-headless')
+backup=('etc/niri-rdp/frontend.conf' 'etc/niri-rdp/headless.kdl' 'etc/pam.d/niri-rdp')
+_revision=0be60b742762905b7bee1ea67bb5a2fb00859bf0
+source=("niri-$_revision.tar.gz::https://codeload.github.com/niri-wm/niri/tar.gz/$_revision")
+sha256sums=('680374cae233d2ed1e0f8474aeb017e36872b30b9e291ce43b1521724b8fe2a9')
+noextract=()
+
+# A checkout is the source of this local package. Snapshot each required input
+# using file:// sources and real checksums; this also includes local edits.
+# Evaluation only reads files. Downloads, copying and extraction remain under
+# makepkg's control. No Python or Cargo is needed before dependency resolution.
+_checkout="${startdir:-$PWD}/../../.."
+_local_files=()
+if [[ -f "$_checkout/bridge/Cargo.lock" && -f "$_checkout/LICENSE" ]]; then
+  _checkout=$(cd "$_checkout" && pwd -P)
+  _local_files=(LICENSE bridge/Cargo.toml bridge/Cargo.lock bridge/build.rs
+                broker/Makefile broker/broker.c broker/tests.c
+                packaging/frontend.conf packaging/nvidia-frontend.conf
+                packaging/niri-rdp.sysusers packaging/niri-rdp-setup.py
+                packaging/prepare-tls.py scripts/collect-licenses.py
+                tests/__init__.py tests/test_host_setup.py
+                compositor/patches/0001-remote-headless-bounds-and-startup.patch)
+  while IFS= read -r -d '' _file; do
+    _local_files+=("${_file#"$_checkout/"}")
+  done < <(find "$_checkout/bridge/src" "$_checkout/broker/config" \
+                "$_checkout/packaging/systemd" "$_checkout/docs" \
+                -type f ! -name '*.pyc' -print0 | sort -z)
+  for _file in "${_local_files[@]}"; do
+    # '+' encodes directory separators in makepkg's flat source directory.
+    [[ $_file != *+* ]] || { printf 'Unsupported source path: %s\n' "$_file" >&2; return 1; }
+    _digest=$(sha256sum "$_checkout/$_file") || return 1
+    _digest=${_digest%% *}
+    # Changed checkout inputs get new cache names, avoiding stale source reuse.
+    _name="repo-$_digest-${_file//\//+}"
+    # Encode spaces and percent signs for curl's file URL parser.
+    _url="$_checkout/$_file"
+    _url="${_url//%/%25}"
+    _url="${_url// /%20}"
+    _url="${_url//#/%23}"
+    _url="${_url//\?/%3F}"
+    source+=("$_name::file://$_url")
+    sha256sums+=("$_digest")
+    noextract+=("$_name")
+  done
+else
+  # makepkg --allsource bundles contain the same verified inputs, flattened.
+  # This permits rebuilding that bundle without the original checkout.
+  for _file in "${startdir:-$PWD}"/repo-*; do
+    [[ -f $_file ]] || continue
+    _name=${_file##*/}
+    _relative=${_name#repo-}
+    _local_files+=("${_relative#*-}")
+    # The source filename carries the checksum captured at bundle creation.
+    _digest=${_relative%%-*}
+    source+=("$_name")
+    sha256sums+=("$_digest")
+    noextract+=("$_name")
+  done
+  [[ ${#_local_files[@]} -gt 0 ]] || {
+    printf 'Build this PKGBUILD inside the Niri-RDP checkout, or from a makepkg --allsource bundle.\n' >&2
+    return 1
+  }
+fi
+
+prepare() {
+  local input relative
+  mkdir -p "$srcdir/niri-remote-login-$pkgver"
+  for input in "${source[@]:1}"; do
+    input=${input%%::*}
+    relative=$input
+    relative=${relative#repo-}
+    relative=${relative#*-}
+    relative=${relative//+/\/}
+    install -Dm644 "$srcdir/$input" "$srcdir/niri-remote-login-$pkgver/$relative"
+  done
+
+  cd "$srcdir/niri-$_revision"
+  patch -Np1 -i "$srcdir/niri-remote-login-$pkgver/compositor/patches/0001-remote-headless-bounds-and-startup.patch"
+  export CARGO_HOME="$srcdir/cargo-home"
+  cargo fetch --locked
+  python "$srcdir/niri-remote-login-$pkgver/scripts/collect-licenses.py" Cargo.toml THIRD-PARTY-NOTICES.txt
+
+  cd "$srcdir/niri-remote-login-$pkgver"
+  cargo fetch --locked --manifest-path bridge/Cargo.toml
+  python scripts/collect-licenses.py bridge/Cargo.toml THIRD-PARTY-NOTICES.txt
+}
+
+build() {
+  export CARGO_HOME="$srcdir/cargo-home"
+  cd "$srcdir/niri-$_revision"
+  cargo build --release --locked --offline --no-default-features --bin niri
+  cd "$srcdir/niri-remote-login-$pkgver"
+  # aws-lc's jitterentropy requires -O0; let cc-rs control its per-file flags.
+  env -u CFLAGS -u CXXFLAGS cargo build --release --locked --offline --manifest-path bridge/Cargo.toml
+  make -C broker
+}
+
+check() {
+  export CARGO_HOME="$srcdir/cargo-home"
+  cd "$srcdir/niri-$_revision"
+  cargo test --locked --offline --no-default-features --lib backend::headless
+  cd "$srcdir/niri-remote-login-$pkgver"
+  env -u CFLAGS -u CXXFLAGS cargo test --locked --offline --manifest-path bridge/Cargo.toml
+  make -C broker check
+  python -m unittest tests.test_host_setup -v
+}
+
+package() {
+  install -Dm755 "${CARGO_TARGET_DIR:-$srcdir/niri-$_revision/target}/release/niri" "$pkgdir/usr/lib/niri-rdp/niri-headless"
+  install -Dm644 "$srcdir/niri-$_revision/LICENSE" "$pkgdir/usr/share/licenses/niri-rdp-headless/LICENSE"
+  install -Dm644 "$srcdir/niri-$_revision/THIRD-PARTY-NOTICES.txt" "$pkgdir/usr/share/licenses/niri-rdp-headless/THIRD-PARTY-NOTICES.txt"
+  cd "$srcdir/niri-remote-login-$pkgver"
+  install -Dm755 "${CARGO_TARGET_DIR:-$srcdir/niri-remote-login-$pkgver/bridge/target}/release/niri-rdp-bridge" "$pkgdir/usr/lib/niri-rdp/niri-rdp-bridge"
+  install -Dm755 "${CARGO_TARGET_DIR:-$srcdir/niri-remote-login-$pkgver/bridge/target}/release/encoder-probe" "$pkgdir/usr/lib/niri-rdp/encoder-probe"
+  make -C broker DESTDIR="$pkgdir" install
+  local unit document
+  for unit in packaging/systemd/*.service; do
+    install -Dm644 "$unit" "$pkgdir/usr/lib/systemd/system/${unit##*/}"
+  done
+  install -Dm755 packaging/niri-rdp-setup.py "$pkgdir/usr/bin/niri-rdp-setup"
+  install -Dm755 packaging/prepare-tls.py "$pkgdir/usr/lib/niri-rdp/prepare-tls"
+  install -Dm644 packaging/niri-rdp.sysusers "$pkgdir/usr/lib/sysusers.d/niri-rdp.conf"
+  install -Dm644 packaging/frontend.conf "$pkgdir/etc/niri-rdp/frontend.conf"
+  install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+  install -Dm644 THIRD-PARTY-NOTICES.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.txt"
+  for document in install acceptance upgrade uninstall; do
+    install -Dm644 "docs/$document.md" "$pkgdir/usr/share/doc/$pkgname/$document.md"
+  done
+  install -Dm644 packaging/nvidia-frontend.conf "$pkgdir/usr/share/doc/$pkgname/nvidia-frontend.conf"
+}

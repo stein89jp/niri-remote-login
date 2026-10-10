@@ -1,91 +1,79 @@
-# Niri Remote Login — experimental Arch packages
+# Niri Remote Login for Arch Linux
 
-An implementation of a dedicated headless Niri desktop, an IronRDP frontend,
-and a PAM/logind session broker, prepared for testing on a **separate Arch Linux
-Niri installation**. Nothing is installed or enabled on the working host.
+A remote desktop host with a dedicated headless Niri compositor, an IronRDP
+frontend, and a PAM/logind session broker. Install the complete host from one
+build folder on an up-to-date **Arch Linux x86_64** machine:
 
-The real Niri-to-RDP bridge has passed a disposable Arch namespace test: changing
-Wayland application frames, keyboard and pointer feedback, authentication
-rejection, reconnect and input releases. A maintained pinned Niri PR #3953 patch
-supplies the headless backend. Its binary is packaged alongside stock Niri.
-The privileged broker is implemented and native-tested; **actual PAM/logind boot
-login, Windows mstsc, and physical-monitor-off validation remain pending**.
-This is not yet a demonstrated production remote-login service.
+```sh
+sudo pacman -Syu --needed base-devel git
+git clone https://github.com/stein89jp/niri-remote-login.git
+cd niri-remote-login/packaging/arch/niri-rdp
+makepkg -si
+sudo usermod -aG niri-rdp-users "$USER"
+sudo systemctl enable --now niri-rdp-frontend.service
+```
 
-The source supports client-selected initial resolution and live resizing for a
-single remote display, including native Niri application reflow and matching
-pointer coordinates. Rebuild both packages to use this support; the preserved
-0.1.0 delivery archives predate it. See [resolution support](bridge/README.md#dynamic-resolution).
+Open Windows Remote Desktop (`mstsc.exe`) and connect to `HOST:33991`.
+Use your Linux account name and password. The frontend listens directly on the
+network; no SSH tunnel is required. If the client omits password credentials,
+a login screen inside the RDP connection authenticates through PAM before
+starting the desktop. Windows policies requiring NLA are currently incompatible.
+Actual Windows interoperability still needs validation.
 
-The source now includes optional NVIDIA NVENC H.264 encoding on the Niri host
-(`NIRI_RDP_ENCODER=nvenc`) for AVC420-capable RDP clients. The default remains
-bitmap transport. See [NVIDIA setup](docs/install.md#optional-nvidia-encoding)
-and the [functionality review](docs/review.md). Existing 0.1.0 binary archives
-predate these changes; rebuild the frontend package to use the fixes and NVENC.
+For a new remote account, replace the `usermod` command with
+`sudo niri-rdp-setup --create-user niri-remote`. **If using your current account,
+log out of its local graphical session before connecting remotely.** The broker
+rejects simultaneous local graphical sessions for the same account.
 
-- [Install/build on the separate test machine](docs/install.md)
-- [Actual-machine acceptance and pending gates](docs/acceptance.md)
+The package creates the service account and authorization group through Arch's
+systemd hooks. The broker generates a self-signed certificate on first start,
+checks existing certificates, and preserves them across restarts. Verify its
+identity from the client; see the [installation guide](docs/install.md).
+Allow TCP 33991 in your existing firewall if necessary. The listener address and
+port are configurable in `/etc/niri-rdp/frontend.conf`.
+
+Stock `/usr/bin/niri` stays alongside the patched
+`/usr/lib/niri-rdp/niri-headless`. The remote session has its own desktop and
+configuration. Reconnect creates a new session. Client-selected resolution and
+single-display live resizing are supported. Bitmap transport is the default;
+optional host NVIDIA NVENC H.264 encoding is available.
+
+This remains **experimental**. Disposable Niri/RDP integration has demonstrated
+changing application frames, keyboard/pointer input, authentication rejection,
+reconnect, and cleanup. Real installed PAM/logind login, cold boot, Windows
+`mstsc`, and monitor-off acceptance remain pending. Installing the package does
+not establish those results.
+
+- [Installation and optional NVIDIA encoding](docs/install.md)
+- [Actual-machine acceptance](docs/acceptance.md)
 - [Uninstall](docs/uninstall.md) and [upgrade/rollback](docs/upgrade.md)
 - [Compositor pins and patches](compositor/README.md)
-- [Real Wayland/RDP bridge](bridge/README.md) and [session broker](broker/README.md)
-- [Integration checkpoint and remaining work](checkpoints/001-integration.md)
+- [Wayland/RDP bridge](bridge/README.md) and [session broker](broker/README.md)
+- [Architecture](docs/architecture.md) and [validation record](docs/validation.md)
 
-The prepared delivery is `artifacts/installable/`: two x86_64 Arch packages,
-matching source bundles, SHA-256 checksums, and validation receipts. A portable
-archive is `artifacts/niri-remote-login-arch-0.1.0.tar.gz`. Use these only on the
-separate test installation; boot-to-login acceptance has not been demonstrated.
+## Maintainer workflow
 
-The private repository also keeps the validated snapshot in
-[the Arch delivery archive](releases/arch-x86_64/0.1.0/niri-remote-login-arch-0.1.0.tar.gz)
-with its [SHA-256 checksum](releases/arch-x86_64/0.1.0/niri-remote-login-arch-0.1.0.tar.gz.sha256).
-Download or clone it, verify the checksum, and extract it to obtain `installable/`.
-The source, checkpoint and validation receipts inside that archive describe the
-exact package build; subsequent repository changes do not alter this snapshot.
+The combined PKGBUILD snapshots checksum-verified source files from the complete
+checkout. Export a portable source package with `makepkg --allsource` from the
+build folder. Dependency fetching happens during preparation; compilation and
+Rust package checks use pinned lockfiles offline. Never run makepkg as root.
 
-Prepare source package bundles without installing anything:
+The separate-package source export is still available:
 
 ```sh
 python3 scripts/prepare-release.py
 ```
 
-The resulting `artifacts/release/` directories contain hash-checked PKGBUILDs and
-sources. Build with `makepkg` on a disposable Arch builder, inspect the packages,
-then install them only on the intended test machine. The frontend is fixed to
-`127.0.0.1:33991`; Windows must use an explicit private tunnel. Broker login mode
-uses TLS-only RDP and password-only PAM; NLA-required Windows policies currently
-prevent this mode. No custom RDP protocol is implemented.
+The binary delivery archive under `releases/arch-x86_64/0.1.0/` is a preserved old
+snapshot. It predates resolution support, NVENC, direct listening, automatic TLS
+setup, and the login screen. Use a current source build for the workflow above.
 
-No GNOME Remote Login settings, services, accounts, packages, or power settings
-were changed. The packages contain no GNOME/GDM files, no stock Niri replacement,
-and no automatic service enablement.
-
-- [Architecture and phase gates](docs/architecture.md)
-- [Niri APIs and upstream changes](docs/niri-findings.md)
-- [Login, authentication, and RDP libraries](docs/login-and-rdp.md)
-- [RDP library proof of concept](poc/README.md)
-- [Validation record](docs/validation.md)
-- [Pinned source manifest](research/upstream/manifest.json)
-
-The preserved initial prototype has two independent parts: a synthetic RDP display and a
-current-user process-isolation harness. They do not yet form a Niri desktop or
-authenticate Linux users. The process harness uses trusted test workers, private
-directories and D-Bus, and separate process groups. It is not a security boundary
-against hostile code and does not create a PAM/logind session.
-
-Run the isolation tests with:
+Run Python tests with:
 
 ```sh
 python3 -m unittest discover -s tests -v
 ```
 
-These tests need permission to create a temporary Unix socket for private D-Bus.
-See the PoC README for the separate Rust tests and explicit loopback launch.
-Nothing starts a network service automatically.
-
-Baseline validation: 17 tests passed, including a displayless FreeRDP client that verifies
-TLS/CredSSP rejection/success, decoded pixels, keyboard/pointer feedback, input
-release and a fresh connection. The opt-in integration test starts and stops a
-temporary listener on `127.0.0.1:33990`. Actual PAM/logind boot login, Windows `mstsc.exe`, and
-physical-monitor power-off remain actual-machine gates. See the validation
-record for the additional real-desktop integration and package results.
-
+`make check` also runs the Rust and broker checks. Disposable transport/desktop
+integration fixtures live under `scripts/` and `lab/`; they do not start installed
+host services or replace the actual-machine acceptance procedure.

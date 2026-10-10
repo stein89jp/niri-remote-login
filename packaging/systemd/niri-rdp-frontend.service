@@ -1,5 +1,5 @@
 [Unit]
-Description=Loopback Niri RDP login frontend
+Description=Niri RDP login frontend
 Requires=niri-rdp-broker.service
 After=niri-rdp-broker.service
 
@@ -24,9 +24,7 @@ ProtectKernelModules=yes
 ProtectControlGroups=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
-RestrictAddressFamilies=AF_UNIX AF_INET
-IPAddressDeny=any
-IPAddressAllow=localhost
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
 LimitCORE=0
 TasksMax=64
 MemoryMax=512M

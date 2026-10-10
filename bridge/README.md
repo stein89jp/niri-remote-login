@@ -15,9 +15,10 @@ cargo build --manifest-path bridge/Cargo.toml --release --locked
 cargo test --manifest-path bridge/Cargo.toml --locked
 ```
 
-The frontend has one fixed listener, `127.0.0.1:33991`. It does not change GNOME
-Remote Login, the existing PoC listener or physical inputs. No UDP transport,
-preemption or reconnect cookie is enabled. An SSH tunnel is needed for Windows.
+Broker mode defaults to `0.0.0.0:33991` for direct Windows connections.
+`NIRI_RDP_LISTEN` accepts a numeric IPv4/IPv6 address and nonzero port. Disposable
+mode defaults to `127.0.0.1:33991` and rejects non-loopback configuration and peers.
+No UDP transport, preemption or reconnect cookie is enabled.
 Each TCP connection receives a new authenticated desktop; reconnect performs PAM
 again and creates a new session. Disconnect closes the broker lease and ends
 the session. A compositor crash terminates the capture stream with the library
@@ -29,9 +30,21 @@ inside systemd's `CREDENTIALS_DIRECTORY`, falling back to explicit
 `NIRI_RDP_CERT` and `NIRI_RDP_KEY` paths for foreground tests. Broker mode uses
 TLS-only RDP because PAM passwords cannot supply the static NTLM credential
 needed by this library's default NLA backend. Credentials supplied in the
-library's TLS-protected ClientInfo flow reach the broker; domain-qualified
-names are rejected. Windows must permit a TLS-only connection (`enablecredsspsupport:i:0`
-in a dedicated .rdp profile). Actual mstsc verification remains pending.
+library's TLS-protected ClientInfo flow reach the broker. Remembered Windows
+domain credentials open an empty Linux login form and are never forwarded to
+PAM. A client omitting its password also receives a
+restricted bitmap login screen. No compositor or Linux login session starts until
+the screen submits credentials and the broker accepts them. Incorrect credentials
+clear the password; attempts have a two-second delay and the connection closes
+after five failures. The screen supports US physical keys and Unicode character
+events, Tab, Backspace, Enter, and mouse focus/sign-in. Password pixels contain
+a fixed mask, never the secret or its length. Disconnect cancels access to a
+pending session and releases its lease. The display/input adapters switch to the
+real desktop after successful login, including optional NVENC and live resizing.
+
+Ordinary mstsc can negotiate TLS when the server offers no NLA. An explicit
+`enablecredsspsupport:i:0` profile remains a fallback; policies requiring NLA are
+incompatible. Actual mstsc verification remains pending.
 
 For a disposable current-UID compositor only, `NIRI_RDP_MODE=disposable` uses
 library NLA with explicit disposable `NIRI_RDP_USERNAME` and

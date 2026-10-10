@@ -1,5 +1,6 @@
 //! Real desktop adapter. IronRDP owns every RDP wire operation.
 pub mod broker;
+pub mod login;
 pub mod video;
 pub mod wayland;
 
@@ -9,8 +10,35 @@ use std::{
     num::{NonZeroU16, NonZeroUsize},
 };
 
-pub const LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33991);
+pub const LISTEN_ADDR: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 33991);
+pub const DISPOSABLE_LISTEN_ADDR: SocketAddr =
+    SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 33991);
 pub const MAX_DIMENSION: u32 = 4096;
+
+/// Broker sessions accept remote clients; disposable test sessions stay local.
+pub fn listen_addr(mode: &str, configured: Option<&str>) -> anyhow::Result<SocketAddr> {
+    let default = match mode {
+        "broker" => LISTEN_ADDR,
+        "disposable" => DISPOSABLE_LISTEN_ADDR,
+        _ => anyhow::bail!("NIRI_RDP_MODE must be broker or disposable"),
+    };
+    let addr = match configured {
+        Some(value) => value.parse::<SocketAddr>().map_err(|_| {
+            anyhow::anyhow!("NIRI_RDP_LISTEN must be a numeric IP address and port, such as 0.0.0.0:33991 or [::]:33991")
+        })?,
+        None => default,
+    };
+    anyhow::ensure!(addr.port() != 0, "NIRI_RDP_LISTEN port must not be zero");
+    anyhow::ensure!(
+        !addr.ip().is_multicast(),
+        "NIRI_RDP_LISTEN must not be a multicast address"
+    );
+    anyhow::ensure!(
+        mode != "disposable" || addr.ip().is_loopback(),
+        "disposable mode requires a loopback NIRI_RDP_LISTEN address"
+    );
+    Ok(addr)
+}
 
 pub fn server_error(message: impl Into<String>) -> ServerError {
     ServerError::new("niri-rdp bridge", ServerErrorKind::Reason(message.into()))
@@ -207,7 +235,44 @@ mod tests {
         );
     }
     #[test]
-    fn listener_is_loopback_and_distinct_from_gnome_and_poc() {
-        assert_eq!(LISTEN_ADDR.to_string(), "127.0.0.1:33991");
+    fn broker_listener_defaults_to_direct_connections_and_accepts_custom_addresses() {
+        assert_eq!(
+            listen_addr("broker", None).unwrap().to_string(),
+            "0.0.0.0:33991"
+        );
+        for address in ["192.168.1.20:3389", "127.0.0.1:33991", "[::]:33991"] {
+            assert_eq!(
+                listen_addr("broker", Some(address)).unwrap().to_string(),
+                address
+            );
+        }
+    }
+    #[test]
+    fn disposable_listener_never_accepts_non_loopback_configuration() {
+        assert_eq!(
+            listen_addr("disposable", None).unwrap().to_string(),
+            "127.0.0.1:33991"
+        );
+        for address in ["127.0.0.1:33992", "[::1]:33992"] {
+            assert!(listen_addr("disposable", Some(address)).is_ok());
+        }
+        for address in ["0.0.0.0:33991", "192.168.1.20:33991", "[::]:33991"] {
+            assert!(listen_addr("disposable", Some(address)).is_err());
+        }
+    }
+    #[test]
+    fn listener_rejects_invalid_configuration() {
+        assert!(listen_addr("unknown", None).is_err());
+        for address in [
+            "",
+            "localhost:33991",
+            "0.0.0.0",
+            "0.0.0.0:0",
+            "0.0.0.0:65536",
+            "224.0.0.1:33991",
+            "[ff02::1]:33991",
+        ] {
+            assert!(listen_addr("broker", Some(address)).is_err());
+        }
     }
 }

@@ -19,7 +19,8 @@
 
 typedef struct {
     rdpContext context;
-    unsigned phase, avc_frames, layout_index;
+    unsigned phase, avc_frames, layout_index, login_phase;
+    ULONGLONG login_retry_at;
     UINT32 expected_width, expected_height;
     UINT16 pointer_x, pointer_y;
     BOOL initialized, gfx_requested, gfx_failed, disp_ready, size_verified, awaiting_ack;
@@ -104,9 +105,53 @@ static BOOL contains_color(rdpGdi *gdi, BYTE b, BYTE g, BYTE r) {
     return FALSE;
 }
 
+static BOOL login_text(rdpContext *ctx, const char *text) {
+    /* Exercise ordinary mstsc scancode input. Fixture credentials are ASCII. */
+    static const struct { UINT16 first; const char *normal, *shifted; } rows[] = {
+        {2, "1234567890-=", "!@#$%^&*()_+"}, {16, "qwertyuiop[]", "QWERTYUIOP{}"},
+        {30, "asdfghjkl;'`", "ASDFGHJKL:\"~"}, {43, "\\", "|"},
+        {44, "zxcvbnm,./", "ZXCVBNM<>?"}, {57, " ", " "}
+    };
+    for (const unsigned char *p = (const unsigned char *)text; *p; p++) {
+        UINT16 code = 0;
+        BOOL shift = FALSE;
+        for (unsigned i = 0; i < sizeof(rows) / sizeof(rows[0]); i++) {
+            const char *found = strchr(rows[i].normal, *p);
+            if (!found) { found = strchr(rows[i].shifted, *p); shift = found != NULL; }
+            if (found) { code = rows[i].first + (UINT16)(found - (shift ? rows[i].shifted : rows[i].normal)); break; }
+        }
+        if (!code || (shift && !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_DOWN, 42)) ||
+            !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_DOWN, code) ||
+            !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_RELEASE, code) ||
+            (shift && !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_RELEASE, 42))) return FALSE;
+    }
+    return TRUE;
+}
+
+static BOOL login_key(rdpContext *ctx, UINT16 code) {
+    return freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_DOWN, code) &&
+        freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_RELEASE, code);
+}
+
 static BOOL end_paint(rdpContext *ctx) {
     Probe *probe = (Probe *)ctx;
     if (probe->gfx_failed) return FALSE;
+    if (getenv("NIRI_RDP_TEST_LOGIN_SCREEN")) {
+        if (probe->login_phase == 0 && contains_color(ctx->gdi, 140, 95, 40)) {
+            puts("NIRI_RDP_LOGIN_SCREEN_WITHOUT_CLIENT_CREDENTIALS");
+            if (!login_text(ctx, getenv("NIRI_RDP_TEST_USERNAME")) || !login_key(ctx, 15) ||
+                !login_text(ctx, "incorrect-test-password") || !login_key(ctx, 28)) return FALSE;
+            probe->login_phase = 1;
+            return TRUE;
+        }
+        if (probe->login_phase == 1 && contains_color(ctx->gdi, 80, 80, 140)) {
+            puts("NIRI_RDP_LOGIN_SCREEN_WRONG_PASSWORD_REJECTED");
+            probe->login_phase = 2;
+            probe->login_retry_at = GetTickCount64() + 2200;
+            return TRUE;
+        }
+        if (probe->login_phase < 3) return TRUE;
+    }
     if (probe->gfx_requested && probe->avc_frames == 0) return TRUE;
     if (ctx->gdi->width != (INT32)probe->expected_width ||
         ctx->gdi->height != (INT32)probe->expected_height) return TRUE;
@@ -168,6 +213,8 @@ int main(void) {
     if (!user || !*user || !pass || !*pass) return 2;
     BOOL nla = getenv("NIRI_RDP_TEST_NLA") != NULL;
     BOOL gfx = getenv("NIRI_RDP_TEST_GFX") != NULL;
+    BOOL login = getenv("NIRI_RDP_TEST_LOGIN_SCREEN") != NULL;
+    if (login && nla) return 2;
     if (freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0) != 0)
         return 2;
     freerdp *rdp = freerdp_new();
@@ -186,13 +233,13 @@ int main(void) {
     rdpSettings *s = rdp->context->settings;
     BOOL configured = freerdp_settings_set_string(s, FreeRDP_ServerHostname, "127.0.0.1") &&
         freerdp_settings_set_uint32(s, FreeRDP_ServerPort, 33991) &&
-        freerdp_settings_set_string(s, FreeRDP_Username, user) &&
-        freerdp_settings_set_string(s, FreeRDP_Password, pass) &&
+        freerdp_settings_set_string(s, FreeRDP_Username, login ? "" : user) &&
+        freerdp_settings_set_string(s, FreeRDP_Password, login ? "" : pass) &&
         freerdp_settings_set_string(s, FreeRDP_Domain, "") &&
         freerdp_settings_set_bool(s, FreeRDP_NlaSecurity, nla) &&
         freerdp_settings_set_bool(s, FreeRDP_TlsSecurity, !nla) &&
         freerdp_settings_set_bool(s, FreeRDP_RdpSecurity, FALSE) &&
-        freerdp_settings_set_bool(s, FreeRDP_AutoLogonEnabled, TRUE) &&
+        freerdp_settings_set_bool(s, FreeRDP_AutoLogonEnabled, !login) &&
         /* Only this disposable loopback probe accepts its ephemeral certificate. */
         freerdp_settings_set_bool(s, FreeRDP_IgnoreCertificate, TRUE) &&
         freerdp_settings_set_bool(s, FreeRDP_SoftwareGdi, TRUE) &&
@@ -215,6 +262,10 @@ int main(void) {
         const unsigned final_layout = resize ? sizeof(layouts) / sizeof(layouts[0]) - 1 : 0;
         ULONGLONG deadline = GetTickCount64() + 20000;
         while ((probe->phase < 4 || probe->layout_index < final_layout) && GetTickCount64() < deadline) {
+            if (login && probe->login_phase == 2 && GetTickCount64() >= probe->login_retry_at) {
+                if (!login_text(rdp->context, pass) || !login_key(rdp->context, 28)) break;
+                probe->login_phase = 3;
+            }
             if (probe->awaiting_ack) {
                 struct pollfd ack = {.fd = STDIN_FILENO, .events = POLLIN};
                 if (poll(&ack, 1, 0) > 0) {
@@ -244,6 +295,7 @@ int main(void) {
                 !freerdp_check_event_handles(rdp->context)) break;
         }
         if (probe->phase == 4 && probe->layout_index == final_layout && (!gfx || probe->avc_frames > 0)) {
+            if (login) puts("NIRI_RDP_LOGIN_SCREEN_PAM_BINDING_OK");
             puts("NIRI_RDP_APP_KEY_POINTER_RELEASE_OK");
             if (resize) puts("NIRI_RDP_DYNAMIC_RESOLUTION_OK");
             if (gfx) printf("NIRI_RDP_AVC420_DECODED_FRAMES %u\n", probe->avc_frames);

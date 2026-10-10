@@ -1,0 +1,7 @@
+/src/
+/pkg/
+/repo-*
+/*.tar.gz
+/*.src.tar.*
+/*.pkg.tar.*
+/*.log

@@ -1,5 +1,5 @@
 //! A bounded local broker protocol; no passwords appear in command lines/logs.
-use crate::{server_error, video::Video, wayland::Desktop};
+use crate::{login::Login, server_error, video::Video, wayland::Desktop};
 use ironrdp_server::{
     BoundConnection, ConnectionBinder, CredentialDecision, CredentialValidationError,
     CredentialValidator, Credentials, DesktopSize, ServerResult,
@@ -107,6 +107,14 @@ pub struct Broker {
     output: String,
     video: Option<Video>,
     active: Mutex<Option<Desktop>>,
+    login: Mutex<Option<Login>>,
+}
+fn requires_login_screen(credentials: &Credentials) -> bool {
+    credentials.password.is_empty()
+        || credentials
+            .domain
+            .as_ref()
+            .is_some_and(|domain| !domain.is_empty())
 }
 impl Broker {
     pub fn new(path: PathBuf, output: String, video: Option<Video>) -> Self {
@@ -116,9 +124,13 @@ impl Broker {
             output,
             video,
             active: Mutex::new(None),
+            login: Mutex::new(None),
         }
     }
     pub fn discard(&self) {
+        if let Some(login) = self.login.lock().unwrap().take() {
+            login.stop();
+        }
         self.pending.lock().unwrap().take();
         if let Some(desktop) = self.active.lock().unwrap().take() {
             desktop.stop();
@@ -131,11 +143,13 @@ impl CredentialValidator for Broker {
         &self,
         c: &Credentials,
     ) -> Result<CredentialDecision, CredentialValidationError> {
-        // Only local Linux names are authorized; domain routing is unsupported.
-        if c.domain.as_ref().is_some_and(|d| !d.is_empty()) {
-            return Ok(CredentialDecision::Reject);
-        }
         self.discard();
+        // A TLS client may omit credentials or send its remembered Windows
+        // domain credentials. Neither identifies an authorized Linux account.
+        // Bind only the restricted form, without passing those secrets to PAM.
+        if requires_login_screen(c) {
+            return Ok(CredentialDecision::Accept);
+        }
         let path = self.path.clone();
         let username = c.username.clone();
         let password = c.password.clone();
@@ -161,6 +175,22 @@ impl ConnectionBinder for Broker {
         c: &Credentials,
         size: DesktopSize,
     ) -> ServerResult<BoundConnection> {
+        if requires_login_screen(c) {
+            let login = Login::new(
+                self.path.clone(),
+                self.output.clone(),
+                self.video.clone(),
+                size,
+                if c.domain.as_ref().is_none_or(|d| d.is_empty()) {
+                    &c.username
+                } else {
+                    ""
+                },
+            );
+            let bound = login.bound();
+            *self.login.lock().unwrap() = Some(login);
+            return Ok(bound);
+        }
         let (name, session) = self
             .pending
             .lock()
@@ -193,6 +223,76 @@ impl ConnectionBinder for Broker {
 mod tests {
     use super::*;
     use std::{io::Read, os::unix::net::UnixListener, thread};
+    #[tokio::test]
+    async fn remembered_windows_domain_credentials_bind_only_empty_login_form() {
+        let broker = Broker::new(
+            PathBuf::from("/nonexistent-niri-rdp-test.sock"),
+            "HEADLESS-1".into(),
+            None,
+        );
+        let credentials = Credentials {
+            username: "windows-user".into(),
+            password: "remembered-windows-secret".into(),
+            domain: Some("WINDOWS-PC".into()),
+        };
+        assert!(matches!(
+            broker.validate(&credentials).await.unwrap(),
+            CredentialDecision::Accept
+        ));
+        let size = DesktopSize {
+            width: 800,
+            height: 600,
+        };
+        let mut bound = broker.bind_connection(&credentials, size).await.unwrap();
+        assert!(broker.pending.lock().unwrap().is_none());
+        assert!(broker.active.lock().unwrap().is_none());
+        let mut updates = bound.display.updates().await.unwrap();
+        let frame = updates.next_update().await.unwrap();
+        let mut empty = Login::new(PathBuf::new(), "HEADLESS-1".into(), None, size, "").bound();
+        let mut empty_updates = empty.display.updates().await.unwrap();
+        match (frame, empty_updates.next_update().await.unwrap()) {
+            (
+                Some(ironrdp_server::DisplayUpdate::Bitmap(actual)),
+                Some(ironrdp_server::DisplayUpdate::Bitmap(expected)),
+            ) => assert_eq!(actual.data, expected.data),
+            _ => panic!("restricted login form did not render"),
+        }
+        broker.discard();
+    }
+    #[tokio::test]
+    async fn omitted_password_binds_only_login_screen_without_contacting_broker() {
+        let broker = Broker::new(
+            PathBuf::from("/nonexistent-niri-rdp-test.sock"),
+            "HEADLESS-1".into(),
+            None,
+        );
+        let credentials = Credentials {
+            username: "alice".into(),
+            password: String::new(),
+            domain: None,
+        };
+        assert!(matches!(
+            broker.validate(&credentials).await.unwrap(),
+            CredentialDecision::Accept
+        ));
+        let mut bound = broker
+            .bind_connection(
+                &credentials,
+                DesktopSize {
+                    width: 800,
+                    height: 600,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(broker.pending.lock().unwrap().is_none());
+        assert!(broker.active.lock().unwrap().is_none());
+        assert!(broker.login.lock().unwrap().is_some());
+        let mut updates = bound.display.updates().await.unwrap();
+        assert!(updates.next_update().await.unwrap().is_some());
+        broker.discard();
+        assert!(updates.next_update().await.unwrap().is_none());
+    }
     fn fake(
         status: u8,
         fd: Option<OwnedFd>,

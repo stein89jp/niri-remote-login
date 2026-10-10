@@ -24,6 +24,13 @@ def selected_files():
             relative = item.relative_to(ROOT)
             if any(part in EXCLUDE for part in relative.parts):
                 continue
+            # Repo-local makepkg folders hold downloaded inputs and build trees.
+            # Exclude only their products: bridge/src remains release source.
+            if relative.parts[:2] == ("packaging", "arch") and len(relative.parts) > 3:
+                product = relative.parts[3]
+                if (product in {"src", "pkg"} or product.startswith("repo-")
+                        or ".tar." in product or product.endswith(".log")):
+                    continue
             if item.is_symlink():
                 raise RuntimeError(f"release input must not be a symlink: {relative}")
             if item.is_file() and item.suffix not in {".pyc", ".o"}:

@@ -1,4 +1,4 @@
-# Proposed architecture and delivery gates
+# Architecture and delivery gates
 
 The target is a login-independent remote desktop: the PC remains awake, a
 system-level broker can create a session without a local user session, and a
@@ -10,9 +10,10 @@ in [Niri findings](niri-findings.md); authentication and library choices are in
 
 ```mermaid
 flowchart LR
-    W[Windows mstsc.exe] --> T[Explicit private tunnel]
-    T --> R[Loopback RDP frontend\nIronRDP or FreeRDP]
-    R -->|Authenticated local request| B[Small PAM/logind broker]
+    W[Windows mstsc.exe] --> R[Network RDP frontend\nIronRDP, TCP 33991]
+    R -->|Local ClientInfo credentials| B[Small PAM/logind broker]
+    R -->|Missing password or Windows domain| L[Restricted RDP login form]
+    L -->|Submitted Linux credentials| B
     B -->|UID, session scope, runtime| N[Dedicated headless Niri process]
     N --> V[Virtual output and independent frame clock]
     V -->|Wayland capture, initially SHM| R
@@ -85,6 +86,10 @@ NLA/CredSSP authentication and PAM password checks are distinct mechanisms.
 Choose the library's supported NLA/SSPI backend or explicitly test TLS-only RDP
 and its client requirements in the VM. Do not assume accepting a PAM password
 provides NLA or arbitrary PAM conversations. The PoC's disposable credentials
-are not Linux account credentials. No service is exposed beyond loopback;
-future Windows tests can use an explicitly configured private tunnel.
+are not Linux account credentials. Disposable test mode remains loopback-only.
+The installed broker frontend defaults to a direct network listener at
+`0.0.0.0:33991`; an explicitly configured loopback listener remains available.
+Missing passwords or remembered Windows domain credentials open a restricted
+login form. Only PAM acceptance creates a Linux desktop/session. Real Windows
+TLS fallback and installed-host PAM/logind acceptance remain pending.
 

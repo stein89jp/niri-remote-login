@@ -134,5 +134,8 @@ An unrelated SSH session or existing user manager can legitimately keep
 Repeat with missing/failing compositor executable in the disposable VM, a
 compositor SIGKILL, holder SIGKILL, broker SIGKILL and a boot with no local login.
 Watch for no stale session scope, child process or private runtime. Then use the
-packaged frontend and Windows mstsc through an explicit private tunnel. These
+packaged frontend and ordinary Windows mstsc directly at `HOST:33991`. The broker
+prepares the TLS identity on first start before the frontend loads credentials.
+Clients omitting a password see the frontend's restricted login screen; PAM still
+authorizes the account before any desktop is started. These
 checks and physical-monitor-off testing are pending, tracked in CHECKPOINT.md.

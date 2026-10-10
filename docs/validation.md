@@ -152,3 +152,61 @@ lab/run-isolated.sh --nvenc env NIRI_RDP_LAB_ENCODER=nvenc \
 See the [resolution contract](../bridge/README.md#dynamic-resolution) for bounds
 and rebuilding both packages. Windows mstsc, installed-service operation and
 real PAM/logind boot acceptance remain separate-machine gates.
+
+## Simplified Arch host installation (2026-10-10)
+
+`packaging/arch/niri-rdp/PKGBUILD` builds the compositor, bridge, broker, and
+setup helpers as one `niri-remote-login` package. Source checksum verification,
+portable `makepkg --allsource` export and verification outside the checkout,
+pinned compositor patch application, package assembly, and staged package
+structure checks passed. The assembly check reused existing compiled binaries;
+a complete fresh combined release build and actual pacman installation were not
+performed. The legacy split-package source exporter also excludes makepkg's
+generated trees and cached inputs.
+
+Python discovery passed 13 tests, with the opt-in synthetic transport test
+skipped. The broker's 10 mock-PAM test groups passed. The bridge Rust suite
+passed 35 library tests plus one frontend test, including direct listener configuration, restricted credential-less
+login binding, keyboard/focus handling, password masking, rejected login, and
+stream cancellation. Staged systemd units passed `systemd-analyze verify`; only
+executable paths were redirected to the extracted package for this check. TLS
+tests use temporary files and exercise real OpenSSL generation, identity
+preservation, private-key permissions, and incomplete/symlink identity rejection.
+
+Fresh bridge and FreeRDP probe builds passed three isolated real-desktop suites:
+
+- `artifacts/easy-install-direct-tls-integration.json`: direct ClientInfo
+  credentials through the broker protocol to a real Niri desktop.
+- `artifacts/easy-install-login-integration.json`: omitted ClientInfo credentials
+  reach the login form, wrong form credentials are rejected, and physical US
+  scancodes submit valid credentials before real desktop interaction.
+- `artifacts/easy-install-login-nvenc-integration.json`: the same login sequence
+  switches to actual NVIDIA NVENC AVC420 with client-decoded desktop frames.
+
+All suites exercise real application frames/input, client-selected initial
+resolution, native/live portrait and odd-height resize, reconnect, held-input
+release, compositor failure, frontend survival, and closure of each accepted
+broker lease. The namespace broker supplies a real compositor socket but uses
+fixture credentials: these results establish RDP/login/desktop transport,
+not installed Linux PAM or logind sessions.
+
+Reproduce the login-screen suites after building the patched compositor, bridge,
+and strict FreeRDP probe:
+
+```sh
+lab/run-isolated.sh env NIRI_RDP_LAB_TLS_CONTRACT=1 \
+  NIRI_RDP_LAB_LOGIN_SCREEN=1 \
+  NIRI_RDP_LAB_REPORT=artifacts/easy-install-login-integration.json \
+  python3 scripts/headless-integration.py
+lab/run-isolated.sh --nvenc env NIRI_RDP_LAB_ENCODER=nvenc \
+  NIRI_RDP_LAB_TLS_CONTRACT=1 NIRI_RDP_LAB_LOGIN_SCREEN=1 \
+  NIRI_RDP_LAB_REPORT=artifacts/easy-install-login-nvenc-integration.json \
+  python3 scripts/headless-integration.py
+```
+
+Microsoft's [RDP negotiation request specification](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/902b090b-9cb3-4efc-92bf-ee13373371e3)
+allows a client offering CredSSP to also offer TLS. The pinned acceptor selects
+the shared TLS protocol and supplies ClientInfo credentials even when they are
+empty. This supports the ordinary-client/login-screen design; it is not evidence
+that a specific Windows build interoperates. Actual Windows mstsc, installed
+PAM/logind boot login, and physical-monitor acceptance remain pending.

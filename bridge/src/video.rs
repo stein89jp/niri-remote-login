@@ -179,6 +179,32 @@ impl Video {
             video: self.clone(),
         })
     }
+    pub(crate) fn updates_send(
+        &self,
+        desktop: &crate::wayland::Desktop,
+    ) -> ServerResult<Box<dyn RdpServerDisplayUpdates + Send>> {
+        let state = self.0.lock().unwrap();
+        Ok(Box::new(VideoUpdates {
+            inner: desktop.updates_send(),
+            handle: state
+                .handle
+                .clone()
+                .ok_or_else(|| server_error("missing graphics context"))?,
+            sender: state
+                .sender
+                .clone()
+                .ok_or_else(|| server_error("missing graphics sender"))?,
+            encoder: Arc::new(Mutex::new(None)),
+            pending: None,
+            surface: None,
+            start: Instant::now(),
+            force_idr: true,
+            ended: false,
+            generation: state.generation.clone(),
+            known_generation: state.generation.load(Ordering::SeqCst),
+            suppressed: state.suppressed.clone(),
+        }))
+    }
     pub fn set_suppressed(&self, suppressed: Arc<AtomicBool>) {
         self.0.lock().unwrap().suppressed = suppressed;
     }
@@ -233,30 +259,7 @@ impl RdpServerDisplay for VideoDisplay {
         self.inner.request_layout(layout);
     }
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
-        let inner = self.inner.updates_send();
-        let state = self.video.0.lock().unwrap();
-        let handle = state
-            .handle
-            .clone()
-            .ok_or_else(|| server_error("missing graphics context"))?;
-        let sender = state
-            .sender
-            .clone()
-            .ok_or_else(|| server_error("missing graphics sender"))?;
-        Ok(Box::new(VideoUpdates {
-            inner,
-            handle,
-            sender,
-            encoder: Arc::new(Mutex::new(None)),
-            pending: None,
-            surface: None,
-            start: Instant::now(),
-            force_idr: true,
-            ended: false,
-            generation: state.generation.clone(),
-            known_generation: state.generation.load(Ordering::SeqCst),
-            suppressed: state.suppressed.clone(),
-        }))
+        Ok(self.video.updates_send(&self.inner)?)
     }
 }
 type EncodingTask = JoinHandle<anyhow::Result<Vec<u8>>>;

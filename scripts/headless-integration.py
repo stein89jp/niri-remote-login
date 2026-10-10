@@ -121,6 +121,9 @@ def main():
     gfx = encoder == "nvenc" and gfx_setting == "1"
     username, password = "disposable-" + secrets.token_hex(8), secrets.token_hex(24)
     tls_contract = os.environ.get("NIRI_RDP_LAB_TLS_CONTRACT") == "1"
+    login_screen = os.environ.get("NIRI_RDP_LAB_LOGIN_SCREEN") == "1"
+    if login_screen and not tls_contract:
+        raise RuntimeError("NIRI_RDP_LAB_LOGIN_SCREEN requires NIRI_RDP_LAB_TLS_CONTRACT=1")
     # The namespace supplies only these explicit environment values.
     env = {k: os.environ[k] for k in ("PATH", "HOME", "XDG_RUNTIME_DIR", "LD_LIBRARY_PATH",
                                     "LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER", "XKB_CONFIG_ROOT")
@@ -196,6 +199,8 @@ def main():
                     print(f"test broker counters: rejected={fixture.rejected}, accepted={fixture.accepted}, closed={fixture.closed}")
                 raise RuntimeError(f"wrong-password rejection failed: rc={bad.returncode} {bad.stderr}")
             results["wrong_disposable_credentials"] = "passed"
+            if login_screen:
+                client_env["NIRI_RDP_TEST_LOGIN_SCREEN"] = "1"
             for i in range(2):
                 good = resize_roundtrip(client_env, ipc_path, private / f"client-{i+1}.log")
                 if good.returncode or "NIRI_RDP_APP_KEY_POINTER_RELEASE_OK" not in good.stdout:
@@ -203,6 +208,12 @@ def main():
                                        f"{good.stdout} {good.stderr}")
                 if gfx and "NIRI_RDP_AVC420_DECODED_FRAMES" not in good.stdout:
                     raise RuntimeError("NVENC roundtrip used bitmap fallback instead of decoded AVC420")
+                if login_screen:
+                    for marker in ("NIRI_RDP_LOGIN_SCREEN_WITHOUT_CLIENT_CREDENTIALS",
+                                   "NIRI_RDP_LOGIN_SCREEN_WRONG_PASSWORD_REJECTED",
+                                   "NIRI_RDP_LOGIN_SCREEN_PAM_BINDING_OK"):
+                        if marker not in good.stdout:
+                            raise RuntimeError(f"login screen roundtrip missing {marker}")
                 results[f"real_desktop_roundtrip_{i+1}"] = "passed"
                 time.sleep(0.3)
             results["client_initial_resolution_native_output_and_decoded_frame"] = "passed"
@@ -266,9 +277,13 @@ def main():
                 deadline = time.monotonic() + 3
                 while fixture.closed != fixture.accepted and time.monotonic() < deadline:
                     time.sleep(0.05)
-                if fixture.rejected < 1 or fixture.accepted != 5 or fixture.closed != 5:
-                    raise RuntimeError("TLS broker FD/lease lifecycle counts do not match the RDP connections")
-                results["tls_clientinfo_broker_fd_binding_and_lease_eof"] = "passed using namespace test broker; no PAM"
+                expected_rejections = 6 if login_screen else 1
+                if fixture.rejected < expected_rejections or fixture.accepted != 5 or fixture.closed != 5:
+                    raise RuntimeError("TLS broker FD/lease lifecycle counts do not match the RDP connections: "
+                                       f"rejected={fixture.rejected}, accepted={fixture.accepted}, closed={fixture.closed}")
+                key = ("tls_login_screen_rejection_authentication_desktop_and_lease_eof" if login_screen else
+                       "tls_clientinfo_broker_fd_binding_and_lease_eof")
+                results[key] = "passed using namespace test broker; no PAM"
             results["pam_logind_boot_windows_monitor_off"] = "pending separate machines"
         except Exception:
             for log in logs:

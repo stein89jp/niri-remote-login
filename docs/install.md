@@ -1,127 +1,151 @@
-# Install on a separate Arch test machine
+# Install the Arch remote desktop host
 
-This is an experimental integration for a dedicated remote account. Read
-[validation](validation.md) and [acceptance](acceptance.md) before enabling it.
-The repository build never installs anything. The commands below deliberately
-change **only the separate test machine on which you choose to run them**.
-Keep the working GNOME Remote Login machine untouched.
+Build on the **Arch Linux x86_64 machine that will host the remote desktop**.
+Use an up-to-date Arch installation and a normal, unprivileged build account.
+The repository is private, so cloning requires repository access. Rust 1.94 or
+newer is required; `makepkg -si` installs the declared build/runtime dependencies.
+The initial Rust/compositor build can take a while.
 
-The two packages are `niri-rdp-headless` and `niri-remote-login`. The former
-installs its pinned patched Niri as `/usr/lib/niri-rdp/niri-headless`, alongside
-stock `/usr/bin/niri`; it installs no local desktop session entry. The latter
-installs the bridge, root broker, a dedicated PAM policy and two disabled system
-services. No package enables a service, opens a firewall, or edits GNOME/GDM.
-
-## Use the prepared binary artifacts
-
-The portable delivery is `artifacts/installable/`. It contains two built x86_64
-packages, their corresponding source bundles, checksums and validation records.
-Verify `SHA256SUMS` and inspect the package contents before transferring them to
-the separate test installation. These binaries were built against the Arch
-library versions recorded in the checkpoints; rebuild on a disposable builder
-if the target's ABI differs.
-
-The original `0.1.0` delivery archives predate the NVENC encoder. Rebuild from
-the current repository sources using the procedure below to use NVIDIA encoding;
-changing an environment variable does not add it to those existing binaries.
-
-On the **separate test machine**, follow its normal full upgrade process and
-install the two exact files:
+## Install, authorize, enable
 
 ```sh
-sha256sum -c SHA256SUMS
-sudo pacman -U niri-rdp-headless-26.04.remote1-1-x86_64.pkg.tar.zst \
-  niri-remote-login-0.1.0-1-x86_64.pkg.tar.zst
+sudo pacman -Syu --needed base-devel git
+git clone https://github.com/stein89jp/niri-remote-login.git
+cd niri-remote-login/packaging/arch/niri-rdp
+makepkg -si
+sudo usermod -aG niri-rdp-users "$USER"
+sudo systemctl enable --now niri-rdp-frontend.service
 ```
 
-Then continue with account/TLS configuration below. This is an experimental
-package set; actual PAM/logind boot and mstsc acceptance is still pending.
+This single `niri-remote-login` package contains the patched headless compositor,
+RDP frontend, PAM/logind broker, defaults, and systemd units. Arch's package hooks
+create the `niri-rdp` service account and `niri-rdp-users` authorization group.
+On first service start the root broker creates a self-signed TLS certificate
+and private key. Existing certificates are preserved and validated. No separate
+release-preparation command, build VM, certificate-generation commands, or SSH
+tunnel is required. Services start only when you enable/start them.
 
-## Build packages
+The compositor installs at `/usr/lib/niri-rdp/niri-headless`, alongside stock
+`/usr/bin/niri`. It launches a separate remote desktop. It does not share your
+existing local desktop or import its Niri configuration.
 
-From the repository root, create source bundles:
+**An account cannot have an existing local X11/Wayland session when it logs in
+remotely.** If you authorize your current user, log out of that user's local
+graphical session before connecting. SSH/TTY logins are allowed. Root, service
+accounts, and accounts outside `niri-rdp-users` are rejected. Rejoining the group
+does not require a new local login for the broker to see the membership.
+
+For a separate account, replace the `usermod` command above with:
+
+```sh
+sudo niri-rdp-setup --create-user niri-remote
+```
+
+The helper creates the home, prompts for a Linux password, and adds the account
+to the group. To configure an existing user and optionally use a DNS name/IP
+for a certificate that has not yet been created:
+
+```sh
+sudo niri-rdp-setup --user "$USER" --hostname YOUR_HOST_NAME_OR_IP
+```
+
+## Connect with Windows Remote Desktop
+
+Open the regular Windows Remote Desktop client (`mstsc.exe`). Enter the host's
+reachable DNS name or IP followed by the port, for example:
+
+```text
+192.168.1.50:33991
+```
+
+Use the Linux account name without a Windows domain prefix. The server negotiates
+TLS RDP. If the client sends Linux username/password credentials, the broker
+checks them directly. If it omits the password or sends remembered Windows domain credentials, a
+login screen inside the remote connection accepts the Linux account name and
+password before starting Niri. Windows domain credentials are never sent to PAM.
+NLA/CredSSP authentication is not provided; Windows policies that require NLA
+remain incompatible. Actual `mstsc` interoperability is still an acceptance gate,
+not a demonstrated result. Protocol fallback and a login screen do not replace a
+Windows machine test.
+
+The default listens on `0.0.0.0:33991`, so clients connect directly over the
+network. If the host has a firewall, allow TCP 33991 from the intended client
+network using your existing firewall configuration. Port 3389 is left available
+for another remote desktop service. Nothing opens the firewall automatically.
+
+The initial self-signed certificate lasts 365 days. Compare the certificate's
+SHA-256 fingerprint with the client certificate details before accepting it:
+
+```sh
+sudo openssl x509 -in /etc/niri-rdp/tls/cert.pem -noout -fingerprint -sha256
+```
+
+You can provide a trusted certificate and unencrypted private key at those same
+paths before starting the service. The TLS directory must be root-owned mode
+700, the key root-owned mode 600, and the certificate root-owned without group
+or world write access. Invalid, expired, mismatched, or incomplete identities
+fail startup rather than silently replacing your certificate. Replacing an
+identity requires restarting both services so the frontend loads new credentials.
+
+The defaults launch `foot`. Super+Enter opens a terminal; Super+Shift+Q logs out.
+Disconnect ends the desktop; reconnect creates a fresh session. The compositor
+renders with llvmpipe; optional NVIDIA encoding is described below. This remains
+experimental: real PAM/logind, installed-service boot, Windows, and physical
+monitor tests are tracked in [acceptance](acceptance.md).
+
+## Configuration and troubleshooting
+
+Review `/etc/niri-rdp/frontend.conf`, `/etc/niri-rdp/headless.kdl`, and
+`/etc/pam.d/niri-rdp`. `NIRI_RDP_LISTEN` accepts a numeric IP address and port,
+including bracketed IPv6. To use the standard RDP port on a host where it is free,
+set `NIRI_RDP_LISTEN=0.0.0.0:3389`. To retain tunnel-only access, set
+`NIRI_RDP_LISTEN=127.0.0.1:33991`. Restart the frontend after changing its config.
+
+```sh
+sudo systemctl status niri-rdp-broker.service niri-rdp-frontend.service
+sudo journalctl -b -u niri-rdp-broker.service -u niri-rdp-frontend.service --no-pager
+ss -ltn 'sport = :33991'
+```
+
+A TLS-only fallback profile is available if a client's normal connection setup
+fails. Save this as `niri.rdp` on Windows, replace the address and account, and
+open it with the regular Remote Desktop client:
+
+```text
+full address:s:192.168.1.50:33991
+username:s:niri-remote
+enablecredsspsupport:i:0
+authentication level:i:2
+prompt for credentials:i:1
+desktopwidth:i:1920
+desktopheight:i:1080
+```
+
+Never store the password in the profile. This does not override an NLA-required
+Windows policy. Client-selected initial resolution and single-display live
+resizing are supported; see [the resolution contract](../bridge/README.md#dynamic-resolution).
+Only password PAM authentication is implemented; MFA and password-expiration
+conversations fail closed.
+
+## Maintainer builds and older artifacts
+
+The older split package workflow remains available:
 
 ```sh
 python3 scripts/prepare-release.py
 ```
 
-This produces `artifacts/release/niri-rdp-headless/` and
-`artifacts/release/niri-remote-login/`, including hash-checked PKGBUILDs.
-Copy those directories to a disposable Arch build VM. On that VM, perform a
-full upgrade and install build dependencies:
+It exports hash-checked source bundles under `artifacts/release/` for separate
+`niri-rdp-headless` and `niri-remote-login` builds. The new direct build folder
+needs the complete repository checkout; copy or clone the repository rather than
+copying only the PKGBUILD. `makepkg --allsource` exports a portable source bundle.
+The combined package provides and conflicts with `niri-rdp-headless`, allowing
+pacman to replace a previously installed split compositor package.
 
-```sh
-sudo pacman -Syu --needed base-devel rust git pkgconf python seatd libinput \
-  libdisplay-info mesa libglvnd wayland libxkbcommon pango cairo pixman \
-  pam systemd dbus foot ffmpeg
-cd niri-rdp-headless
-makepkg
-cd ../niri-remote-login
-```
-
-Install the built headless package on that **build VM** to satisfy the frontend
-package dependency, then run `makepkg` in the frontend directory. Never run
-makepkg as root. Do not use `makepkg -si` on the working host. Rust must support
-1.94 or newer. Cargo.lock pins both dependency graphs; preparation fetches these
-dependencies, and build/check runs offline. A fresh builder needs network access
-during preparation. Clean-chroot validation with Arch devtools is preferred
-when available. See the [makepkg manual](https://man.archlinux.org/man/makepkg.8.en)
-and [Arch clean-chroot workflow](https://wiki.archlinux.org/title/DeveloperWiki:Building_in_a_clean_chroot).
-
-Inspect the package contents using `bsdtar -tf` and record `sha256sum` before
-copying them to the separate Niri test installation. Follow its normal full
-upgrade process, then install the two exact filenames with `sudo pacman -U`.
-Package installation alone does not start remote login.
-
-## Configure the test installation
-
-Create a dedicated test account, or use a pre-existing dedicated account. Do not
-add an account currently running GNOME or Niri locally. The broker rejects root,
-service accounts, nonmembers of `niri-rdp-users`, and accounts with another
-graphical logind session, including a closing one. SSH/TTY administrator access
-can remain available for observation.
-
-```sh
-sudo systemd-sysusers /usr/lib/sysusers.d/niri-rdp.conf
-sudo useradd -m -s /bin/bash niri-remote-test
-sudo passwd niri-remote-test
-sudo usermod -aG niri-rdp-users niri-remote-test
-sudo install -d -m 700 /etc/niri-rdp/tls
-sudo openssl req -x509 -newkey rsa:3072 -nodes -days 30 \
-  -subj /CN=localhost -addext subjectAltName=DNS:localhost,IP:127.0.0.1 \
-  -keyout /etc/niri-rdp/tls/key.pem \
-  -out /etc/niri-rdp/tls/cert.pem
-sudo chmod 600 /etc/niri-rdp/tls/key.pem
-sudo openssl x509 -in /etc/niri-rdp/tls/cert.pem -noout -fingerprint -sha256
-```
-
-Use a trusted certificate for normal use and verify its identity from Windows.
-The generated self-signed identity is for the dedicated experiment. systemd
-passes the certificate and key through `LoadCredential`; the frontend runs as
-`niri-rdp`, while only the broker runs as root. No login password is stored in
-configuration, command arguments or logs. Only a single password conversation
-is supported; MFA, expired-password changes, Unicode/IME input and general PAM
-conversations are unsupported and fail closed.
-
-Review `/etc/pam.d/niri-rdp`, `/etc/niri-rdp/frontend.conf`, and
-`/etc/niri-rdp/headless.kdl`. The private desktop launches `foot` and uses a US
-keyboard, software llvmpipe rendering, one `HEADLESS-1` output, scale 1 and normal transform. Super+Enter opens
-a terminal; Super+Shift+Q exits Niri and should close the remote login session.
-There is no persistent-session resume; reconnect creates a fresh login. The fixed
-worker forces software rendering for the tested compositor baseline. Optional
-NVENC encoding runs in the frontend; it does not require GPU access for the
-remote account or change the compositor's rendering mode.
-
-```sh
-sudo systemctl daemon-reload
-sudo systemctl start niri-rdp-frontend.service
-sudo systemctl status niri-rdp-broker.service niri-rdp-frontend.service
-ss -ltn 'sport = :33991'
-```
-
-The only TCP bind must be `127.0.0.1:33991`; GNOME Remote Login keeps its own
-listener. Do not change the bind or take port 3389. The broker uses only
-`/run/niri-rdp/broker.sock`. Test failure cleanup before enabling boot startup.
+The archived `0.1.0-1` delivery is a preserved snapshot. It lacks current
+resolution support, NVENC, direct listening, automatic certificate setup, and
+the login screen. Rebuild current source to use this installation procedure.
+Use [uninstall](uninstall.md) and [upgrade](upgrade.md) for removal and maintenance.
 
 ## Optional NVIDIA encoding
 
@@ -131,7 +155,7 @@ FFmpeg's `h264_nvenc` encoder and sends H.264 through the RDP graphics channel
 as AVC420. The client must negotiate that graphics/codec support; otherwise the
 connection uses bitmap updates. This is host-side encoding. Decoding happens
 on the RDP client, whose hardware acceleration depends on its own GPU and client.
-The current frontend source builds package release `0.1.0-2`; the archived
+The current combined package includes NVENC; the archived
 `0.1.0-1` frontend binaries contain neither these fixes nor NVENC support.
 The frontend converts captured pixels to full-range BT.709 on the CPU before
 hardware H.264 encoding; compositor rendering and capture also remain on the
@@ -203,51 +227,3 @@ sudo rm /etc/systemd/system/niri-rdp-frontend.service.d/nvidia.conf
 sudo systemctl daemon-reload
 sudo systemctl restart niri-rdp-frontend.service
 ```
-
-## Windows test via an explicit private tunnel
-
-With SSH already configured on the test machine, run this on Windows:
-
-```powershell
-ssh -N -L 127.0.0.1:33991:127.0.0.1:33991 administrator@ARCH_TEST_MACHINE
-mstsc.exe niri-test.rdp
-```
-
-Create `niri-test.rdp` locally on Windows:
-
-```text
-full address:s:127.0.0.1:33991
-username:s:niri-remote-test
-enablecredsspsupport:i:0
-authentication level:i:2
-prompt for credentials:i:1
-desktopwidth:i:1920
-desktopheight:i:1080
-```
-
-The current sources adapt the native Niri desktop to the client's selected
-resolution. Rebuild both packages for this support; preserved 0.1.0 archives
-predate it. Live window resizing additionally requires the client to send Display
-Control requests; see the [resolution contract](../bridge/README.md#dynamic-resolution).
-
-Broker mode uses library-managed TLS-only RDP. PAM passwords do not supply an
-NLA/NTLM backend. Microsoft's [RDP property reference](https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-properties)
-describes `enablecredsspsupport`; the setting above is an explicit experimental
-client choice, not a Windows policy change. NLA-required clients/policies are
-currently incompatible. **This mstsc credential flow has not been tested**;
-whether current Windows sends the required ClientInfo credentials is an open
-acceptance gate. Do not report boot login complete if this configuration fails.
-Never save the password in the RDP file.
-
-After the authentication/cleanup checks pass on the test machine, enable boot:
-
-```sh
-sudo systemctl enable niri-rdp-frontend.service
-```
-
-Then perform a separate test-machine reboot and the complete
-[acceptance procedure](acceptance.md). A running user service or lingering user
-manager does not satisfy the no-local-login requirement.
-
-See [uninstall](uninstall.md) to remove the experiment and
-[upgrade](upgrade.md) for pinned-compositor maintenance.

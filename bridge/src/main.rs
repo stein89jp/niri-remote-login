@@ -3,7 +3,7 @@ use ironrdp_server::{
     DesktopSize, KeyboardEvent, MouseEvent, PostConnectionAction, RdpServer, RdpServerDisplay,
     RdpServerDisplayUpdates, RdpServerInputHandler, ServerError, ServerResult, TlsIdentityCtx,
 };
-use niri_rdp_bridge::{LISTEN_ADDR, broker::Broker, server_error, video::Video, wayland::Desktop};
+use niri_rdp_bridge::{broker::Broker, listen_addr, server_error, video::Video, wayland::Desktop};
 use std::{
     net::SocketAddr,
     os::unix::net::UnixStream,
@@ -75,10 +75,11 @@ impl ConnectionBinder for Disposable {
 struct Lifecycle {
     active: Option<Arc<Mutex<Option<Desktop>>>>,
     broker: Option<Arc<Broker>>,
+    loopback_only: bool,
 }
 impl ConnectionHandler for Lifecycle {
     fn on_accept(&mut self, p: SocketAddr) -> bool {
-        p.ip().is_loopback()
+        !self.loopback_only || p.ip().is_loopback()
     }
     fn on_disconnected(
         &mut self,
@@ -110,13 +111,19 @@ async fn main() -> anyhow::Result<()> {
         std::env::var_os("SSLKEYLOGFILE").is_none(),
         "unset SSLKEYLOGFILE"
     );
+    let mode = std::env::var("NIRI_RDP_MODE").unwrap_or_else(|_| "broker".into());
+    let configured_listen = match std::env::var("NIRI_RDP_LISTEN") {
+        Ok(value) => Some(value),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(_) => anyhow::bail!("NIRI_RDP_LISTEN must contain valid Unicode"),
+    };
+    let listen = listen_addr(&mode, configured_listen.as_deref())?;
     let identity = TlsIdentityCtx::init_from_paths(
         &credential("tls-cert", "NIRI_RDP_CERT")?,
         &credential("tls-key", "NIRI_RDP_KEY")?,
     )?;
     let acceptor = identity.make_acceptor()?;
     let output = std::env::var("NIRI_RDP_OUTPUT").unwrap_or_else(|_| "HEADLESS-1".into());
-    let mode = std::env::var("NIRI_RDP_MODE").unwrap_or_else(|_| "broker".into());
     let video = Video::from_env()?;
     let mut server = if mode == "broker" {
         let broker = Arc::new(Broker::new(
@@ -127,7 +134,7 @@ async fn main() -> anyhow::Result<()> {
         // PAM receives ClientInfo credentials within authenticated server TLS.
         // Arbitrary PAM passwords do not supply a server-side NLA/NTLM secret.
         let mut server = RdpServer::builder()
-            .with_addr(LISTEN_ADDR)
+            .with_addr(listen)
             .with_tls(acceptor)
             .with_input_handler(Placeholder)
             .with_display_handler(Placeholder)
@@ -140,6 +147,7 @@ async fn main() -> anyhow::Result<()> {
             .with_connection_handler(Some(Box::new(Lifecycle {
                 broker: Some(broker.clone()),
                 active: None,
+                loopback_only: false,
             })))
             .build();
         server.set_credential_validator(Some(broker.clone()));
@@ -153,7 +161,7 @@ async fn main() -> anyhow::Result<()> {
         );
         let active = Arc::new(Mutex::new(None));
         let mut server = RdpServer::builder()
-            .with_addr(LISTEN_ADDR)
+            .with_addr(listen)
             .with_hybrid(acceptor, identity.pub_key)
             .with_input_handler(Placeholder)
             .with_display_handler(Placeholder)
@@ -166,6 +174,7 @@ async fn main() -> anyhow::Result<()> {
             .with_connection_handler(Some(Box::new(Lifecycle {
                 broker: None,
                 active: Some(active.clone()),
+                loopback_only: true,
             })))
             .build();
         server.set_credentials(Some(Credentials {
@@ -188,7 +197,27 @@ async fn main() -> anyhow::Result<()> {
         video.set_suppressed(server.display_suppressed_handle());
     }
     server.set_auto_reconnect_cookie(None);
-    println!("Niri RDP frontend on {LISTEN_ADDR} ({mode}); dedicated session only");
+    println!("Niri RDP frontend on {listen} ({mode}); dedicated session only");
     tokio::select! {result=server.run()=>result?,result=tokio::signal::ctrl_c()=>result?}
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lifecycle_accepts_remote_broker_peers_but_keeps_disposable_peers_local() {
+        let mut lifecycle = Lifecycle {
+            active: None,
+            broker: None,
+            loopback_only: false,
+        };
+        let remote = "192.168.1.50:50000".parse().unwrap();
+        assert!(lifecycle.on_accept(remote));
+        lifecycle.loopback_only = true;
+        assert!(!lifecycle.on_accept(remote));
+        assert!(lifecycle.on_accept("127.0.0.1:50000".parse().unwrap()));
+        assert!(lifecycle.on_accept("[::1]:50000".parse().unwrap()));
+    }
 }

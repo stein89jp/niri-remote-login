@@ -52,7 +52,7 @@ def inspect(package):
     if missing := EXPECTED[name] - files:
         raise RuntimeError(f"missing package files: {sorted(missing)}")
     for path in files:
-        if path == ".INSTALL" or path.startswith(("usr/bin/", "usr/share/wayland-sessions/", "etc/gdm/", "etc/gnome/")):
+        if path == ".INSTALL" or (path.startswith("usr/bin/") and path != "usr/bin/niri-rdp-setup") or path.startswith(("usr/share/wayland-sessions/", "etc/gdm/", "etc/gnome/")):
             raise RuntimeError(f"unexpected host-desktop or install-hook entry: {path}")
         if path.startswith("etc/pam.d/") and path != "etc/pam.d/niri-rdp":
             raise RuntimeError(f"unexpected PAM service: {path}")
@@ -64,15 +64,22 @@ def inspect(package):
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("packages", nargs=2, type=Path)
+    p.add_argument("packages", nargs="+", type=Path)
     p.add_argument("--stage", type=Path, default=ROOT / "artifacts/package-root")
     args = p.parse_args()
     stage = args.stage.resolve()
     if not stage.is_relative_to(ROOT / "artifacts"):
         p.error("staging root must be inside repository artifacts/")
     reports = [inspect(pkg.resolve(strict=True)) for pkg in args.packages]
-    if {report["name"] for report in reports} != set(EXPECTED):
-        raise RuntimeError("supply exactly one package of each type")
+    names = [report["name"] for report in reports]
+    combined = names == ["niri-remote-login"]
+    if combined:
+        if missing := EXPECTED["niri-rdp-headless"] - set(reports[0]["files"]):
+            raise RuntimeError(f"combined package missing headless files: {sorted(missing)}")
+        if {"usr/bin/niri-rdp-setup", "usr/lib/niri-rdp/prepare-tls"} - set(reports[0]["files"]):
+            raise RuntimeError("combined package missing host setup helpers")
+    elif len(names) != 2 or set(names) != set(EXPECTED):
+        raise RuntimeError("supply one combined package or exactly one package of each split type")
     stage.mkdir(parents=True, exist_ok=True)
     for package in args.packages:
         subprocess.run(["bsdtar", "-xf", str(package.resolve()), "-C", str(stage)], check=True)
@@ -84,7 +91,7 @@ def main():
         "packages": reports, "stage": str(stage), "result": "structure and preservation checks passed",
         "scope": "workspace extraction; not a pacman installation or boot test",
     }, indent=2) + "\n")
-    print(f"Both packages inspected and extracted into {stage}; no installation performed")
+    print(f"Packages inspected and extracted into {stage}; no installation performed")
 
 
 if __name__ == "__main__":

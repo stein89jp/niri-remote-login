@@ -2,13 +2,13 @@
 # Build without -i/-s: never install dependencies or this package on the host.
 pkgname=niri-remote-login
 pkgver=0.1.0
-pkgrel=3
-pkgdesc='Experimental loopback Niri RDP bridge and PAM/logind session broker'
+pkgrel=4
+pkgdesc='Niri RDP host bridge and PAM/logind session broker'
 arch=('x86_64')
 # Bridge source is MIT; the combined binary links Arch's GPL-licensed FFmpeg.
 license=('MIT' 'GPL-3.0-only')
 options=('!debug' '!lto')
-depends=('niri-rdp-headless>=0.1.0-2' 'pam' 'systemd' 'systemd-libs' 'dbus' 'wayland' 'libxkbcommon' 'xkeyboard-config' 'foot' 'ttf-dejavu' 'ffmpeg')
+depends=('niri-rdp-headless>=0.1.0-2' 'pam' 'systemd' 'systemd-libs' 'dbus' 'wayland' 'libxkbcommon' 'xkeyboard-config' 'foot' 'ttf-dejavu' 'ffmpeg' 'openssl' 'python')
 makedepends=('rust>=1.94' 'cargo' 'gcc' 'pkgconf' 'python')
 backup=('etc/niri-rdp/frontend.conf' 'etc/niri-rdp/headless.kdl' 'etc/pam.d/niri-rdp')
 source=("niri-remote-login-$pkgver.tar.gz")
@@ -35,6 +35,7 @@ check() {
   export CARGO_HOME="$srcdir/cargo-home"
   env -u CFLAGS -u CXXFLAGS cargo test --locked --offline --manifest-path bridge/Cargo.toml
   make -C broker check
+  python -m unittest tests.test_host_setup -v
 }
 
 package() {
@@ -47,6 +48,8 @@ package() {
   done
   install -Dm644 packaging/niri-rdp.sysusers "$pkgdir/usr/lib/sysusers.d/niri-rdp.conf"
   install -Dm644 packaging/frontend.conf "$pkgdir/etc/niri-rdp/frontend.conf"
+  install -Dm755 packaging/niri-rdp-setup.py "$pkgdir/usr/bin/niri-rdp-setup"
+  install -Dm755 packaging/prepare-tls.py "$pkgdir/usr/lib/niri-rdp/prepare-tls"
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 THIRD-PARTY-NOTICES.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.txt"
   install -Dm644 docs/install.md "$pkgdir/usr/share/doc/$pkgname/install.md"

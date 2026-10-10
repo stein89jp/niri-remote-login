@@ -1,9 +1,10 @@
 # Functionality and NVIDIA review — 2026-10-10
 
-The reviewed source fixes the failures below and adds optional NVIDIA host
-encoding. The existing 0.1.0 binary archives are unchanged; rebuild the frontend
-package from this source to use the fixes. The rebuilt frontend package is
-`niri-remote-login-0.1.0-2`; the compositor package is unchanged. Installation steps are in
+The functionality review below records the earlier fixes and NVIDIA host
+encoding work. The current combined `niri-remote-login-0.1.0-4` package also adds
+direct network listening, first-start TLS setup, and an RDP login screen; see
+[the latest validation](validation.md#simplified-arch-host-installation-2026-10-10). The existing 0.1.0 binary archives are unchanged; rebuild the frontend
+package from this source to use the fixes. The current build folder installs the compositor and frontend together. Installation steps are in
 [install.md](install.md#optional-nvidia-encoding).
 
 | Failure | Resulting change | Regression evidence |

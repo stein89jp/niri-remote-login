@@ -1,6 +1,6 @@
 # Acceptance on actual test machines
 
-Record machine/kernel/package versions, exact two package hashes, compositor and
+Record machine/kernel/package versions, exact package hashes, compositor and
 IronRDP revisions, Windows build, mstsc version, GPU/driver, rendering mode, date
 and each result. Store evidence without credentials. Automated disposable checks
 are in `scripts/headless-integration.py`; they do not substitute for this matrix.
@@ -10,9 +10,10 @@ are in `scripts/headless-integration.py`; they do not substitute for this matrix
 | Headless desktop bridge | Private namespace, no physical devices or inherited display; animated Wayland app, decoded RDP frame, key/pointer changes and releases | Automated real-app test passed |
 | TLS broker transport | TLS-only FreeRDP credentials, connected Wayland FD transfer and lease EOF for each connection | Passed with namespace test broker; no Linux-account/PAM proof |
 | Linux-account login | Valid dedicated account creates exactly one remote Wayland logind session of service `niri-rdp`, expected UID, no seat; invalid account/password creates none | Pending separate Arch machine |
+| RDP login screen | Connect without a ClientInfo password; see the login screen without a compositor/session, reject a bad password, accept the Linux account, verify masked pixels, input, and disconnect cleanup | Automated login tests; installed PAM and Windows checks pending |
 | Authentication policy | Wrong password, unknown user, root, nonmember, locked/expired user, additional PAM prompt, account with local graphical session; confirm no app/session/private directory remains | Pending real PAM tests; native failure tests cover contracts |
-| Cold boot | Enable system frontend, reboot test machine, do not log in locally, connect via Windows tunnel; record `loginctl` identity and terminal `id` output | Pending |
-| Windows | mstsc displays dedicated Niri terminal and sends keyboard, pointer, wheel and modifiers; record TLS-only client properties and certificate verification | Pending |
+| Cold boot | Enable system frontend, reboot test machine, do not log in locally, connect directly using Windows Remote Desktop; record `loginctl` identity and terminal `id` output | Pending |
+| Windows | mstsc displays dedicated Niri terminal and sends keyboard, pointer, wheel and modifiers; test ordinary TLS negotiation, missing-password login screen, optional TLS-only profile, and certificate verification | Pending |
 | Dynamic resolution | Connect at a non-default size; resize the client window in portrait and landscape, verify application reflow, sharp text and accurate pointer clicks without reconnecting | Namespace FreeRDP validation recorded in validation.md; Windows and installed-service behavior pending |
 | NVIDIA encoding | Rebuild the current frontend, enable its NVIDIA drop-in, verify NVENC initialization and AVC420 graphics negotiation; decode changing frames, exercise input/reconnect, and record GPU encoder activity, bitrate and latency against bitmap mode | Release NVENC/FreeRDP namespace app/input/reconnect test passed; Windows, systemd permissions and complete-path performance pending |
 | Codec fallback and hardware failure | With NVENC enabled, a client without AVC420 graphics support receives bitmap updates; unavailable/denied NVIDIA hardware produces a clear frontend startup failure; restore bitmap mode and verify login | Release namespace bitmap fallback passed with NVENC configured; actual service/device-denial checks pending |
