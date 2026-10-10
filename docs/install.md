@@ -225,6 +225,11 @@ desktopwidth:i:1920
 desktopheight:i:1080
 ```
 
+The current sources adapt the native Niri desktop to the client's selected
+resolution. Rebuild both packages for this support; preserved 0.1.0 archives
+predate it. Live window resizing additionally requires the client to send Display
+Control requests; see the [resolution contract](../bridge/README.md#dynamic-resolution).
+
 Broker mode uses library-managed TLS-only RDP. PAM passwords do not supply an
 NLA/NTLM backend. Microsoft's [RDP property reference](https://learn.microsoft.com/en-us/azure/virtual-desktop/rdp-properties)
 describes `enablecredsspsupport`; the setting above is an explicit experimental

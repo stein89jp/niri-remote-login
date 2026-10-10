@@ -1,5 +1,6 @@
 //! One worker owns the Wayland queue and its bounded SHM buffers.
 use crate::{bitmap, buffer_length, evdev_key};
+use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{
     DesktopSize, DisplayUpdate, KeyboardEvent, MouseButton, MouseEvent, RdpServerDisplay,
     RdpServerDisplayUpdates, RdpServerInputHandler, ServerResult,
@@ -28,6 +29,13 @@ use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1,
 };
 use wayland_protocols_wlr::{
+    output_management::v1::client::{
+        zwlr_output_configuration_head_v1::ZwlrOutputConfigurationHeadV1,
+        zwlr_output_configuration_v1::{self, ZwlrOutputConfigurationV1},
+        zwlr_output_head_v1::{self, ZwlrOutputHeadV1},
+        zwlr_output_manager_v1::{self, ZwlrOutputManagerV1},
+        zwlr_output_mode_v1::ZwlrOutputModeV1,
+    },
     screencopy::v1::client::{
         zwlr_screencopy_frame_v1::{self, ZwlrScreencopyFrameV1},
         zwlr_screencopy_manager_v1::ZwlrScreencopyManagerV1,
@@ -40,6 +48,7 @@ use wayland_protocols_wlr::{
 use xkbcommon::xkb;
 
 enum Command {
+    Resize(DesktopSize),
     Key(KeyboardEvent),
     Mouse(MouseEvent),
     Release,
@@ -52,7 +61,8 @@ pub struct Desktop {
 struct Inner {
     commands: mpsc::SyncSender<Command>,
     frames: Mutex<tokio::sync::watch::Receiver<Option<Arc<DisplayUpdate>>>>,
-    size: DesktopSize,
+    // Last announced RDP size, not the worker's possibly newer captured size.
+    size: Arc<Mutex<DesktopSize>>,
     failed: Arc<Mutex<Option<String>>>,
     alive: Arc<AtomicBool>,
     // Retain ownership while handlers live; the worker closes it after teardown.
@@ -85,6 +95,7 @@ impl Desktop {
         let worker_lease = lease.clone();
         let worker_failed = failed.clone();
         let worker_alive = alive.clone();
+        let size = Arc::new(Mutex::new(target));
         std::thread::spawn(move || {
             if let Err(err) = run(
                 socket,
@@ -110,7 +121,7 @@ impl Desktop {
             inner: Arc::new(Inner {
                 commands: tx,
                 frames: Mutex::new(frame_rx),
-                size: target,
+                size,
                 failed,
                 alive,
                 _lease: lease,
@@ -148,6 +159,8 @@ impl Desktop {
         Box::new(Updates {
             desktop: self.clone(),
             rx: self.inner.frames.lock().unwrap().clone(),
+            size: *self.inner.size.lock().unwrap(),
+            pending: None,
         })
     }
 }
@@ -162,6 +175,25 @@ impl RdpServerInputHandler for Desktop {
 struct Updates {
     desktop: Desktop,
     rx: tokio::sync::watch::Receiver<Option<Arc<DisplayUpdate>>>,
+    size: DesktopSize,
+    pending: Option<DisplayUpdate>,
+}
+impl Updates {
+    fn prepare(&mut self, update: DisplayUpdate) -> DisplayUpdate {
+        if let DisplayUpdate::Bitmap(image) = &update {
+            let size = DesktopSize {
+                width: image.width.get(),
+                height: image.height.get(),
+            };
+            if size != self.size {
+                self.size = size;
+                *self.desktop.inner.size.lock().unwrap() = size;
+                self.pending = Some(update);
+                return DisplayUpdate::Resize(size);
+            }
+        }
+        update
+    }
 }
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for Updates {
@@ -173,35 +205,74 @@ impl RdpServerDisplayUpdates for Updates {
         if !self.desktop.alive() {
             return Ok(None);
         }
+        if let Some(update) = self.pending.take() {
+            return Ok(Some(update));
+        }
         if self.rx.changed().await.is_err() {
             return Ok(None);
         }
-        Ok(self
+        let update = self
             .rx
             .borrow_and_update()
             .as_ref()
-            .map(|f| f.as_ref().clone()))
+            .map(|f| f.as_ref().clone());
+        Ok(update.map(|update| self.prepare(update)))
     }
 }
 #[async_trait::async_trait]
 impl RdpServerDisplay for Desktop {
     async fn size(&mut self) -> DesktopSize {
-        self.inner.size
+        *self.inner.size.lock().unwrap()
     }
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         Ok(self.updates_send())
     }
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        if let Some(size) = layout_size(&layout) {
+            self.send(Command::Resize(size));
+        }
+    }
+}
+
+fn layout_size(layout: &DisplayControlMonitorLayout) -> Option<DesktopSize> {
+    let [monitor] = layout.monitors() else {
+        return None;
+    };
+    let (width, height) = monitor.dimensions();
+    if !monitor.is_primary()
+        || monitor.position() != Some((0, 0))
+        || !(200..=crate::MAX_DIMENSION).contains(&width)
+        || !(200..=crate::MAX_DIMENSION).contains(&height)
+        || width % 2 != 0
+    {
+        return None;
+    }
+    Some(DesktopSize {
+        width: width as u16,
+        height: height as u16,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ConfigurationResult {
+    Succeeded,
+    Failed,
+    Cancelled,
 }
 
 #[derive(Default)]
 struct State {
+    output_manager: Option<ZwlrOutputManagerV1>,
+    heads: Vec<(ZwlrOutputHeadV1, String, bool)>,
+    output_serial: Option<u32>,
+    configuration_result: Option<ConfigurationResult>,
     shm: Option<wl_shm::WlShm>,
     seat: Option<wl_seat::WlSeat>,
     capture: Option<ZwlrScreencopyManagerV1>,
     pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
     keyboard_manager: Option<ZwpVirtualKeyboardManagerV1>,
     synced: bool,
-    outputs: Vec<(u32, wl_output::WlOutput, String, i32, bool)>,
+    outputs: Vec<(u32, wl_output::WlOutput, String, i32, bool, (u32, u32))>,
     selected_output: Option<u32>,
     output_removed: bool,
     dimensions: Option<(wl_shm::Format, u32, u32, u32)>,
@@ -235,7 +306,11 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     String::new(),
                     1,
                     true,
+                    (0, 0),
                 )),
+                "zwlr_output_manager_v1" => {
+                    s.output_manager = Some(registry.bind(name, version.min(4), q, ()))
+                }
                 "zwlr_screencopy_manager_v1" => {
                     s.capture = Some(registry.bind(name, version.min(3), q, ()))
                 }
@@ -286,6 +361,14 @@ impl Dispatch<wl_output::WlOutput, ()> for State {
             match e {
                 wl_output::Event::Name { name } => o.2 = name,
                 wl_output::Event::Scale { factor } => o.3 = factor,
+                wl_output::Event::Mode {
+                    flags: WEnum::Value(flags),
+                    width,
+                    height,
+                    ..
+                } if flags.contains(wl_output::Mode::Current) => {
+                    o.5 = (width as u32, height as u32);
+                }
                 wl_output::Event::Geometry { transform, .. } => {
                     o.4 = transform == WEnum::Value(wl_output::Transform::Normal)
                 }
@@ -329,6 +412,163 @@ delegate_noop!(State: ignore ZwlrVirtualPointerManagerV1);
 delegate_noop!(State: ignore ZwlrVirtualPointerV1);
 delegate_noop!(State: ignore ZwpVirtualKeyboardManagerV1);
 delegate_noop!(State: ignore ZwpVirtualKeyboardV1);
+delegate_noop!(State: ignore ZwlrOutputModeV1);
+delegate_noop!(State: ignore ZwlrOutputConfigurationHeadV1);
+
+impl Dispatch<ZwlrOutputManagerV1, ()> for State {
+    fn event(
+        s: &mut Self,
+        _: &ZwlrOutputManagerV1,
+        e: zwlr_output_manager_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        match e {
+            zwlr_output_manager_v1::Event::Head { head } => {
+                s.heads.push((head, String::new(), false))
+            }
+            zwlr_output_manager_v1::Event::Done { serial } => s.output_serial = Some(serial),
+            zwlr_output_manager_v1::Event::Finished => s.output_manager = None,
+            _ => {}
+        }
+    }
+    wayland_client::event_created_child!(State, ZwlrOutputManagerV1, [0 => (ZwlrOutputHeadV1, ())]);
+}
+impl Dispatch<ZwlrOutputHeadV1, ()> for State {
+    fn event(
+        s: &mut Self,
+        head: &ZwlrOutputHeadV1,
+        e: zwlr_output_head_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let Some(entry) = s.heads.iter_mut().find(|entry| &entry.0 == head) {
+            match e {
+                zwlr_output_head_v1::Event::Name { name } => entry.1 = name,
+                zwlr_output_head_v1::Event::Enabled { enabled } => entry.2 = enabled != 0,
+                zwlr_output_head_v1::Event::Finished => s.heads.retain(|entry| &entry.0 != head),
+                _ => {}
+            }
+        }
+    }
+    wayland_client::event_created_child!(State, ZwlrOutputHeadV1, [3 => (ZwlrOutputModeV1, ())]);
+}
+impl Dispatch<ZwlrOutputConfigurationV1, ()> for State {
+    fn event(
+        s: &mut Self,
+        _: &ZwlrOutputConfigurationV1,
+        e: zwlr_output_configuration_v1::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        s.configuration_result = match e {
+            zwlr_output_configuration_v1::Event::Succeeded => Some(ConfigurationResult::Succeeded),
+            zwlr_output_configuration_v1::Event::Failed => Some(ConfigurationResult::Failed),
+            zwlr_output_configuration_v1::Event::Cancelled => Some(ConfigurationResult::Cancelled),
+            _ => return,
+        };
+    }
+}
+
+fn resize_output(
+    c: &Connection,
+    q: &mut wayland_client::EventQueue<State>,
+    s: &mut State,
+    name: &str,
+    target: DesktopSize,
+    alive: &AtomicBool,
+) -> anyhow::Result<()> {
+    let expected = (u32::from(target.width), u32::from(target.height));
+    if s.outputs.iter().any(|o| o.2 == name && o.5 == expected) {
+        return Ok(());
+    }
+    let started = Instant::now();
+    while s.output_serial.is_none() || s.heads.iter().all(|head| head.1 != name) {
+        anyhow::ensure!(
+            alive.load(Ordering::Acquire),
+            "desktop stopped during resize"
+        );
+        anyhow::ensure!(
+            s.output_manager.is_some(),
+            "missing output management protocol"
+        );
+        pump(c, q, s)?;
+        anyhow::ensure!(
+            started.elapsed() < Duration::from_secs(3),
+            "output management timed out"
+        );
+    }
+    let h = q.handle();
+    loop {
+        let manager = s
+            .output_manager
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("output manager closed"))?;
+        let config = manager.create_configuration(s.output_serial.unwrap(), &h, ());
+        for (head, head_name, enabled) in &s.heads {
+            if head_name == name {
+                let conf = config.enable_head(head, &h, ());
+                conf.set_custom_mode(target.width.into(), target.height.into(), 60_000);
+                conf.set_scale(1.0);
+                conf.set_transform(wl_output::Transform::Normal);
+                conf.set_position(0, 0);
+            } else if *enabled {
+                // Niri retains the existing properties of other enabled heads.
+                config.enable_head(head, &h, ());
+            } else {
+                config.disable_head(head);
+            }
+        }
+        s.configuration_result = None;
+        config.apply();
+        let result = (|| -> anyhow::Result<bool> {
+            loop {
+                anyhow::ensure!(
+                    alive.load(Ordering::Acquire),
+                    "desktop stopped during resize"
+                );
+                pump(c, q, s)?;
+                anyhow::ensure!(
+                    started.elapsed() < Duration::from_secs(3),
+                    "output resize not applied"
+                );
+                match s.configuration_result {
+                    Some(ConfigurationResult::Failed) => anyhow::bail!("output resize rejected"),
+                    Some(ConfigurationResult::Cancelled) => return Ok(false),
+                    Some(ConfigurationResult::Succeeded)
+                        if s.outputs.iter().any(|o| o.2 == name && o.5 == expected) =>
+                    {
+                        return Ok(true);
+                    }
+                    _ => {}
+                }
+            }
+        })();
+        config.destroy();
+        if result? {
+            return Ok(());
+        }
+        // Geometry notifications can invalidate the serial between creating
+        // and applying a configuration. Sync the updated metadata and retry
+        // within the same deadline, using the compositor's latest serial.
+        s.synced = false;
+        c.display().sync(&h, ());
+        while !s.synced {
+            anyhow::ensure!(
+                alive.load(Ordering::Acquire),
+                "desktop stopped during resize"
+            );
+            pump(c, q, s)?;
+            anyhow::ensure!(
+                started.elapsed() < Duration::from_secs(3),
+                "output resize retry timed out"
+            );
+        }
+    }
+}
 
 fn pump(
     c: &Connection,
@@ -547,7 +787,7 @@ fn wl_seat_button_pressed() -> wayland_client::protocol::wl_pointer::ButtonState
 fn run(
     socket: UnixStream,
     name: &str,
-    target: DesktopSize,
+    mut target: DesktopSize,
     commands: mpsc::Receiver<Command>,
     frames: tokio::sync::watch::Sender<Option<Arc<DisplayUpdate>>>,
     ready: mpsc::SyncSender<anyhow::Result<()>>,
@@ -584,6 +824,7 @@ fn run(
     );
     s.selected_output = Some(output.0);
     let output = output.1.clone();
+    resize_output(&c, &mut q, &mut s, name, target, &alive)?;
     let seat = s
         .seat
         .as_ref()
@@ -639,6 +880,31 @@ fn run(
             if !alive.load(Ordering::Acquire) {
                 return Ok(());
             }
+            // Apply resize only between captures, preserving the coordinate
+            // contract for every queued input event and in-flight SHM buffer.
+            for _ in 0..256 {
+                if !alive.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                match commands.try_recv() {
+                    Ok(Command::Resize(next)) if next != target => {
+                        resize_output(&c, &mut q, &mut s, name, next, &alive)?;
+                        target = next;
+                        input.target = target;
+                        input.size = (u32::from(target.width), u32::from(target.height));
+                        input.point = (
+                            input.point.0.min(u32::from(target.width) - 1),
+                            input.point.1.min(u32::from(target.height) - 1),
+                        );
+                    }
+                    Ok(Command::Resize(_)) => {}
+                    Ok(Command::Key(e)) => input.key_event(e),
+                    Ok(Command::Mouse(e)) => input.mouse_event(e),
+                    Ok(Command::Release) => input.release(),
+                    Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                }
+            }
             s.dimensions = None;
             s.buffer_done = false;
             s.ready = false;
@@ -675,15 +941,6 @@ fn run(
             frame.copy(&buffer);
             input.size = (w, height);
             while !s.ready {
-                for _ in 0..256 {
-                    match commands.try_recv() {
-                        Ok(Command::Key(e)) => input.key_event(e),
-                        Ok(Command::Mouse(e)) => input.mouse_event(e),
-                        Ok(Command::Release) => input.release(),
-                        Ok(Command::Stop) | Err(mpsc::TryRecvError::Disconnected) => return Ok(()),
-                        Err(mpsc::TryRecvError::Empty) => break,
-                    }
-                }
                 if !alive.load(Ordering::Acquire) {
                     return Ok(());
                 }
@@ -741,6 +998,91 @@ impl Dispatch<wayland_client::protocol::wl_callback::WlCallback, ()> for State {
 #[cfg(test)]
 mod lifecycle_tests {
     use super::*;
+    #[test]
+    fn layout_accepts_portrait_and_odd_height_but_rejects_unsupported_sizes() {
+        for (width, height, accepted) in [
+            (1002, 701, true),
+            (702, 1001, true),
+            (4096, 4096, true),
+            (4098, 700, false),
+            (1000, 4097, false),
+        ] {
+            let layout =
+                DisplayControlMonitorLayout::new_single_primary_monitor(width, height, None, None)
+                    .unwrap();
+            assert_eq!(layout_size(&layout).is_some(), accepted);
+        }
+        let primary =
+            ironrdp_displaycontrol::pdu::MonitorLayoutEntry::new_primary(1000, 700).unwrap();
+        let secondary =
+            ironrdp_displaycontrol::pdu::MonitorLayoutEntry::new_secondary(1000, 700).unwrap();
+        assert!(
+            layout_size(&DisplayControlMonitorLayout::new(&[primary, secondary]).unwrap())
+                .is_none()
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn latest_frame_announces_resize_before_pixels_and_survives_cancellation() {
+        let initial = DesktopSize {
+            width: 640,
+            height: 480,
+        };
+        let (commands, _worker) = mpsc::sync_channel(256);
+        let (frames, rx) = tokio::sync::watch::channel(None);
+        let desktop = Desktop {
+            inner: Arc::new(Inner {
+                commands,
+                frames: Mutex::new(rx.clone()),
+                size: Arc::new(Mutex::new(initial)),
+                failed: Arc::new(Mutex::new(None)),
+                alive: Arc::new(AtomicBool::new(true)),
+                _lease: Arc::new(Mutex::new(None)),
+            }),
+        };
+        let mut updates = Updates {
+            desktop,
+            rx,
+            size: initial,
+            pending: None,
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(1), updates.next_update())
+                .await
+                .is_err()
+        );
+        let publish = |width, height| {
+            let target = DesktopSize { width, height };
+            let image = bitmap(&[1, 2, 3, 0], 1, 1, 4, false, target, false).unwrap();
+            frames.send_replace(Some(Arc::new(DisplayUpdate::Bitmap(image))));
+        };
+        // A watch receiver can skip several captures; derive control updates
+        // from the retained frame rather than relying on a transient Resize.
+        publish(800, 600);
+        publish(702, 1001);
+        assert!(matches!(
+            updates.next_update().await.unwrap(),
+            Some(DisplayUpdate::Resize(DesktopSize {
+                width: 702,
+                height: 1001
+            }))
+        ));
+        assert!(
+            matches!(updates.next_update().await.unwrap(), Some(DisplayUpdate::Bitmap(image)) if image.width.get() == 702 && image.height.get() == 1001)
+        );
+        publish(702, 1001);
+        assert!(matches!(
+            updates.next_update().await.unwrap(),
+            Some(DisplayUpdate::Bitmap(_))
+        ));
+        publish(1002, 701);
+        assert!(matches!(
+            updates.next_update().await.unwrap(),
+            Some(DisplayUpdate::Resize(DesktopSize {
+                width: 1002,
+                height: 701
+            }))
+        ));
+    }
     #[tokio::test(flavor = "current_thread")]
     async fn dead_or_closed_capture_is_terminal_not_a_retry_error() {
         for alive in [false, true] {
@@ -750,17 +1092,25 @@ mod lifecycle_tests {
                 inner: Arc::new(Inner {
                     commands,
                     frames: Mutex::new(rx.clone()),
-                    size: DesktopSize {
+                    size: Arc::new(Mutex::new(DesktopSize {
                         width: 640,
                         height: 480,
-                    },
+                    })),
                     failed: Arc::new(Mutex::new(Some("broken compositor".into()))),
                     alive: Arc::new(AtomicBool::new(alive)),
                     _lease: Arc::new(Mutex::new(None)),
                 }),
             };
             drop(frames);
-            let mut updates = Updates { desktop, rx };
+            let mut updates = Updates {
+                desktop,
+                rx,
+                size: DesktopSize {
+                    width: 640,
+                    height: 480,
+                },
+                pending: None,
+            };
             let result = tokio::time::timeout(Duration::from_millis(100), updates.next_update())
                 .await
                 .unwrap()
@@ -783,10 +1133,10 @@ mod lifecycle_tests {
             inner: Arc::new(Inner {
                 commands,
                 frames: Mutex::new(rx),
-                size: DesktopSize {
+                size: Arc::new(Mutex::new(DesktopSize {
                     width: 640,
                     height: 480,
-                },
+                })),
                 failed: Arc::new(Mutex::new(None)),
                 alive: Arc::new(AtomicBool::new(true)),
                 _lease: Arc::new(Mutex::new(Some(lease))),

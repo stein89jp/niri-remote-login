@@ -1,5 +1,6 @@
 //! Optional host NVENC encoding; IronRDP owns graphics negotiation and framing.
 use crate::server_error;
+use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_egfx::{
     pdu::{Avc420Region, CapabilitiesAdvertisePdu, CapabilitySet},
     server::{GraphicsPipelineHandler, GraphicsPipelineServer},
@@ -57,13 +58,8 @@ impl Encoder {
     }
     fn new(width: u16, height: u16, software: bool) -> anyhow::Result<Self> {
         anyhow::ensure!(
-            width >= 2
-                && height >= 2
-                && width <= 4096
-                && height <= 4096
-                && width.is_multiple_of(2)
-                && height.is_multiple_of(2),
-            "H.264 dimensions must be even, within 2..4096"
+            width >= 1 && height >= 1 && width <= 4096 && height <= 4096,
+            "H.264 dimensions must be within 1..4096"
         );
         let mut error = [0 as c_char; 256];
         let ptr = unsafe {
@@ -81,6 +77,24 @@ impl Encoder {
             unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
         );
         Ok(Self { ptr, width, height })
+    }
+    fn encode_frame(
+        encoder: &mut Option<Self>,
+        image: &BitmapUpdate,
+        force_idr: bool,
+        create: impl FnOnce(u16, u16) -> anyhow::Result<Self>,
+    ) -> anyhow::Result<Vec<u8>> {
+        let (width, height) = (image.width.get(), image.height.get());
+        let changed = encoder
+            .as_ref()
+            .is_none_or(|encoder| (encoder.width, encoder.height) != (width, height));
+        if changed {
+            *encoder = Some(create(width, height)?);
+        }
+        encoder
+            .as_mut()
+            .unwrap()
+            .encode(image, force_idr || changed)
     }
     pub fn encode(&mut self, image: &BitmapUpdate, force_idr: bool) -> anyhow::Result<Vec<u8>> {
         anyhow::ensure!(
@@ -212,6 +226,12 @@ impl RdpServerDisplay for VideoDisplay {
     async fn size(&mut self) -> DesktopSize {
         self.inner.size().await
     }
+    async fn request_initial_size(&mut self, client_size: DesktopSize) -> DesktopSize {
+        self.inner.request_initial_size(client_size).await
+    }
+    fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
+        self.inner.request_layout(layout);
+    }
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         let inner = self.inner.updates_send();
         let state = self.video.0.lock().unwrap();
@@ -260,9 +280,20 @@ impl VideoUpdates {
         if !gfx.is_ready() || !gfx.supports_avc420() {
             return Err(server_error("H.264 graphics channel closed"));
         }
+        if let Some(id) = self.surface {
+            match gfx.get_surface(id) {
+                Some(surface) if (surface.width, surface.height) == (width, height) => (),
+                _ => self.surface = None,
+            }
+        }
         let surface = match self.surface {
             Some(id) => id,
             None => {
+                // Reactivation can replace this update stream while its old
+                // surfaces remain in the connection's graphics context.
+                if gfx.surface_ids().next().is_some() {
+                    gfx.resize(width, height);
+                }
                 gfx.set_output_dimensions(width, height);
                 let id = gfx
                     .create_surface(width, height)
@@ -335,8 +366,19 @@ impl RdpServerDisplayUpdates for VideoUpdates {
             let Some(update) = self.inner.next_update().await? else {
                 return Ok(None);
             };
-            let DisplayUpdate::Bitmap(image) = update else {
-                return Ok(Some(update));
+            let image = match update {
+                DisplayUpdate::Bitmap(image) => image,
+                DisplayUpdate::Resize(size) => {
+                    self.encoder.lock().unwrap().take();
+                    self.surface = None;
+                    self.force_idr = true;
+                    let mut gfx = self.handle.lock().unwrap();
+                    if gfx.is_ready() && gfx.supports_avc420() {
+                        gfx.resize(size.width, size.height);
+                    }
+                    return Ok(Some(DisplayUpdate::Resize(size)));
+                }
+                other => return Ok(Some(other)),
             };
             let generation = self.generation.load(Ordering::SeqCst);
             if generation != self.known_generation {
@@ -368,10 +410,7 @@ impl RdpServerDisplayUpdates for VideoUpdates {
             // Encoder initialization and GPU submission run off the input/network thread.
             let task = tokio::task::spawn_blocking(move || {
                 let mut encoder = encoder.lock().unwrap();
-                if encoder.is_none() {
-                    *encoder = Some(Encoder::nvenc(width, height)?);
-                }
-                encoder.as_mut().unwrap().encode(&image, force_idr)
+                Encoder::encode_frame(&mut encoder, &image, force_idr, Encoder::nvenc)
             });
             self.pending = Some((task, width, height, generation));
         }
@@ -393,17 +432,17 @@ mod tests {
         }
     }
     fn image() -> DisplayUpdate {
+        sized_image(64, 64)
+    }
+    fn sized_image(width: u16, height: u16) -> DisplayUpdate {
         DisplayUpdate::Bitmap(
             crate::bitmap(
-                &vec![127; 64 * 64 * 4],
-                64,
-                64,
-                256,
+                &vec![127; usize::from(width) * usize::from(height) * 4],
+                width.into(),
+                height.into(),
+                u32::from(width) * 4,
                 false,
-                DesktopSize {
-                    width: 64,
-                    height: 64,
-                },
+                DesktopSize { width, height },
                 false,
             )
             .unwrap(),
@@ -423,6 +462,26 @@ mod tests {
         gfx.process(7, &bytes).unwrap();
         assert!(gfx.is_ready());
         assert_eq!(gfx.supports_avc420(), avc);
+    }
+    fn graphics_pdus(event: ServerEvent) -> Vec<GfxPdu> {
+        use ironrdp_dvc::pdu::{DrdynvcDataPdu, DrdynvcServerPdu};
+        let ServerEvent::Egfx(EgfxServerMessage::SendMessages { messages }) = event else {
+            panic!("expected graphics messages");
+        };
+        messages
+            .into_iter()
+            .map(|message| {
+                let bytes = message.encode_unframed_pdu().unwrap();
+                let DrdynvcServerPdu::Data(DrdynvcDataPdu::Data(data)) =
+                    ironrdp_core::decode(&bytes).unwrap()
+                else {
+                    panic!("small graphics test PDU must fit one DVC message");
+                };
+                let payload = data.data();
+                assert_eq!(&payload[..2], &[0xe0, 0x04], "uncompressed ZGFX segment");
+                ironrdp_core::decode(&payload[2..]).unwrap()
+            })
+            .collect()
     }
     fn updates(
         frames: Vec<DisplayUpdate>,
@@ -498,6 +557,126 @@ mod tests {
         assert!(stream.encoder.lock().unwrap().is_none());
         assert!(stream.pending.is_none());
         assert!(events.try_recv().is_err());
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn resize_releases_encoder_and_old_graphics_surfaces() {
+        let size = DesktopSize {
+            width: 63,
+            height: 61,
+        };
+        let (mut stream, mut events) = updates(vec![DisplayUpdate::Resize(size)]);
+        advertise(&stream.handle, true);
+        stream.submit(&[0, 0, 0, 1, 0x65], 64, 64).unwrap();
+        let old_surface = stream.surface.unwrap();
+        events.try_recv().unwrap();
+        *stream.encoder.lock().unwrap() = Some(Encoder::new(64, 64, true).unwrap());
+        assert!(
+            matches!(stream.next_update().await.unwrap(), Some(DisplayUpdate::Resize(actual))
+            if actual.width == size.width && actual.height == size.height)
+        );
+        assert!(stream.encoder.lock().unwrap().is_none());
+        assert!(stream.surface.is_none());
+        assert!(stream.force_idr);
+        assert!(
+            stream
+                .handle
+                .lock()
+                .unwrap()
+                .get_surface(old_surface)
+                .is_none()
+        );
+        stream
+            .submit(&[0, 0, 0, 1, 0x65], size.width, size.height)
+            .unwrap();
+        let gfx = stream.handle.lock().unwrap();
+        let surface = gfx.get_surface(stream.surface.unwrap()).unwrap();
+        assert_eq!((surface.width, surface.height), (size.width, size.height));
+        assert!(surface.is_mapped);
+        assert!(events.try_recv().is_ok());
+    }
+    #[test]
+    fn changed_dimensions_and_replaced_stream_recreate_graphics_surface() {
+        let (mut stream, mut events) = updates(vec![]);
+        advertise(&stream.handle, true);
+        stream.submit(&[0, 0, 0, 1, 0x65], 64, 64).unwrap();
+        let old_surface = stream.surface.unwrap();
+        events.try_recv().unwrap();
+        for replaced_stream in [false, true] {
+            if replaced_stream {
+                stream.surface = None;
+            }
+            stream.submit(&[0, 0, 0, 1, 0x65], 63, 61).unwrap();
+            let gfx = stream.handle.lock().unwrap();
+            assert!(gfx.get_surface(old_surface).is_none());
+            assert_eq!(gfx.surface_ids().count(), 1);
+            let surface = gfx.get_surface(stream.surface.unwrap()).unwrap();
+            assert_eq!((surface.width, surface.height), (63, 61));
+            assert!(surface.is_mapped);
+            let pdus = graphics_pdus(events.try_recv().unwrap());
+            let deleted = pdus
+                .iter()
+                .position(|pdu| matches!(pdu, GfxPdu::DeleteSurface(_)))
+                .unwrap();
+            let reset = pdus
+                .iter()
+                .position(|pdu| {
+                    matches!(pdu,
+                GfxPdu::ResetGraphics(reset) if (reset.width, reset.height) == (63, 61))
+                })
+                .unwrap();
+            let created = pdus
+                .iter()
+                .position(|pdu| {
+                    matches!(pdu,
+                GfxPdu::CreateSurface(surface) if (surface.width, surface.height) == (63, 61))
+                })
+                .unwrap();
+            let mapped = pdus
+                .iter()
+                .position(|pdu| matches!(pdu, GfxPdu::MapSurfaceToOutput(_)))
+                .unwrap();
+            assert!(deleted < reset && reset < created && created < mapped);
+        }
+    }
+    #[test]
+    fn dimension_changes_recreate_encoder_and_odd_sizes_are_padded() {
+        let mut encoder = None;
+        for (width, height) in [(64, 64), (63, 61), (80, 48)] {
+            let DisplayUpdate::Bitmap(image) = sized_image(width, height) else {
+                unreachable!()
+            };
+            let encoded =
+                Encoder::encode_frame(&mut encoder, &image, false, |w, h| Encoder::new(w, h, true))
+                    .unwrap();
+            let context = encoder.as_ref().unwrap();
+            assert_eq!((context.width, context.height), (width, height));
+            assert!(
+                encoded
+                    .windows(4)
+                    .any(|nal| nal[..3] == [0, 0, 1] && nal[3] & 0x1f == 5),
+                "each new size must begin with an IDR"
+            );
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("resized.h264");
+            std::fs::write(&path, encoded).unwrap();
+            let decoded = Command::new("ffmpeg")
+                .args(["-v", "error", "-threads", "1", "-i"])
+                .arg(path)
+                .args([
+                    "-f", "rawvideo", "-pix_fmt", "bgra", "-threads", "1", "pipe:1",
+                ])
+                .output()
+                .unwrap();
+            assert!(
+                decoded.status.success(),
+                "{}",
+                String::from_utf8_lossy(&decoded.stderr)
+            );
+            assert_eq!(
+                decoded.stdout.len(),
+                usize::from(width.div_ceil(16) * 16) * usize::from(height.div_ceil(16) * 16) * 4
+            );
+        }
     }
     #[tokio::test(flavor = "current_thread")]
     async fn capability_readvertise_discards_inflight_reference_and_recreates_surface() {
@@ -578,7 +757,7 @@ mod tests {
     }
     #[test]
     fn invalid_video_dimensions_fail_before_ffi() {
-        for (w, h) in [(0, 2), (2, 0), (3, 2), (2, 4097), (4098, 2)] {
+        for (w, h) in [(0, 2), (2, 0), (2, 4097), (4098, 2)] {
             assert!(Encoder::new(w, h, true).is_err());
         }
     }

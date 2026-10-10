@@ -13,6 +13,7 @@ are in `scripts/headless-integration.py`; they do not substitute for this matrix
 | Authentication policy | Wrong password, unknown user, root, nonmember, locked/expired user, additional PAM prompt, account with local graphical session; confirm no app/session/private directory remains | Pending real PAM tests; native failure tests cover contracts |
 | Cold boot | Enable system frontend, reboot test machine, do not log in locally, connect via Windows tunnel; record `loginctl` identity and terminal `id` output | Pending |
 | Windows | mstsc displays dedicated Niri terminal and sends keyboard, pointer, wheel and modifiers; record TLS-only client properties and certificate verification | Pending |
+| Dynamic resolution | Connect at a non-default size; resize the client window in portrait and landscape, verify application reflow, sharp text and accurate pointer clicks without reconnecting | Namespace FreeRDP validation recorded in validation.md; Windows and installed-service behavior pending |
 | NVIDIA encoding | Rebuild the current frontend, enable its NVIDIA drop-in, verify NVENC initialization and AVC420 graphics negotiation; decode changing frames, exercise input/reconnect, and record GPU encoder activity, bitrate and latency against bitmap mode | Release NVENC/FreeRDP namespace app/input/reconnect test passed; Windows, systemd permissions and complete-path performance pending |
 | Codec fallback and hardware failure | With NVENC enabled, a client without AVC420 graphics support receives bitmap updates; unavailable/denied NVIDIA hardware produces a clear frontend startup failure; restore bitmap mode and verify login | Release namespace bitmap fallback passed with NVENC configured; actual service/device-denial checks pending |
 | Physical monitor off | Keep test machine awake, power monitor off while moving typing in app remotely; record continued changing pixels/input, independent output and session identity | Pending |
@@ -46,8 +47,9 @@ Inspect service/UID before terminating any session. Monitor-off is not suspend;
 keep the test machine awake without modifying the working host's power policy.
 
 Single-session frontend, US physical-key input, normal transform and scale 1 are
-the current contract. The frontend serves a fixed 1920×1080 desktop; the capture
-probe additionally verifies scaling to 640×480. Client resize is unsupported. No
+the current contract. The frontend follows client-selected initial dimensions
+and supports live single-display resolution requests through Display Control.
+Rebuild both packages; see the [resolution contract](../bridge/README.md#dynamic-resolution). No
 persistent reconnect, multi-monitor, clipboard, audio or Unicode/IME claim is made.
 The optional host encoder uses H.264 AVC420; it does not enable host-side NVDEC
 or ensure that the RDP client uses hardware decoding. Compositor rendering stays

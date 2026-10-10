@@ -46,6 +46,12 @@ Alternative Smithay: `22571baa20d34d71092942dbb520c4e3fbbd6263`.
 - Regression test exercises invalid requests with no state changes, capacity
   refusal, removal, capacity recovery, identity monotonicity and removal of the
   final output.
+- Headless output configuration applies custom modes through the existing wlr
+  output-management protocol. It preserves output identity and workspaces,
+  updates frame pacing, layout, IPC and announced geometry, rejects dimensions
+  outside 1–8192 and refresh outside 1–240 Hz, and retains one current mode.
+  The resize regression exercises three mode changes and invalid requests,
+  checking output identity, bounded mode storage and IPC/logical geometry.
 
 Compile with `--locked --no-default-features`, and launch without `--session`.
 This excludes D-Bus/systemd user environment import and portal integration.
@@ -111,6 +117,11 @@ color acknowledgment/release and two reconnects. See root integration logs for
 that stronger result; do not infer Windows compatibility from it.
 
 ## Remaining gates
+
+The release results and binary hash below describe the original startup/bounds
+patch before dynamic-resolution support. The current patch was rebuilt in debug
+mode; both headless lifecycle and resize regressions pass, and the patch applies
+cleanly to the pinned source archive. Its current checksum is in `pins.json`.
 
 Release build PASS: `cargo build --release --locked --offline
 --no-default-features`, `CARGO_BUILD_JOBS=2`, elapsed 4m01s. Unstripped binary

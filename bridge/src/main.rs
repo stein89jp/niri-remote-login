@@ -131,6 +131,10 @@ async fn main() -> anyhow::Result<()> {
             .with_tls(acceptor)
             .with_input_handler(Placeholder)
             .with_display_handler(Placeholder)
+            .with_honor_client_desktop_size(Some(DesktopSize {
+                width: 4096,
+                height: 4096,
+            }))
             .with_gfx_factory(video.as_ref().map(|v| Box::new(v.clone()) as _))
             .with_connection_policy(ConnectionPolicy::Reject)
             .with_connection_handler(Some(Box::new(Lifecycle {
@@ -153,6 +157,10 @@ async fn main() -> anyhow::Result<()> {
             .with_hybrid(acceptor, identity.pub_key)
             .with_input_handler(Placeholder)
             .with_display_handler(Placeholder)
+            .with_honor_client_desktop_size(Some(DesktopSize {
+                width: 4096,
+                height: 4096,
+            }))
             .with_gfx_factory(video.as_ref().map(|v| Box::new(v.clone()) as _))
             .with_connection_policy(ConnectionPolicy::Reject)
             .with_connection_handler(Some(Box::new(Lifecycle {

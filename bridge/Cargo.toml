@@ -12,6 +12,7 @@ ironrdp-server = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019c
 ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
 ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
 ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
+ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
 tokio = { version = "1", features = ["macros", "rt", "time", "signal", "sync"] }
 wayland-client = "=0.31.14"
 wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }

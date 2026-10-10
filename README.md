@@ -12,6 +12,11 @@ The privileged broker is implemented and native-tested; **actual PAM/logind boot
 login, Windows mstsc, and physical-monitor-off validation remain pending**.
 This is not yet a demonstrated production remote-login service.
 
+The source supports client-selected initial resolution and live resizing for a
+single remote display, including native Niri application reflow and matching
+pointer coordinates. Rebuild both packages to use this support; the preserved
+0.1.0 delivery archives predate it. See [resolution support](bridge/README.md#dynamic-resolution).
+
 The source now includes optional NVIDIA NVENC H.264 encoding on the Niri host
 (`NIRI_RDP_ENCODER=nvenc`) for AVC420-capable RDP clients. The default remains
 bitmap transport. See [NVIDIA setup](docs/install.md#optional-nvidia-encoding)

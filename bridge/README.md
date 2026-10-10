@@ -47,7 +47,8 @@ animated test app's own log; request submission alone is not input proof.
 
 Capture uses `zwlr_screencopy_manager_v1` into bounded anonymous SHM files,
 accepting XRGB/ARGB/XBGR/ABGR8888, converting row padding and vertical inversion,
-and scaling into the negotiated RDP desktop. The worker retains only the
+and normalizing frames into the negotiated RDP desktop. The native headless
+output is resized to that same pixel size before capture. The worker retains only the
 latest frame and captures at most 30 fps. Wayland dispatch/capture waits have
 bounded deadlines. Output removal or capture failure closes the connection.
 
@@ -132,11 +133,38 @@ RDP set-1 E0 codes map explicitly to Linux evdev codes. Pointer absolute and
 relative motion is bounded before mapping into the capture output. Click
 coordinates travel with the button event. Output scale 1 and normal transform
 are required; unsupported layouts fail closed. Unicode/IME events are ignored,
-not treated as physical keys; arbitrary layouts, Pause/E1, IME, dynamic resize,
-clipboard, audio and lock-screen behavior remain work. The network frontend reports a fixed 1920x1080 desktop; the capture probe
-exercises 640x480 scaling. Client-selected initial size and resizing during an
-active connection need a tested size/input contract before enabling
-display-control or honoring client dimensions.
+not treated as physical keys; arbitrary layouts, Pause/E1, IME, clipboard, audio
+and lock-screen behavior remain work.
+
+## Dynamic resolution
+
+The frontend honors the client's initial desktop dimensions, bounded to 4096
+pixels per axis. During the session, clients with the RDP Display Control channel
+can request a new single-display layout at the origin. Live dimensions must be
+200..4096 pixels per axis, with even width as required by Display Control; odd
+heights and portrait layouts are supported. Unsupported layouts are ignored.
+Clients without Display Control keep their initial size. Physical monitor size
+and client DPI scaling do not change the remote output scale, which remains 1.
+
+The capture worker applies each mode through wlr output management on its
+authenticated Wayland connection and verifies Niri's current mode. The maintained
+headless compositor patch updates the existing output, so applications and
+workspaces survive and reflow. Frames and pointer coordinates use the same size;
+IronRDP reactivates the desktop before sending pixels at the new resolution.
+NVENC recreates its encoder and graphics surface and begins with an IDR frame;
+codec padding is cropped to the logical desktop.
+
+Rebuild **both** `niri-rdp-headless` and `niri-remote-login`. The older delivery
+archives and upstream headless backend do not include native mode changes.
+Choose the desired resolution in your RDP client and enable its dynamic
+resolution option to follow window-size changes. Windows mstsc interoperability
+remains an actual-machine acceptance gate.
+
+The namespace integration probe requests 1001×701 initially, then resizes to
+702×1001, 1002×701, and 702×1001 without reconnecting. At each size it checks
+FreeRDP-decoded geometry, native/logical Niri output dimensions, application
+keyboard input and center-pointer click/release. Use the existing integration
+commands above with the current debug or release frontend and rebuilt compositor.
 
 Broker transport is bounded `NRB1 + BE16(username length) + BE16(password length)
 + UTF-8 credentials`, no NUL; username 1..64, password 1..512 bytes. Reply is

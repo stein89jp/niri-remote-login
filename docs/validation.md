@@ -102,3 +102,53 @@ must precede `--offline`; keep the Cargo home and target within the workspace.
 See [PoC instructions](../poc/README.md) for explicit TLS setup, launch, and
 integration commands. Default test discovery does not implicitly start an RDP
 service.
+
+
+## Dynamic resolution validation (2026-10-10)
+
+The current bridge and maintained headless compositor patch support native
+client-selected initial resolution and single-display live resize. The displayless
+FreeRDP client negotiates 1001×701, then sends Display Control layouts for
+702×1001 → 1002×701 → 702×1001 on the same connection. For every size, the harness
+checks decoded frame geometry against Niri IPC's native and logical output size,
+then requires application keyboard and center-pointer click/release feedback.
+This verifies application reflow at native resolution as well as RDP geometry.
+
+Three complete isolated TLS broker fixture suites passed: bitmap, NVENC AVC420,
+and NVENC with a bitmap-only client. Receipts are
+`artifacts/dynamic-resolution-bitmap.json`,
+`artifacts/dynamic-resolution-nvenc.json`, and
+`artifacts/dynamic-resolution-nvenc-fallback.json`. They also retain wrong-password
+rejection, reconnect, held-input disconnect release, compositor-crash termination,
+frontend survival and broker lease EOF checks. The last fallback run uses the
+final disconnect responsiveness checks. The fixture supplies a real compositor
+FD but does not authenticate through PAM.
+
+All 27 bridge unit tests passed, including resize-before-pixels ordering,
+cancellation, unsupported layouts, odd-size video decoding, encoder recreation,
+and graphics surface reset. Both compositor headless regressions passed; the
+maintained patch applies to the pristine pinned archive, and both debug binaries
+build. Python regression discovery passed seven tests with the opt-in synthetic
+transport test skipped. Socket tests and isolated integration required execution
+outside the restrictive sandbox. No host service was installed or enabled.
+
+Reproduce after building the patched compositor, bridge and strict FreeRDP probe:
+
+```sh
+cargo test --manifest-path bridge/Cargo.toml --locked --offline
+lab/run-isolated.sh env NIRI_RDP_LAB_TLS_CONTRACT=1 \
+  NIRI_RDP_LAB_REPORT=artifacts/dynamic-resolution-bitmap.json \
+  python3 scripts/headless-integration.py
+lab/run-isolated.sh --nvenc env NIRI_RDP_LAB_ENCODER=nvenc \
+  NIRI_RDP_LAB_TLS_CONTRACT=1 \
+  NIRI_RDP_LAB_REPORT=artifacts/dynamic-resolution-nvenc.json \
+  python3 scripts/headless-integration.py
+lab/run-isolated.sh --nvenc env NIRI_RDP_LAB_ENCODER=nvenc \
+  NIRI_RDP_LAB_GFX=0 NIRI_RDP_LAB_TLS_CONTRACT=1 \
+  NIRI_RDP_LAB_REPORT=artifacts/dynamic-resolution-nvenc-fallback.json \
+  python3 scripts/headless-integration.py
+```
+
+See the [resolution contract](../bridge/README.md#dynamic-resolution) for bounds
+and rebuilding both packages. Windows mstsc, installed-service operation and
+real PAM/logind boot acceptance remain separate-machine gates.

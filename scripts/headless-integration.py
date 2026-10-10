@@ -4,6 +4,7 @@ import json
 import os
 from pathlib import Path
 import secrets
+import selectors
 import shutil
 import signal
 import socket
@@ -13,6 +14,7 @@ import time
 from mock_broker import MockBroker
 
 ROOT = Path(__file__).resolve().parents[1]
+DESKTOP_SIZES = [(1001, 701), (702, 1001), (1002, 701), (702, 1001)]
 
 
 def wait_for(path, process):
@@ -36,6 +38,71 @@ def stop(process):
     except subprocess.TimeoutExpired:
         os.killpg(process.pid, signal.SIGKILL)
         process.wait(timeout=5)
+
+
+def native_output_size(ipc_path):
+    with socket.socket(socket.AF_UNIX) as connection:
+        connection.settimeout(2)
+        connection.connect(str(ipc_path))
+        connection.sendall(b'"Outputs"\n')
+        with connection.makefile("rb") as reply:
+            outputs = json.loads(reply.readline())["Ok"]["Outputs"]
+    output = outputs["HEADLESS-1"]
+    mode = output["modes"][output["current_mode"]]
+    logical = output["logical"]
+    return (mode["width"], mode["height"]), (logical["width"], logical["height"])
+
+
+def resize_roundtrip(environment, ipc_path, log_path):
+    """Hold each decoded size until IPC confirms the native compositor mode."""
+    decoded_sizes = []
+    output = []
+    with log_path.open("w+") as error_log:
+        process = subprocess.Popen([str(ROOT / "artifacts/rdp-desktop-client")],
+                                   env=dict(environment, NIRI_RDP_TEST_RESIZE_ACK="1"),
+                                   stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                   stderr=error_log, text=True, start_new_session=True)
+        try:
+            deadline = time.monotonic() + 25
+            with selectors.DefaultSelector() as selector:
+                selector.register(process.stdout, selectors.EVENT_READ)
+                while True:
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("dynamic resolution client timed out")
+                    if not selector.select(timeout=0.1):
+                        continue
+                    line = process.stdout.readline()
+                    if not line:
+                        break
+                    output.append(line)
+                    if line.startswith("NIRI_RDP_DESKTOP_SIZE "):
+                        size = tuple(map(int, line.split()[1:]))
+                        expected = DESKTOP_SIZES[len(decoded_sizes)]
+                        if size != expected:
+                            raise RuntimeError(f"decoded desktop size {size}, expected {expected}")
+                        native, logical = native_output_size(ipc_path)
+                        if native != size or logical != size:
+                            raise RuntimeError(f"decoded {size} but native output={native}, logical={logical}")
+                        decoded_sizes.append(size)
+                        process.stdin.write("continue\n")
+                        process.stdin.flush()
+            result = process.wait(timeout=3)
+            error_log.flush()
+            error_log.seek(0)
+            errors = error_log.read()
+            rendered = "".join(output)
+            if result or decoded_sizes != DESKTOP_SIZES or "NIRI_RDP_DYNAMIC_RESOLUTION_OK" not in rendered:
+                raise RuntimeError(f"dynamic resolution roundtrip failed: rc={result}, sizes={decoded_sizes} "
+                                   f"{rendered} {errors}")
+            return subprocess.CompletedProcess(process.args, result, rendered, errors)
+        finally:
+            stop(process)
+            process.stdin.close()
+            process.stdout.close()
+            error_log.flush()
+            error_log.seek(0)
+            errors = error_log.read()
+            log_path.write_text("".join(output) + errors)
 
 
 def main():
@@ -82,6 +149,8 @@ def main():
             niri = launch([str(ROOT / os.environ.get("NIRI_RDP_LAB_NIRI", "compositor/upstream/target/debug/niri")),
                            "--config", str(ROOT / "lab/headless.kdl")], env, "niri.log")
             wait_for(runtime / "wayland-0", niri)
+            ipc_path = runtime / f"niri.wayland-0.{niri.pid}.sock"
+            wait_for(ipc_path, niri)
             app = launch([str(ROOT / "lab/dynamic-app")], dict(env, WAYLAND_DISPLAY="wayland-0"), "app.log")
             time.sleep(1)
             bridge_env = dict(env, NIRI_RDP_MODE="disposable", NIRI_RDP_CERT=str(private / "cert.pem"),
@@ -128,9 +197,7 @@ def main():
                 raise RuntimeError(f"wrong-password rejection failed: rc={bad.returncode} {bad.stderr}")
             results["wrong_disposable_credentials"] = "passed"
             for i in range(2):
-                good = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")], env=client_env,
-                                      capture_output=True, text=True, timeout=25)
-                (private / f"client-{i+1}.log").write_text(good.stdout + good.stderr)
+                good = resize_roundtrip(client_env, ipc_path, private / f"client-{i+1}.log")
                 if good.returncode or "NIRI_RDP_APP_KEY_POINTER_RELEASE_OK" not in good.stdout:
                     raise RuntimeError(f"real desktop RDP roundtrip {i} failed: rc={good.returncode} "
                                        f"{good.stdout} {good.stderr}")
@@ -138,6 +205,8 @@ def main():
                     raise RuntimeError("NVENC roundtrip used bitmap fallback instead of decoded AVC420")
                 results[f"real_desktop_roundtrip_{i+1}"] = "passed"
                 time.sleep(0.3)
+            results["client_initial_resolution_native_output_and_decoded_frame"] = "passed"
+            results["live_disp_portrait_landscape_odd_height_native_output_decode_input"] = "passed"
             log = (private / "app.log").read_text()
             for event in ("KEY 30 1", "KEY 30 0", "BUTTON 272 1", "BUTTON 272 0", "MOTION"):
                 if event not in log:
@@ -183,10 +252,12 @@ def main():
                 bridge_log = (private / "bridge.log").read_text()
                 if "NVENC H.264 preflight passed" not in bridge_log:
                     raise RuntimeError("requested NVENC encoder did not pass hardware preflight")
-                expected_graphics = 5 if gfx else 0
+                # Three normal clients recreate graphics at every live layout;
+                # held-input and crash probes retain their initial desktop.
+                expected_graphics = 3 * len(DESKTOP_SIZES) + 2 if gfx else 0
                 actual_graphics = bridge_log.count("RDP graphics using NVENC H.264 AVC420")
                 if actual_graphics != expected_graphics:
-                    raise RuntimeError(f"expected {expected_graphics} NVENC AVC420 sessions, "
+                    raise RuntimeError(f"expected {expected_graphics} NVENC AVC420 initializations, "
                                        f"observed {actual_graphics}")
                 key = ("nvenc_avc420_graphics_real_app_decode_input_reconnect" if gfx else
                        "nvenc_bitmap_fallback_for_client_without_graphics")

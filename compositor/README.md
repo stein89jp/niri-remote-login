@@ -23,7 +23,12 @@ library-managed RDP and the real compositor/app capture/input bridge.
 The broker's worker launches with `NIRI_BACKEND=headless`, a private runtime
 directory as `XDG_RUNTIME_DIR`, and `--config /etc/niri-rdp/headless.kdl`.
 It must never inherit a local display socket or run Niri with `--session`.
-The patch creates private `wayland-0` and HEADLESS-1 at 1920×1080, 60 Hz;
+The patch creates private `wayland-0` and HEADLESS-1 initially at 1920×1080, 60 Hz;
 scale=1 and transform=normal are enforced by the supplied config. Capture uses
 existing wlr SHM screencopy; input uses existing virtual keyboard/pointer
-protocols. No RDP protocol code lives in the compositor.
+protocols. The bridge changes the HEADLESS-1 mode through existing
+`zwlr_output_manager_v1` custom-mode configuration when a client connects or
+requests a new size. Changes preserve the output, workspaces and applications,
+update layout and announced capture geometry, and keep a single current mode.
+Dimensions remain bounded to 1–8192 and refresh to 1–240 Hz. No RDP protocol code
+lives in the compositor.

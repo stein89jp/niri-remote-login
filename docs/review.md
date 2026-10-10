@@ -100,7 +100,9 @@ Real PAM/logind cold-boot login, installed service-account GPU access,
 Windows mstsc behavior, physical-monitor power-off/disconnection, and
 end-to-end latency/bitrate measurements still need the separate-machine
 [acceptance procedure](acceptance.md). TLS-only broker authentication remains
-incompatible with NLA-required client policies. Dynamic resize, arbitrary
+incompatible with NLA-required client policies. Client-selected initial size and
+live single-display resize are implemented; see the
+[resolution contract](../bridge/README.md#dynamic-resolution). Arbitrary
 keyboard layouts, Pause/E1, Unicode/IME, clipboard and audio retain the existing
 documented limitations.
 

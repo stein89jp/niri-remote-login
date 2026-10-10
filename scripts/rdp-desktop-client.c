@@ -3,9 +3,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
+#include <unistd.h>
 #include <freerdp/freerdp.h>
 #include <freerdp/client/channels.h>
 #include <freerdp/client/cmdline.h>
+#include <freerdp/client/disp.h>
 #include <freerdp/gdi/gfx.h>
 #include <freerdp/settings.h>
 #include <freerdp/gdi/gdi.h>
@@ -16,10 +19,24 @@
 
 typedef struct {
     rdpContext context;
-    unsigned phase, avc_frames;
-    BOOL initialized, gfx_requested, gfx_failed;
+    unsigned phase, avc_frames, layout_index;
+    UINT32 expected_width, expected_height;
+    UINT16 pointer_x, pointer_y;
+    BOOL initialized, gfx_requested, gfx_failed, disp_ready, size_verified, awaiting_ack;
+    DispClientContext *disp;
     pcRdpgfxSurfaceCommand surface_command;
 } Probe;
+
+/* Negotiation allows odd widths; DISP widths are even. Exercise codec padding. */
+static const UINT32 layouts[][2] = {{1001, 701}, {702, 1001}, {1002, 701}, {702, 1001}};
+
+static UINT display_caps(DispClientContext *disp, UINT32 monitors, UINT32 a, UINT32 b) {
+    Probe *probe = disp->custom;
+    (void)a; (void)b;
+    if (monitors < 1) return CHANNEL_RC_BAD_CHANNEL;
+    probe->disp_ready = TRUE;
+    return CHANNEL_RC_OK;
+}
 
 static UINT decode_surface(RdpgfxClientContext *gfx, const RDPGFX_SURFACE_COMMAND *command) {
     rdpGdi *gdi = (rdpGdi *)gfx->custom;
@@ -32,6 +49,12 @@ static UINT decode_surface(RdpgfxClientContext *gfx, const RDPGFX_SURFACE_COMMAN
 
 static void channel_connected(void *context, const ChannelConnectedEventArgs *event) {
     Probe *probe = context;
+    if (strcmp(event->name, DISP_DVC_CHANNEL_NAME) == 0) {
+        probe->disp = event->pInterface;
+        probe->disp->custom = probe;
+        probe->disp->DisplayControlCaps = display_caps;
+        return;
+    }
     if (strcmp(event->name, RDPGFX_DVC_CHANNEL_NAME) != 0) return;
     RdpgfxClientContext *gfx = event->pInterface;
     if (!gdi_graphics_pipeline_init(probe->context.gdi, gfx)) {
@@ -44,12 +67,15 @@ static void channel_connected(void *context, const ChannelConnectedEventArgs *ev
 
 static void channel_disconnected(void *context, const ChannelDisconnectedEventArgs *event) {
     Probe *probe = context;
+    if (strcmp(event->name, DISP_DVC_CHANNEL_NAME) == 0) {
+        probe->disp = NULL;
+        probe->disp_ready = FALSE;
+    }
     if (strcmp(event->name, RDPGFX_DVC_CHANNEL_NAME) == 0 && probe->initialized)
         gdi_graphics_pipeline_uninit(probe->context.gdi, event->pInterface);
 }
 
 static BOOL pre_connect(freerdp *rdp) {
-    if (!((Probe *)rdp->context)->gfx_requested) return TRUE;
     return PubSub_SubscribeChannelConnected(rdp->context->pubSub, channel_connected) >= 0 &&
         PubSub_SubscribeChannelDisconnected(rdp->context->pubSub, channel_disconnected) >= 0;
 }
@@ -82,19 +108,29 @@ static BOOL end_paint(rdpContext *ctx) {
     Probe *probe = (Probe *)ctx;
     if (probe->gfx_failed) return FALSE;
     if (probe->gfx_requested && probe->avc_frames == 0) return TRUE;
+    if (ctx->gdi->width != (INT32)probe->expected_width ||
+        ctx->gdi->height != (INT32)probe->expected_height) return TRUE;
+    if (!probe->size_verified && contains_color(ctx->gdi, 180, 40, 30)) {
+        probe->size_verified = TRUE;
+        printf("NIRI_RDP_DESKTOP_SIZE %u %u\n", probe->expected_width, probe->expected_height);
+        probe->awaiting_ack = getenv("NIRI_RDP_TEST_RESIZE_ACK") != NULL;
+    }
+    if (!probe->size_verified || probe->awaiting_ack) return TRUE;
     if (probe->phase == 0 && contains_color(ctx->gdi, 180, 40, 30)) {
         if (!freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_DOWN, 30)) return FALSE;
         probe->phase = 1;
     } else if (probe->phase == 1 && contains_color(ctx->gdi, 30, 40, 180)) {
         if ((!getenv("NIRI_RDP_TEST_HOLD") && !getenv("NIRI_RDP_TEST_CRASH") &&
              !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_RELEASE, 30)) ||
-            !freerdp_input_send_mouse_event(ctx->input, PTR_FLAGS_MOVE, 320, 240) ||
-            !freerdp_input_send_mouse_event(ctx->input, PTR_FLAGS_BUTTON1 | PTR_FLAGS_DOWN, 320, 240)) return FALSE;
+            !freerdp_input_send_mouse_event(ctx->input, PTR_FLAGS_MOVE, probe->pointer_x, probe->pointer_y) ||
+            !freerdp_input_send_mouse_event(ctx->input, PTR_FLAGS_BUTTON1 | PTR_FLAGS_DOWN,
+                                           probe->pointer_x, probe->pointer_y)) return FALSE;
         probe->phase = 2;
     } else if (probe->phase == 2 && contains_color(ctx->gdi, 40, 180, 30)) {
         if (getenv("NIRI_RDP_TEST_CRASH")) return TRUE;
         if (getenv("NIRI_RDP_TEST_HOLD")) { probe->phase = 4; return TRUE; }
-        if (!freerdp_input_send_mouse_event(ctx->input, PTR_FLAGS_BUTTON1, 320, 240)) return FALSE;
+        if (!freerdp_input_send_mouse_event(ctx->input, PTR_FLAGS_BUTTON1,
+                                           probe->pointer_x, probe->pointer_y)) return FALSE;
         probe->phase = 3;
     } else if (probe->phase == 3 && contains_color(ctx->gdi, 180, 40, 30)) {
         probe->phase = 4;
@@ -126,22 +162,27 @@ static BOOL no_prompt(freerdp *rdp, char **user, char **password, char **domain,
 }
 
 int main(void) {
+    setvbuf(stdout, NULL, _IOLBF, 0);
     const char *user = getenv("NIRI_RDP_TEST_USERNAME");
     const char *pass = getenv("NIRI_RDP_TEST_PASSWORD");
     if (!user || !*user || !pass || !*pass) return 2;
     BOOL nla = getenv("NIRI_RDP_TEST_NLA") != NULL;
     BOOL gfx = getenv("NIRI_RDP_TEST_GFX") != NULL;
-    if (gfx && freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0) != 0)
+    if (freerdp_register_addin_provider(freerdp_channels_load_static_addin_entry, 0) != 0)
         return 2;
     freerdp *rdp = freerdp_new();
     if (!rdp) return 2;
     rdp->ContextSize = sizeof(Probe);
     rdp->PostConnect = post_connect;
     rdp->PreConnect = pre_connect;
-    if (gfx) rdp->LoadChannels = load_channels;
+    rdp->LoadChannels = load_channels;
     rdp->AuthenticateEx = no_prompt;
     if (!freerdp_context_new(rdp)) { freerdp_free(rdp); return 2; }
     ((Probe *)rdp->context)->gfx_requested = gfx;
+    ((Probe *)rdp->context)->expected_width = layouts[0][0];
+    ((Probe *)rdp->context)->expected_height = layouts[0][1];
+    ((Probe *)rdp->context)->pointer_x = layouts[0][0] / 2;
+    ((Probe *)rdp->context)->pointer_y = layouts[0][1] / 2;
     rdpSettings *s = rdp->context->settings;
     BOOL configured = freerdp_settings_set_string(s, FreeRDP_ServerHostname, "127.0.0.1") &&
         freerdp_settings_set_uint32(s, FreeRDP_ServerPort, 33991) &&
@@ -156,32 +197,61 @@ int main(void) {
         freerdp_settings_set_bool(s, FreeRDP_IgnoreCertificate, TRUE) &&
         freerdp_settings_set_bool(s, FreeRDP_SoftwareGdi, TRUE) &&
         freerdp_settings_set_bool(s, FreeRDP_SupportGraphicsPipeline, gfx) &&
-        freerdp_settings_set_bool(s, FreeRDP_SupportDynamicChannels, gfx) &&
+        freerdp_settings_set_bool(s, FreeRDP_SupportDynamicChannels, TRUE) &&
+        freerdp_settings_set_bool(s, FreeRDP_SupportDisplayControl, TRUE) &&
         freerdp_settings_set_bool(s, FreeRDP_GfxH264, gfx) &&
         freerdp_settings_set_bool(s, FreeRDP_GfxAVC444, FALSE) &&
         freerdp_settings_set_bool(s, FreeRDP_GfxAVC444v2, FALSE) &&
         freerdp_settings_set_bool(s, FreeRDP_CompressionEnabled, FALSE) &&
         freerdp_settings_set_bool(s, FreeRDP_BitmapCacheEnabled, FALSE) &&
-        freerdp_settings_set_uint32(s, FreeRDP_DesktopWidth, 640) &&
-        freerdp_settings_set_uint32(s, FreeRDP_DesktopHeight, 480) &&
+        freerdp_settings_set_uint32(s, FreeRDP_DesktopWidth, layouts[0][0]) &&
+        freerdp_settings_set_uint32(s, FreeRDP_DesktopHeight, layouts[0][1]) &&
         freerdp_settings_set_uint32(s, FreeRDP_ColorDepth, 32) &&
         freerdp_settings_set_uint32(s, FreeRDP_TcpConnectTimeout, 5000);
     int result = 2;
     if (configured && freerdp_connect(rdp)) {
         Probe *probe = (Probe *)rdp->context;
-        ULONGLONG deadline = GetTickCount64() + 15000;
-        while (probe->phase < 4 && GetTickCount64() < deadline) {
+        const BOOL resize = !getenv("NIRI_RDP_TEST_HOLD") && !getenv("NIRI_RDP_TEST_CRASH");
+        const unsigned final_layout = resize ? sizeof(layouts) / sizeof(layouts[0]) - 1 : 0;
+        ULONGLONG deadline = GetTickCount64() + 20000;
+        while ((probe->phase < 4 || probe->layout_index < final_layout) && GetTickCount64() < deadline) {
+            if (probe->awaiting_ack) {
+                struct pollfd ack = {.fd = STDIN_FILENO, .events = POLLIN};
+                if (poll(&ack, 1, 0) > 0) {
+                    char line[32];
+                    if (!fgets(line, sizeof(line), stdin) || strcmp(line, "continue\n") != 0) break;
+                    probe->awaiting_ack = FALSE;
+                }
+            }
+            if (probe->phase == 4 && probe->layout_index < final_layout && probe->disp_ready) {
+                const unsigned next = probe->layout_index + 1;
+                DISPLAY_CONTROL_MONITOR_LAYOUT monitor = {
+                    .Flags = DISPLAY_CONTROL_MONITOR_PRIMARY,
+                    .Width = layouts[next][0], .Height = layouts[next][1],
+                    .PhysicalWidth = 300, .PhysicalHeight = 200,
+                    .DesktopScaleFactor = 100, .DeviceScaleFactor = 100
+                };
+                if (probe->disp->SendMonitorLayout(probe->disp, 1, &monitor) != CHANNEL_RC_OK) break;
+                probe->layout_index = next;
+                probe->expected_width = layouts[next][0]; probe->expected_height = layouts[next][1];
+                probe->pointer_x = layouts[next][0] / 2; probe->pointer_y = layouts[next][1] / 2;
+                probe->size_verified = FALSE;
+                probe->phase = 0;
+            }
             HANDLE events[64];
             DWORD n = freerdp_get_event_handles(rdp->context, events, 64);
             if (!n || WaitForMultipleObjects(n, events, FALSE, 100) == WAIT_FAILED ||
                 !freerdp_check_event_handles(rdp->context)) break;
         }
-        if (probe->phase == 4 && (!gfx || probe->avc_frames > 0)) {
+        if (probe->phase == 4 && probe->layout_index == final_layout && (!gfx || probe->avc_frames > 0)) {
             puts("NIRI_RDP_APP_KEY_POINTER_RELEASE_OK");
+            if (resize) puts("NIRI_RDP_DYNAMIC_RESOLUTION_OK");
             if (gfx) printf("NIRI_RDP_AVC420_DECODED_FRAMES %u\n", probe->avc_frames);
             result = 0;
         }
-        else fprintf(stderr, "app input/frame acknowledgement failed in phase %u\n", probe->phase);
+        else fprintf(stderr, "app input/frame acknowledgement failed in phase %u layout %u, decoded %dx%d, expected %ux%u, DISP=%d\n",
+                     probe->phase, probe->layout_index, probe->context.gdi->width, probe->context.gdi->height,
+                     probe->expected_width, probe->expected_height, probe->disp_ready);
         if (!freerdp_disconnect(rdp)) result = 2;
     } else if (freerdp_get_last_error(rdp->context) == FREERDP_ERROR_AUTHENTICATION_FAILED ||
                freerdp_get_last_error(rdp->context) == FREERDP_ERROR_CONNECT_LOGON_FAILURE) {
