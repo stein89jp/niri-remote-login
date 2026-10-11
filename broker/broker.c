@@ -568,9 +568,11 @@ int main(int argc, char **argv) {
     struct passwd *frontend = getpwnam("niri-rdp"); if (!frontend || frontend->pw_uid == 0) return 1;
     uid_t frontend_uid = frontend->pw_uid; gid_t frontend_gid = frontend->pw_gid;
     if ((mkdir(ROOT "/sessions", 0700) && errno != EEXIST) ||
-        (mkdir(ROOT "/desktops", 0711) && errno != EEXIST)) return 1;
-    // umask(077) would remove traversal from mode0711.
-    if (chmod(ROOT "/desktops", 0711)) return 1;
+        (mkdir(ROOT "/desktops", 0755) && errno != EEXIST)) return 1;
+    // Bubblewrap opens every runtime ancestor for reading to mount D-Bus
+    // proxies. Keep the parent readable; individual desktops remain 0700.
+    // umask(077) would otherwise remove the parent's read/traversal permissions.
+    if (chmod(ROOT "/desktops", 0755)) return 1;
     int listener = socket(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0);
     struct sockaddr_un address = {.sun_family = AF_UNIX}; strcpy(address.sun_path, ROOT "/broker.sock");
     unlink(address.sun_path);

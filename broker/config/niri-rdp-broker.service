@@ -13,7 +13,9 @@ ExecStopPost=/usr/lib/niri-rdp/niri-rdp-broker --cleanup
 Restart=on-failure
 RestartSec=2
 RuntimeDirectory=niri-rdp
-RuntimeDirectoryMode=0711
+# Bubblewrap opens runtime ancestors for reading when mounting D-Bus proxies.
+# Session records and each user's desktop remain private (0700).
+RuntimeDirectoryMode=0755
 # Preserve crash session records until ExecStopPost handles them.
 RuntimeDirectoryPreserve=yes
 KillMode=control-group

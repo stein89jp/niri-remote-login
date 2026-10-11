@@ -87,6 +87,35 @@ for a certificate that has not yet been created:
 sudo niri-rdp-setup --user "$USER" --hostname YOUR_HOST_NAME_OR_IP
 ```
 
+## Flatpak applications and updates
+
+Flatpak's Bubblewrap helper needs read and traversal access to every parent of
+the private runtime directory. The broker therefore uses mode 0755 for
+`/run/niri-rdp` and `/run/niri-rdp/desktops`; individual desktop directories and
+session records remain private at mode 0700.
+
+Older packages used mode 0711 for these parents, causing application launches
+to fail with `bwrap: Can't mkdir parents for .../.dbus-proxy/: Permission denied`.
+After upgrading, the following also fixes an already-running remote desktop
+without restarting the broker or disconnecting:
+
+```sh
+sudo chmod 0755 /run/niri-rdp /run/niri-rdp/desktops
+```
+
+System-wide Flatpak changes can require administrator authentication in a
+remote login. A graphical updater needs a working Polkit authentication agent
+in the remote desktop. To update system-wide applications from a terminal with
+administrator authentication:
+
+```sh
+sudo flatpak update --system
+```
+
+Applications installed per user instead use `flatpak update --user` without
+sudo. The private session bus does not import the local desktop's service
+environment; portal and keyring integration may require additional setup.
+
 ## Connect with Windows Remote Desktop
 
 Open the regular Windows Remote Desktop client (`mstsc.exe`). Enter the host's

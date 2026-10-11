@@ -24,8 +24,11 @@ main installation documentation.
 The root system service listens only on `/run/niri-rdp/broker.sock`, not TCP.
 It requires the peer's kernel-reported UID to equal the dedicated `niri-rdp`
 frontend account. The socket is root:niri-rdp mode 0660. Its parent is root-owned
-mode 0711 so desktop UIDs can traverse to their own private runtime; session
-records are 0700 and every desktop runtime is 0700 owned by its account.
+mode 0755 so desktop UIDs and Bubblewrap can read and traverse the runtime
+ancestors. Bubblewrap opens parent directories for reading when mounting
+Flatpak's D-Bus proxies; mode 0711 prevents Flatpak applications from starting.
+The desktops parent is also 0755; session records are 0700 and every desktop
+runtime is 0700 owned by its account.
 
 Requests contain only a Linux username and password. The frontend cannot choose
 an executable, arguments, session environment, account UID, socket path or
