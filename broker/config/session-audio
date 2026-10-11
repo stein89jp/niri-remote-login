@@ -1,11 +1,82 @@
 #!/usr/bin/python3
 """Private PipeWire graph and a reconnectable, bounded S16LE monitor socket."""
+from collections import deque
 import os
 from pathlib import Path
+import selectors
 import signal
 import socket
 import subprocess
 import time
+
+
+BLOCK_BYTES = 3840  # 20 ms of stereo S16LE at 48 kHz
+
+
+def relay_capture(connection, source):
+    """Drain capture during client stalls, retaining at most three PCM blocks.
+
+    A partly sent block must finish to preserve the byte stream's sample
+    alignment. A small FIFO absorbs ordinary PipeWire quantum batching; only
+    capture older than this 60 ms budget is replaced during backpressure.
+    """
+    connection.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, BLOCK_BYTES * 3)
+    connection.setblocking(False)
+    os.set_blocking(source.fileno(), False)
+    partial = bytearray()
+    queued = deque()
+    offset = 0
+    with selectors.DefaultSelector() as selector:
+        selector.register(source, selectors.EVENT_READ)
+        selector.register(connection, selectors.EVENT_READ)
+        while True:
+            # Register write interest only when there is data: otherwise a
+            # healthy socket would spin continuously while capture is silent.
+            selector.modify(connection, selectors.EVENT_READ |
+                            (selectors.EVENT_WRITE if queued else 0))
+            events = selector.select(timeout=0.1)
+            ready = {key.fileobj: mask for key, mask in events}
+            if ready.get(connection, 0) & selectors.EVENT_READ:
+                try:
+                    if not connection.recv(1):
+                        return
+                except BlockingIOError:
+                    pass
+            if ready.get(source, 0) & selectors.EVENT_READ:
+                # Bound each drain turn so disconnects remain responsive even
+                # when a producer is faster than real-time.
+                for _ in range(64):
+                    try:
+                        data = os.read(source.fileno(), BLOCK_BYTES * 16)
+                    except BlockingIOError:
+                        break
+                    if not data:
+                        return
+                    partial.extend(data)
+                    complete = len(partial) // BLOCK_BYTES
+                    if complete:
+                        for position in range(complete):
+                            queued.append(bytes(partial[position * BLOCK_BYTES:(position + 1) * BLOCK_BYTES]))
+                            if len(queued) > 3:
+                                # Finish a partly written front block, dropping
+                                # its oldest unsent successor when overloaded.
+                                if offset:
+                                    del queued[1]
+                                else:
+                                    queued.popleft()
+                        del partial[:complete * BLOCK_BYTES]
+            if queued:
+                try:
+                    sent = connection.send(queued[0][offset:])
+                except BlockingIOError:
+                    continue
+                if sent == 0:
+                    return
+                offset += sent
+                if offset == len(queued[0]):
+                    queued.popleft()
+                    offset = 0
+
 
 
 def capture(connection, environment):
@@ -22,11 +93,9 @@ def capture(connection, environment):
     process = subprocess.Popen([
         "/usr/bin/parec", "--raw", "--format=s16le", "--rate=48000",
         "--channels=2", "--device=niri-rdp-sink.monitor", "--latency-msec=20",
-    ], env=environment, stdout=subprocess.PIPE)
+    ], env=environment, stdout=subprocess.PIPE, bufsize=0, pipesize=4096)
     try:
-        connection.settimeout(0.5)
-        while data := process.stdout.read(3840):
-            connection.sendall(data)
+        relay_capture(connection, process.stdout)
     except OSError:
         pass
     finally:

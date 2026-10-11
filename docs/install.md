@@ -272,8 +272,31 @@ the [actual-machine checks](acceptance.md).
 
 `NIRI_RDP_FPS` in `frontend.conf` limits capture/transmission to 1–60 frames per
 second (default 60 for NVENC, 30 for bitmap). `NIRI_RDP_BITRATE_MBPS` accepts
-1–100 megabits per second (default 12). Reduce the frame rate
-or bitrate for limited networks; increasing bitrate can improve AVC420 quality.
+1–100 megabits per second (default 12) as the NVENC bitrate ceiling. Each
+connection starts at that ceiling and adapts down toward 1 Mbps when graphics
+acknowledgements slow relative to the connection's baseline, stall, or report a
+client decoding backlog. It recovers gradually when delivery stays healthy.
+Changes apply to the live encoder without resetting the desktop. Reduce the
+frame rate or ceiling for limited networks; increasing the ceiling can improve
+AVC420 quality when the connection has enough bandwidth. Bitmap fallback does
+not use this bitrate controller.
+
+Audio is paced in 20 ms blocks and keeps recent capture samples when the source
+or network stalls. The frontend also observes playback confirmations after
+receipt confirmations, so a client reporting excessive playback buffering can
+drain before current sound resumes. Recovery may skip sound during congestion.
+These controls limit accumulating delay; they do not establish a shared audio
+and video presentation clock or guarantee a particular sound offset on mstsc.
+Uncompressed stereo audio itself uses about 1.54 Mbps before framing.
+
+To investigate remaining delay, inspect the frontend journal for `RDP audio
+client playback delay` and `RDP graphics adaptive H.264 target`. Test a clip with visible
+claps or simultaneous flash/tone for several minutes, then repeat after a short
+network stall. Record whether the offset stays constant or keeps growing; see
+the [audio/video acceptance check](acceptance.md). When upgrading from an active
+RDP desktop, build first and arrange the service restart from a local terminal
+or SSH: restarting the frontend disconnects the client, and stopping the broker
+logs out the desktop.
 
 The default `NIRI_RDP_ENCODER=bitmap` sends bitmap updates. A rebuilt frontend
 supports `NIRI_RDP_ENCODER=nvenc`, which passes captured desktop frames to

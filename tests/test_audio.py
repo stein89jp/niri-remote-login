@@ -1,4 +1,6 @@
 """Actual private PipeWire playback and monitor capture; no host service changes."""
+import importlib.machinery
+import importlib.util
 import math
 import os
 from pathlib import Path
@@ -13,6 +15,113 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class CaptureBackpressureTests(unittest.TestCase):
+    def test_stalled_frontend_keeps_recent_aligned_sound_and_capture_drain(self):
+        loader = importlib.machinery.SourceFileLoader("session_audio", str(ROOT / "broker/config/session-audio"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        source_fd, writer_fd = os.pipe()
+        source = os.fdopen(source_fd, "rb", buffering=0)
+        client, capture = socket.socketpair()
+        errors = []
+        def run():
+            try:
+                module.relay_capture(capture, source)
+            except OSError:
+                # Closing the client may race the final socket write.
+                pass
+            except Exception as error:
+                errors.append(error)
+        worker = threading.Thread(target=run)
+        worker.start()
+        try:
+            # No frontend reads while capture advances by two seconds. The
+            # source writer must finish, proving socket stalls do not back up
+            # parec's stdout and then its monitor stream.
+            def produce():
+                for number in range(100):
+                    block = bytes([number]) * module.BLOCK_BYTES
+                    # Deliberately fragment one stereo frame across writes.
+                    os.write(writer_fd, block[:7])
+                    os.write(writer_fd, block[7:])
+                    time.sleep(0.001)
+            writer = threading.Thread(target=produce, daemon=True)
+            writer.start()
+            writer.join(timeout=2)
+            self.assertFalse(writer.is_alive(), "capture must drain while client stalls")
+            client.settimeout(2)
+            received = bytearray()
+            while len(received) < module.BLOCK_BYTES or received[-module.BLOCK_BYTES:] != bytes([99]) * module.BLOCK_BYTES:
+                data = client.recv(module.BLOCK_BYTES)
+                self.assertTrue(data)
+                received.extend(data)
+            self.assertLess(len(received), module.BLOCK_BYTES * 16, "buffered capture must stay below 320 ms")
+            self.assertEqual(len(received) % module.BLOCK_BYTES, 0)
+            for offset in range(0, len(received), module.BLOCK_BYTES):
+                block = received[offset:offset + module.BLOCK_BYTES]
+                self.assertEqual(block, bytes([block[0]]) * module.BLOCK_BYTES,
+                                 "partial sends and reads must retain sample alignment")
+        finally:
+            client.close()
+            worker.join(timeout=2)
+            os.close(writer_fd)
+            capture.close()
+            source.close()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
+
+
+    def test_regular_pipewire_quantum_batching_preserves_every_sample(self):
+        loader = importlib.machinery.SourceFileLoader("session_audio_quantum", str(ROOT / "broker/config/session-audio"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        module = importlib.util.module_from_spec(spec)
+        loader.exec_module(module)
+        source_fd, writer_fd = os.pipe()
+        source = os.fdopen(source_fd, "rb", buffering=0)
+        client, capture = socket.socketpair()
+        errors = []
+        def relay():
+            try:
+                module.relay_capture(capture, source)
+            except OSError:
+                pass
+            except Exception as error:
+                errors.append(error)
+        worker = threading.Thread(target=relay)
+        worker.start()
+        # 1024 stereo samples per21.33ms PipeWire quantum periodically
+        # complete TWO3840-byte waves. Neither may be discarded when healthy.
+        quantum = 4096
+        samples = b"".join(struct.pack("<I", number) for number in range(quantum * 32 // 4))
+        def produce():
+            started = time.monotonic()
+            for position in range(0, len(samples), quantum):
+                deadline = started + position / 192000
+                time.sleep(max(0, deadline - time.monotonic()))
+                os.write(writer_fd, samples[position:position + quantum])
+        writer = threading.Thread(target=produce, daemon=True)
+        writer.start()
+        try:
+            client.settimeout(2)
+            expected = samples[:len(samples) // module.BLOCK_BYTES * module.BLOCK_BYTES]
+            received = bytearray()
+            while len(received) < len(expected):
+                data = client.recv(module.BLOCK_BYTES)
+                self.assertTrue(data)
+                received.extend(data)
+            self.assertEqual(received, expected, "healthy quantum batching must preserve every PCM sample")
+        finally:
+            writer.join(timeout=2)
+            client.close()
+            worker.join(timeout=2)
+            os.close(writer_fd)
+            capture.close()
+            source.close()
+        self.assertFalse(worker.is_alive())
+        self.assertEqual(errors, [])
 
 
 @unittest.skipUnless(all(shutil.which(x) for x in

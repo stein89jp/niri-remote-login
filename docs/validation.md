@@ -1,5 +1,38 @@
 # Validation record
 
+## Audio delay and adaptive NVENC bitrate, 2026-10-12
+
+Package release `0.1.0-9` separates audio receipt credits from playback feedback,
+paces PCM at a 20 ms cadence, and bounds capture FIFOs to three blocks (60 ms).
+The capture relay drains its source even when the frontend stalls. Seven Rust
+audio tests cover format negotiation, transport credit, playback delay, duplicate
+and wrapped confirmations, bursts, partial blocks and healthy sample continuity.
+Three Python tests pass, including real private PipeWire tone playback/reconnect
+and exact PCM coverage with 4096-byte producer quanta at 21.33 ms intervals.
+
+NVENC bitrate adapts independently for each graphics connection using frame ACK
+latency relative to its baseline, queued bytes, and missing acknowledgements.
+Tests cover reduction, recovery, bounds, long RTT, ACK suspension, connection
+isolation and uninterrupted software decoding across live rate changes. An
+opt-in test on the host GPU encoded 180 noisy frames in one NVENC context at
+12, 2 and 8 Mbps (60 frames each). Encoded phase sizes were 1,362,510, 325,776 and
+942,540 bytes; all 180 frames decoded cleanly. Reproduce with:
+
+```sh
+NIRI_RDP_TEST_NVENC=1 python3 -m unittest tests.test_native_video -v
+CARGO_HOME="$PWD/poc/.cargo-cache" cargo test --locked --offline --manifest-path bridge/Cargo.toml
+python3 -m unittest tests.test_audio -v
+```
+
+The release frontend also passed disposable NVENC and bitmap-fallback desktop
+integration: decoded changing frames, keyboard/pointer input, live resizing,
+reconnect and compositor failure, using the TLS namespace broker fixture.
+Reports are `artifacts/audio-video-nvenc-integration.log` and
+`artifacts/audio-video-bitmap-fallback-integration.log`. These fixtures do not
+measure Windows audio presentation. No installed services were restarted during
+development; actual mstsc lip-sync, sound continuity under a constrained link,
+and recovery time remain the [audio/video acceptance check](acceptance.md).
+
 ## NVIDIA performance, 2026-10-10
 
 The `0.1.0-5` source prefers NVIDIA hardware EGL compositor rendering, advertises

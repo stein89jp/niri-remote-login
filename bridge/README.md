@@ -110,7 +110,13 @@ Unchanged desktop pixels skip conversion, GPU upload and transmission. Capture
 heartbeats continue so decoder recovery, minimize/resume and channel negotiation
 can request a new IDR even on a static desktop. Encoding keeps one pending task
 and graphics backpressure bounds unacknowledged frames. Set
-`NIRI_RDP_BITRATE_MBPS=1..100` to tune H.264 quality/network use (default 12 Mbps).
+`NIRI_RDP_BITRATE_MBPS=1..100` sets the H.264 bitrate ceiling (default 12 Mbps).
+Each connection adapts bitrate toward a 1 Mbps floor when graphics ACK latency
+rises above its baseline, acknowledgements stall, or the client reports a
+decoding backlog. It recovers slowly after healthy delivery and updates the
+live NVENC rate control without recreating the encoder. Tracking stays bounded
+and resets for reconnects; the graphics acknowledgement-suspension sentinel is
+handled as a protocol mode. Bitmap fallback retains its existing transport.
 See [installation](../docs/install.md#optional-nvidia-encoding) for GPU access and
 renderer policy configuration. This remains a SHM capture path with CPU color
 conversion; it does not claim zero-copy GPU capture and encoding.
@@ -227,8 +233,17 @@ Playback is stereo 48 kHz, signed 16-bit little-endian PCM, in 20 ms blocks
 accept this format. No microphone redirection is provided. Audio starts after
 successful Linux authentication, including submission through the login form.
 Disconnect closes capture; authenticated reconnect opens a fresh monitor of the
-retained desktop. At most four waves await confirmation, and capture continues
-draining during client stalls so stale samples do not accumulate in memory.
+retained desktop. At most four waves await receipt confirmation. A separate
+bounded history retains playback feedback after receipt acknowledgements: when
+the client reports more than 120 ms of playback buffering, capture is discarded
+while that buffer drains. A client sending only one confirmation remains usable.
+The bridge paces blocks at a 20 ms cadence and retains a three-block (60 ms)
+capture FIFO to absorb ordinary PipeWire batching. Excess backlog drops the
+oldest complete blocks while preserving partial-sample alignment. The session monitor
+also drains capture continuously through socket stalls with bounded buffers.
+This trades skipped sound during congestion for recovery to current playback.
+It does not synchronize the client's audio and graphics presentation clocks;
+actual Windows lip-sync and recovery still need measurement.
 Disposable compositor mode has no audio backend.
 
 `python3 -m unittest tests.test_audio -v` runs real private PipeWire playback,

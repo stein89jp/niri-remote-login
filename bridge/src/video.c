@@ -39,6 +39,17 @@ static void error_text(char *error, size_t length, const char *step, int code) {
     snprintf(error, length, "%s: %s", step, detail);
 }
 
+/* FFmpeg's NVENC wrapper reconfigures rate control before the next frame when
+   these public context fields change. Keep the context alive; FFmpeg requests
+   an IDR as part of NVENC's rate reconfiguration for decoder continuity. */
+int niri_video_set_bitrate(struct niri_video *v, int bitrate) {
+    if (!v || bitrate < 1000000 || bitrate > 100000000) return -1;
+    v->codec->bit_rate = bitrate;
+    v->codec->rc_max_rate = bitrate;
+    v->codec->rc_buffer_size = bitrate / v->codec->framerate.num;
+    return 0;
+}
+
 /* software is used by regression tests only; production always requests NVENC. */
 struct niri_video *niri_video_new(int width, int height, int software, int fps, int bitrate,
                                  char *error, size_t length) {

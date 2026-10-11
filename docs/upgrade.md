@@ -43,6 +43,15 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+The audio pacing and adaptive bitrate changes are included in package release 9.
+Build with `makepkg` (without `-i`) while your remote session remains active.
+Install and restart from a local terminal or an independent SSH session when
+you are ready for the RDP connection to drop. The frontend needs restarting to
+load the new bridge. A retained desktop keeps its running audio helper; log out
+of that desktop and start a fresh login to load the new capture relay as well.
+Stopping the broker logs out all retained desktops, so save application work
+before following the full upgrade procedure below.
+
 On the intended host, update the checkout and run `makepkg -si` again from
 `packaging/arch/niri-rdp`. The local sources are copied under content-addressed
 names so changed files cannot accidentally reuse stale cached inputs. Stop both

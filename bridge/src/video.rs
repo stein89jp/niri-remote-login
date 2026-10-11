@@ -31,6 +31,7 @@ unsafe extern "C" {
         length: usize,
     ) -> *mut c_void;
     fn niri_video_free(encoder: *mut c_void);
+    fn niri_video_set_bitrate(encoder: *mut c_void, bitrate: c_int) -> c_int;
     fn niri_video_encode(
         encoder: *mut c_void,
         pixels: *const u8,
@@ -46,6 +47,7 @@ pub struct Encoder {
     ptr: *mut c_void,
     width: u16,
     height: u16,
+    bitrate: u32,
 }
 // The FFmpeg context has a single owner; access from encoding tasks is serialized.
 unsafe impl Send for Encoder {}
@@ -55,6 +57,23 @@ impl Drop for Encoder {
     }
 }
 impl Encoder {
+    fn set_bitrate(&mut self, bitrate: u32) -> anyhow::Result<()> {
+        if bitrate == self.bitrate {
+            return Ok(());
+        }
+        anyhow::ensure!(
+            (1_000_000..=100_000_000).contains(&bitrate)
+                && unsafe { niri_video_set_bitrate(self.ptr, bitrate as c_int) } == 0,
+            "invalid adaptive H.264 bitrate"
+        );
+        eprintln!(
+            "RDP graphics adaptive H.264 target: {} -> {} kbps",
+            self.bitrate / 1000,
+            bitrate / 1000
+        );
+        self.bitrate = bitrate;
+        Ok(())
+    }
     pub fn nvenc(width: u16, height: u16) -> anyhow::Result<Self> {
         Self::new(width, height, false)
     }
@@ -63,6 +82,7 @@ impl Encoder {
             width >= 1 && height >= 1 && width <= 4096 && height <= 4096,
             "H.264 dimensions must be within 1..4096"
         );
+        let bitrate = crate::performance::bitrate()?;
         let mut error = [0 as c_char; 256];
         let ptr = unsafe {
             niri_video_new(
@@ -70,7 +90,7 @@ impl Encoder {
                 height.into(),
                 software.into(),
                 crate::performance::frame_rate()? as c_int,
-                crate::performance::bitrate()? as c_int,
+                bitrate as c_int,
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -80,7 +100,12 @@ impl Encoder {
             "{}",
             unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
         );
-        Ok(Self { ptr, width, height })
+        Ok(Self {
+            ptr,
+            width,
+            height,
+            bitrate,
+        })
     }
     fn encode_frame(
         encoder: &mut Option<Self>,
@@ -145,6 +170,7 @@ struct Shared {
     sender: Option<UnboundedSender<ServerEvent>>,
     generation: Arc<AtomicU64>,
     suppressed: Arc<AtomicBool>,
+    rate: Arc<Mutex<crate::performance::AdaptiveBitrate>>,
 }
 #[derive(Clone, Default)]
 pub struct Video(Arc<Mutex<Shared>>);
@@ -175,7 +201,13 @@ impl Video {
                 )?;
                 encoder.encode(&image, true)?;
                 eprintln!("NVENC H.264 preflight passed; AVC420-capable clients use host encoding");
-                Ok(Some(Self::default()))
+                let video = Self::default();
+                *video.0.lock().unwrap().rate.lock().unwrap() =
+                    crate::performance::AdaptiveBitrate::new(
+                        crate::performance::bitrate()?,
+                        Instant::now(),
+                    );
+                Ok(Some(video))
             }
             _ => anyhow::bail!("NIRI_RDP_ENCODER must be bitmap or nvenc"),
         }
@@ -217,20 +249,32 @@ impl Video {
             generation: state.generation.clone(),
             known_generation: state.generation.load(Ordering::SeqCst),
             suppressed: state.suppressed.clone(),
+            rate: state.rate.clone(),
         }))
     }
     pub fn set_suppressed(&self, suppressed: Arc<AtomicBool>) {
         self.0.lock().unwrap().suppressed = suppressed;
     }
 }
-struct Handler(Arc<AtomicU64>);
+struct Handler(
+    Arc<AtomicU64>,
+    Arc<Mutex<crate::performance::AdaptiveBitrate>>,
+);
 impl GraphicsPipelineHandler for Handler {
     fn capabilities_advertise(&mut self, _: &CapabilitiesAdvertisePdu) {
         self.0.fetch_add(1, Ordering::SeqCst);
+        self.1.lock().unwrap().reset_frames();
     }
     fn on_ready(&mut self, _: &CapabilitySet) {}
     fn on_close(&mut self) {
         self.0.fetch_add(1, Ordering::SeqCst);
+        self.1.lock().unwrap().reset_frames();
+    }
+    fn on_frame_ack(&mut self, frame_id: u32, queue_depth: u32, _: u32) {
+        self.1
+            .lock()
+            .unwrap()
+            .acknowledged(frame_id, queue_depth, Instant::now());
     }
     fn max_frames_in_flight(&self) -> u32 {
         2
@@ -243,17 +287,24 @@ impl ServerEventSender for Video {
 }
 impl GfxServerFactory for Video {
     fn build_gfx_handler(&self) -> Box<dyn GraphicsPipelineHandler> {
-        Box::new(Handler(Arc::new(AtomicU64::new(0))))
+        Box::new(Handler(Arc::new(AtomicU64::new(0)), Arc::default()))
     }
     fn build_server_with_handle(&self) -> Option<(GfxDvcBridge, GfxServerHandle)> {
         // A new context per connection prevents surfaces/acks crossing authenticated sessions.
         let generation = Arc::new(AtomicU64::new(0));
+        let mut state = self.0.lock().unwrap();
+        let ceiling = state.rate.lock().unwrap().ceiling();
+        let rate = Arc::new(Mutex::new(crate::performance::AdaptiveBitrate::new(
+            ceiling,
+            Instant::now(),
+        )));
         let handle = Arc::new(Mutex::new(GraphicsPipelineServer::new(Box::new(Handler(
             generation.clone(),
+            rate.clone(),
         )))));
-        let mut state = self.0.lock().unwrap();
         state.handle = Some(handle.clone());
         state.generation = generation;
+        state.rate = rate;
         Some((GfxDvcBridge::new(handle.clone()), handle))
     }
 }
@@ -292,6 +343,7 @@ struct VideoUpdates {
     generation: Arc<AtomicU64>,
     known_generation: u64,
     suppressed: Arc<AtomicBool>,
+    rate: Arc<Mutex<crate::performance::AdaptiveBitrate>>,
 }
 impl VideoUpdates {
     fn unchanged(&self, image: &BitmapUpdate) -> bool {
@@ -341,6 +393,9 @@ impl VideoUpdates {
         );
         // If a reference frame is dropped, the next accepted frame must be an IDR.
         self.force_idr = frame.is_none();
+        if let Some(id) = frame {
+            self.rate.lock().unwrap().sent(id, Instant::now());
+        }
         let channel = gfx
             .channel_id()
             .ok_or_else(|| server_error("graphics channel missing"))?;
@@ -402,6 +457,7 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                     self.last_image = None;
                     self.surface = None;
                     self.force_idr = true;
+                    self.rate.lock().unwrap().reset_frames();
                     let mut gfx = self.handle.lock().unwrap();
                     if gfx.is_ready() && gfx.supports_avc420() {
                         gfx.resize(size.width, size.height);
@@ -434,6 +490,7 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                     return Ok(Some(DisplayUpdate::Bitmap(image)));
                 }
                 if gfx.should_backpressure() {
+                    self.rate.lock().unwrap().check_stall(Instant::now());
                     continue;
                 }
             }
@@ -447,10 +504,18 @@ impl RdpServerDisplayUpdates for VideoUpdates {
             self.last_image = Some(image.clone());
             let encoder = self.encoder.clone();
             let force_idr = self.force_idr;
+            let bitrate = self.rate.lock().unwrap().current();
             // Encoder initialization and GPU submission run off the input/network thread.
             let task = tokio::task::spawn_blocking(move || {
                 let mut encoder = encoder.lock().unwrap();
-                Encoder::encode_frame(&mut encoder, &image, force_idr, Encoder::nvenc)
+                if let Some(encoder) = encoder.as_mut() {
+                    encoder.set_bitrate(bitrate)?;
+                }
+                Encoder::encode_frame(&mut encoder, &image, force_idr, |w, h| {
+                    let mut encoder = Encoder::nvenc(w, h)?;
+                    encoder.set_bitrate(bitrate)?;
+                    Ok(encoder)
+                })
             });
             self.pending = Some((task, width, height, generation));
         }
@@ -549,6 +614,7 @@ mod tests {
                 generation: state.generation.clone(),
                 known_generation: 0,
                 suppressed: state.suppressed.clone(),
+                rate: state.rate.clone(),
             },
             receiver,
         )
@@ -1102,6 +1168,89 @@ mod tests {
             }
         }
         assert_eq!(checked, 3);
+    }
+    #[test]
+    fn graphics_ack_feedback_changes_rate_and_new_connections_reset_it() {
+        use ironrdp_egfx::pdu::{FrameAcknowledgePdu, QueueDepth};
+        let (mut stream, mut events) = updates(vec![]);
+        advertise(&stream.handle, true);
+        let now = Instant::now();
+        *stream.rate.lock().unwrap() =
+            crate::performance::AdaptiveBitrate::new(12_000_000, now - Duration::from_secs(2));
+        stream.submit(&[0, 0, 0, 1, 0x65], 64, 64).unwrap();
+        let id = graphics_pdus(events.try_recv().unwrap())
+            .into_iter()
+            .find_map(|pdu| {
+                if let GfxPdu::StartFrame(frame) = pdu {
+                    Some(frame.frame_id)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        stream
+            .rate
+            .lock()
+            .unwrap()
+            .sent(id, now - Duration::from_secs(1));
+        let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+            queue_depth: QueueDepth::AvailableBytes(1_000_000),
+            frame_id: id,
+            total_frames_decoded: 1,
+        });
+        stream
+            .handle
+            .lock()
+            .unwrap()
+            .process(7, &ironrdp_core::encode_vec(&ack).unwrap())
+            .unwrap();
+        assert_eq!(stream.rate.lock().unwrap().current(), 9_000_000);
+        let video = Video::default();
+        video.0.lock().unwrap().rate = stream.rate.clone();
+        video.build_server_with_handle().unwrap();
+        let new_rate = video.0.lock().unwrap().rate.clone();
+        assert!(!Arc::ptr_eq(&new_rate, &stream.rate));
+        assert_eq!(new_rate.lock().unwrap().current(), 12_000_000);
+    }
+    #[test]
+    fn rate_changes_keep_a_decodable_stream() {
+        let mut encoder = Encoder::new(64, 64, true).unwrap();
+        let DisplayUpdate::Bitmap(mut image) = image() else {
+            unreachable!()
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let stream = dir.path().join("adaptive.h264");
+        let mut file = std::fs::File::create(&stream).unwrap();
+        for (index, rate) in [12_000_000, 6_000_000, 1_000_000, 3_000_000, 12_000_000]
+            .into_iter()
+            .enumerate()
+        {
+            encoder.set_bitrate(rate).unwrap();
+            image.data = vec![30 + index as u8 * 40; 64 * 64 * 4].into();
+            file.write_all(&encoder.encode(&image, index == 0).unwrap())
+                .unwrap();
+        }
+        assert!(encoder.set_bitrate(999_999).is_err());
+        assert!(encoder.set_bitrate(100_000_001).is_err());
+        drop(file);
+        let output = Command::new("ffmpeg")
+            .args(["-v", "error", "-threads", "1", "-i"])
+            .arg(stream)
+            .args([
+                "-f", "rawvideo", "-pix_fmt", "bgra", "-threads", "1", "pipe:1",
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "decoder reported reference corruption"
+        );
+        assert_eq!(output.stdout.len(), 64 * 64 * 4 * 5);
     }
     #[test]
     fn encoded_frames_decode_and_idr_survives_a_dropped_reference() {

@@ -32,6 +32,10 @@ int main(void) {
                                                  12000000, error, sizeof(error));
             assert(v);
             const uint8_t *packet;
+            assert(niri_video_set_bitrate(NULL, 12000000) == -1);
+            assert(niri_video_set_bitrate(v, 999999) == -1);
+            assert(niri_video_set_bitrate(v, 100000001) == -1);
+            assert(v->codec->bit_rate == 12000000);
 
             assert(niri_video_encode(v, pixels, stride, 1, &packet, error, sizeof(error)) > 0);
             if (v->rgb) assert(av_frame_is_writable(v->rgb));
@@ -58,6 +62,10 @@ int main(void) {
                 pixels[k] = pixels[k + 1] = 0;
                 pixels[k + 2] = pixels[k + 3] = 255;
             }
+            assert(niri_video_set_bitrate(v, 4000000) == 0);
+            assert(v->codec->bit_rate == 4000000);
+            assert(v->codec->rc_max_rate == 4000000);
+            assert(v->codec->rc_buffer_size == 4000000 / 60);
             assert(niri_video_encode(v, pixels, stride, 1, &packet, error, sizeof(error)) > 0);
             if (v->rgb) assert(av_frame_is_writable(v->rgb));
             for (int p = 0; p < (nv12 ? 2 : 3); ++p) {
@@ -72,6 +80,7 @@ int main(void) {
                     }
             }
             if (width * height >= 640 * 480) {
+                assert(niri_video_set_bitrate(v, 12000000) == 0);
                 for (int white = 0; white <= 1; ++white) {
                     memset(pixels, white ? 255 : 0, length);
                     assert(niri_video_encode(v, pixels, stride, 1, &packet, error, sizeof(error)) > 0);

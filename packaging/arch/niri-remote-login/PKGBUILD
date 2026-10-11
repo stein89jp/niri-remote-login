@@ -2,13 +2,13 @@
 # Build without -i/-s: never install dependencies or this package on the host.
 pkgname=niri-remote-login
 pkgver=0.1.0
-pkgrel=7
+pkgrel=9
 pkgdesc='Niri RDP host bridge and PAM/logind session broker'
 arch=('x86_64')
 # Bridge source is MIT; the combined binary links Arch's GPL-licensed FFmpeg.
 license=('MIT' 'GPL-3.0-only')
 options=('!debug' '!lto')
-depends=('niri-rdp-headless>=26.04.remote1-4' 'pam' 'systemd' 'systemd-libs' 'dbus' 'wayland' 'libxkbcommon' 'xkeyboard-config' 'foot' 'fuzzel' 'waybar' 'ttf-dejavu' 'ffmpeg' 'openssl' 'python')
+depends=('niri-rdp-headless>=26.04.remote1-4' 'pam' 'systemd' 'systemd-libs' 'dbus' 'wayland' 'libxkbcommon' 'xkeyboard-config' 'foot' 'fuzzel' 'waybar' 'ttf-dejavu' 'ffmpeg' 'openssl' 'python' 'pipewire' 'pipewire-pulse' 'wireplumber' 'libpulse')
 makedepends=('rust>=1.94' 'cargo' 'gcc' 'pkgconf' 'python')
 backup=('etc/niri-rdp/frontend.conf' 'etc/niri-rdp/headless.kdl' 'etc/niri-rdp/waybar.json' 'etc/niri-rdp/renderer.conf' 'etc/pam.d/niri-rdp')
 source=("niri-remote-login-$pkgver.tar.gz")
@@ -35,7 +35,7 @@ check() {
   export CARGO_HOME="$srcdir/cargo-home"
   env -u CFLAGS -u CXXFLAGS cargo test --locked --offline --manifest-path bridge/Cargo.toml
   make -C broker check
-  python -m unittest tests.test_host_setup tests.test_native_video -v
+  python -m unittest tests.test_host_setup tests.test_native_video tests.test_audio -v
 }
 
 package() {
