@@ -35,15 +35,19 @@ while [ ! -S "$NIRI_RDP_RUNTIME_DIR/audio-0" ]; do
 done
 # Reuse the user's desktop settings without starting the shared user services.
 config=/etc/niri-rdp/headless.kdl
+inherit_desktop=0
 remote_config="${XDG_CONFIG_HOME:-$HOME/.config}/niri-rdp/config.kdl"
 desktop_config="${XDG_CONFIG_HOME:-$HOME/.config}/niri/config.kdl"
 if [ -f "$remote_config" ]; then
     config="$remote_config"
 elif [ -f "$desktop_config" ]; then
-    config="$NIRI_RDP_RUNTIME_DIR/config.kdl"
-    # The include retains the original file's relative include paths (DMS
-    # output/color snippets). Escape paths as KDL, including control characters.
-    /usr/bin/python3 - "$desktop_config" "$config" <<'PY'
+    config="$desktop_config"
+    inherit_desktop=1
+fi
+# Every configuration needs portal startup after Niri sets WAYLAND_DISPLAY.
+# The include retains the original file's relative include paths (DMS snippets).
+# Escape paths as KDL, including control characters.
+/usr/bin/python3 - "$config" "$NIRI_RDP_RUNTIME_DIR/config.kdl" "$inherit_desktop" <<'PY'
 import pathlib
 import sys
 source = pathlib.Path(sys.argv[1]).absolute()
@@ -52,11 +56,11 @@ quoted = '"' + ''.join(
     '\\"' if char == '"' else '\\\\' if char == '\\' else char
     for char in str(source)
 ) + '"'
-pathlib.Path(sys.argv[2]).write_text(
-    "include " + quoted + "\n"
-    'output "HEADLESS-1" { scale 1; transform "normal"; }\n'
-    'spawn-at-startup "/usr/lib/niri-rdp/session-desktop"\n'
-)
+wrapper = "include " + quoted + "\n"
+if sys.argv[3] == "1":
+    wrapper += ('output "HEADLESS-1" { scale 1; transform "normal"; }\n'
+                'spawn-at-startup "/usr/lib/niri-rdp/session-desktop"\n')
+wrapper += 'spawn-at-startup "/usr/lib/niri-rdp/session-portals"\n'
+pathlib.Path(sys.argv[2]).write_text(wrapper)
 PY
-fi
-exec /usr/lib/niri-rdp/niri-headless --config "$config"
+exec /usr/lib/niri-rdp/niri-headless --config "$NIRI_RDP_RUNTIME_DIR/config.kdl"

@@ -4,7 +4,7 @@
 # Export a portable source bundle with makepkg --allsource.
 pkgname=niri-remote-login
 pkgver=0.1.0
-pkgrel=9
+pkgrel=10
 pkgdesc='Niri remote desktop host with a PAM/logind broker and dedicated headless compositor'
 arch=('x86_64')
 # Niri is GPL-3.0-or-later; the bridge links Arch's GPL-licensed FFmpeg.
@@ -13,7 +13,8 @@ options=('!debug' '!lto')
 depends=('pam' 'systemd' 'systemd-libs' 'dbus' 'wayland' 'libxkbcommon'
          'xkeyboard-config' 'foot' 'fuzzel' 'waybar' 'ttf-dejavu' 'ffmpeg' 'seatd' 'libinput'
          'libdisplay-info' 'mesa' 'libglvnd' 'pango' 'cairo' 'pixman'
-         'openssl' 'python' 'pipewire' 'pipewire-pulse' 'wireplumber' 'libpulse')
+         'openssl' 'python' 'pipewire' 'pipewire-pulse' 'wireplumber' 'libpulse'
+         'xdg-desktop-portal' 'xdg-desktop-portal-gtk')
 makedepends=('rust>=1.94' 'cargo' 'git' 'gcc' 'pkgconf')
 provides=('niri-rdp-headless=26.04.remote1-4')
 conflicts=('niri-rdp-headless')

@@ -43,6 +43,14 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+Package release 10 adds private file open/save portals and updates the
+private D-Bus activation environment after the remote display is available.
+This fixes Firefox downloads whose save dialog previously failed in remote
+sessions. Start a fresh remote login after upgrading; reconnecting to a retained
+desktop does not run the new portal startup helper. The installed Niri chooser
+is preserved, with GTK as a fallback; Firefox download preferences are unchanged.
+See [configuration and troubleshooting](install.md#configuration-and-troubleshooting).
+
 The audio pacing and adaptive bitrate changes are included in package release 9.
 Build with `makepkg` (without `-i`) while your remote session remains active.
 Install and restart from a local terminal or an independent SSH session when

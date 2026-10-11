@@ -113,8 +113,9 @@ sudo flatpak update --system
 ```
 
 Applications installed per user instead use `flatpak update --user` without
-sudo. The private session bus does not import the local desktop's service
-environment; portal and keyring integration may require additional setup.
+sudo. A private desktop portal supplies your configured file open/save dialogs,
+including Firefox downloads, on the remote display. Keyring integration may require
+additional setup.
 
 ## Connect with Windows Remote Desktop
 
@@ -184,17 +185,31 @@ monitor tests are tracked in [acceptance](acceptance.md).
 
 Configuration priority is `~/.config/niri-rdp/config.kdl`, then your usual
 `~/.config/niri/config.kdl`, then `/etc/niri-rdp/headless.kdl`. `XDG_CONFIG_HOME`
-is honored when set. Your usual configuration is included by a temporary wrapper
-that keeps `HEADLESS-1` at scale 1 with normal orientation and supplies a private
-bar startup helper. Physical output settings do not apply to this virtual output.
+is honored when set. Each selected configuration is included by a temporary
+wrapper that starts the private desktop portal after Niri creates its display.
+For your usual configuration, the wrapper also keeps `HEADLESS-1` at scale 1 with
+normal orientation and supplies a private bar startup helper. Physical output
+settings do not apply to this virtual output.
 Your original files are preserved. The helper waits up to two seconds for
 configured DMS/Waybar/Quickshell startup before supplying a bar; unusually slow or
 custom bars should use an explicit remote configuration.
 
 To opt into separate remote settings, create `~/.config/niri-rdp/config.kdl`.
-This override is loaded directly, so include your desired `spawn-at-startup`
+This override keeps its own output and bar settings, so include your desired `spawn-at-startup`
 commands for the bar. The remote session uses its own Wayland socket and D-Bus
 bus. Local systemd desktop services are not started or given the remote environment.
+
+The portal startup helper exports the remote runtime, display, and audio settings
+to the private bus only. Portal service activation uses `XDG_CURRENT_DESKTOP=niri:niri-rdp`
+so your installed Niri portal configuration and preferred chooser take precedence.
+For example, the GNOME backend supplies Nautilus file dialogs. The packaged
+`niri-rdp-portals.conf` supplies GTK when there is no Niri portal configuration.
+User portal settings under `~/.config/xdg-desktop-portal/` also take precedence.
+The helper replaces GNOME/GTK backends already activated before the remote display
+was available, without starting unused backends. It does not change application
+configuration directories or Firefox's download preferences.
+Upgrading fixes newly created remote sessions; reconnecting to
+a preserved session retains its old startup environment until that session logs out.
 
 Review `/etc/niri-rdp/frontend.conf`, `/etc/niri-rdp/headless.kdl`,
 `/etc/niri-rdp/waybar.json`, `/etc/niri-rdp/renderer.conf`, and
