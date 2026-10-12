@@ -208,8 +208,11 @@ Set `NIRI_RDP_LAB_GFX=0` in that command to check bitmap fallback for a client
 without graphics support while the host encoder remains configured as NVENC.
 
 Input uses virtual keyboard and virtual pointer v2 bound to the selected output
-and seat. The compiled Japanese JP106/evdev XKB map, modifiers and Caps/Num/Scroll
-synchronization are sent to Niri; held keys/buttons are released at disconnect, and a bounded compositor sync
+and seat. The bridge inherits the compositor's actual XKB map, including the
+host's JP106 layout or explicit user layout, and sends Caps/Num/Scroll lock
+synchronization to Niri. The restricted login form also reads the host's XKB
+defaults before authentication, with Shift, Caps Lock, AltGr and keypad support.
+Held keys/buttons are released at disconnect, and a bounded compositor sync
 acknowledgment completes input teardown before the socket closes.
 RDP set-1 E0 codes map explicitly to Linux evdev codes. Pointer absolute and
 relative motion is bounded before mapping into the capture output. Click
@@ -217,9 +220,8 @@ coordinates travel with the button event. Output scale 1 and normal transform
 are required; unsupported layouts fail closed. Unicode events commit exact text through a temporary one-level XKB map, including
 Japanese and UTF-16 surrogate pairs (emoji). Each character is a balanced tap; the
 physical keymap and held modifiers are restored afterward. Phone-side IME
-composition can submit committed text this way. Arbitrary layouts, Pause/E1,
-remote IME composition, clipboard
-and lock-screen behavior remain work.
+composition can submit committed text this way. Pause/E1, clipboard and
+lock-screen behavior remain work.
 
 ## Session audio
 

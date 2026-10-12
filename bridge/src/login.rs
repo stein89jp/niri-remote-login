@@ -10,6 +10,7 @@ use std::{
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
+use xkbcommon::xkb;
 
 // Avoid retaining submitted passwords after a failed attempt or disconnect.
 struct Password(String);
@@ -37,6 +38,9 @@ struct State {
     password_focus: bool,
     shift: [bool; 2],
     caps: bool,
+    num_lock: bool,
+    keymap: String,
+    keyboard_layout: String,
     unicode: crate::keyboard::UnicodeInput,
     synchronize: Option<KeyboardEvent>,
     control: [bool; 2],
@@ -71,6 +75,33 @@ impl Login {
         } else {
             String::new()
         };
+        // The restricted form cannot connect to a user's compositor before PAM.
+        // Its launcher supplies the same host XKB defaults as a remote session.
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let map = xkb::Keymap::new_from_names(
+            &context,
+            "",
+            "",
+            "",
+            "",
+            None,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap_or_else(|| {
+            eprintln!("host login keyboard map unavailable; falling back to US");
+            xkb::Keymap::new_from_names(
+                &context,
+                "evdev",
+                "pc105",
+                "us",
+                "",
+                Some(String::new()),
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+            .expect("fallback login keyboard map unavailable")
+        });
+        let keyboard_layout = map.layout_get_name(0).to_owned();
+        let keymap = map.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
         Self {
             state: Arc::new(Mutex::new(State {
                 size,
@@ -79,6 +110,9 @@ impl Login {
                 password: Password::default(),
                 shift: [false; 2],
                 caps: false,
+                num_lock: false,
+                keymap,
+                keyboard_layout,
                 unicode: Default::default(),
                 synchronize: None,
                 control: [false; 2],
@@ -173,22 +207,24 @@ impl Login {
                     Ok(Some((mut desktop, audio_socket))) if !state.stopped => {
                         audio.attach(audio_socket);
                         // Preserve lock state and modifiers held while signing in.
-                        let synchronized_caps =
+                        let synchronized =
                             if let Some(KeyboardEvent::Synchronize(flags)) = &state.synchronize {
                                 desktop.keyboard(KeyboardEvent::Synchronize(*flags));
-                                flags.bits() & 4 != 0
+                                flags.bits()
                             } else {
-                                false
+                                0
                             };
-                        if state.caps != synchronized_caps {
-                            desktop.keyboard(KeyboardEvent::Pressed {
-                                code: 58,
-                                extended: false,
-                            });
-                            desktop.keyboard(KeyboardEvent::Released {
-                                code: 58,
-                                extended: false,
-                            });
+                        for (active, bit, code) in [(state.caps, 4, 58), (state.num_lock, 2, 69)] {
+                            if active != (synchronized & bit != 0) {
+                                desktop.keyboard(KeyboardEvent::Pressed {
+                                    code,
+                                    extended: false,
+                                });
+                                desktop.keyboard(KeyboardEvent::Released {
+                                    code,
+                                    extended: false,
+                                });
+                            }
                         }
                         for (held, code, extended) in [
                             (state.shift[0], 42, false),
@@ -271,6 +307,14 @@ impl RdpServerInputHandler for Login {
                 code,
                 extended: false,
             } => (code, false),
+            KeyboardEvent::Pressed {
+                code: 0x1c,
+                extended: true,
+            } => (28, true),
+            KeyboardEvent::Pressed {
+                code: 0x35,
+                extended: true,
+            } => (98, true),
             KeyboardEvent::UnicodePressed(value) => {
                 let character = self.state.lock().unwrap().unicode.press(value);
                 if let Some(character) = character {
@@ -293,6 +337,7 @@ impl RdpServerInputHandler for Login {
                 // CAPS_LOCK is bit 2 in the RDP synchronize flags.
                 let mut state = self.state.lock().unwrap();
                 state.caps = flags.bits() & 4 != 0;
+                state.num_lock = flags.bits() & 2 != 0;
                 state.synchronize = Some(KeyboardEvent::Synchronize(flags));
                 return;
             }
@@ -307,11 +352,8 @@ impl RdpServerInputHandler for Login {
         }
         if {
             let state = self.state.lock().unwrap();
-            state
-                .control
-                .iter()
-                .chain(state.alt.iter())
-                .any(|held| *held)
+            // Windows sends a synthetic left Ctrl alongside AltGr.
+            state.control[1] || (state.control[0] && !state.alt[1]) || state.alt[0]
         } {
             return;
         }
@@ -337,9 +379,23 @@ impl RdpServerInputHandler for Login {
                 }
             }
             58 => state.caps = !state.caps,
+            69 => state.num_lock = !state.num_lock,
             _ => {
-                let character =
-                    jp_character(code, state.shift.iter().any(|shift| *shift), state.caps);
+                let evdev = if code == 98 {
+                    Some(98)
+                } else {
+                    crate::evdev_key(code, false)
+                };
+                let character = evdev.and_then(|key| {
+                    login_character(
+                        &state.keymap,
+                        key,
+                        state.shift,
+                        state.caps,
+                        state.num_lock,
+                        state.alt[1],
+                    )
+                });
                 drop(state);
                 if let Some(character) = character {
                     self.character(character);
@@ -460,32 +516,38 @@ impl RdpServerDisplayUpdates for Updates {
         }
     }
 }
-fn jp_character(code: u8, shift: bool, caps: bool) -> Option<char> {
-    let (normal, shifted): (&[u8], &[u8]) = match code {
-        2..=13 => (b"1234567890-^", b"!\"#$%&'()~=~"),
-        16..=27 => (b"qwertyuiop@[", b"QWERTYUIOP`{"),
-        30..=40 => (b"asdfghjkl;:", b"ASDFGHJKL+*"),
-        43 => (b"]".as_slice(), b"}".as_slice()),
-        0x73 => return Some(if shift { '_' } else { '\\' }),
-        0x7d => return Some(if shift { '|' } else { '\\' }),
-        44..=53 => (b"zxcvbnm,./".as_slice(), b"ZXCVBNM<>?".as_slice()),
-        57 => return Some(' '),
-        _ => return None,
-    };
-    let base = match code {
-        2..=13 => 2,
-        16..=27 => 16,
-        30..=40 => 30,
-        43 => 43,
-        _ => 44,
-    };
-    let index = usize::from(code - base);
-    let uppercase = shift ^ (caps && normal[index].is_ascii_alphabetic());
-    Some(char::from(if uppercase {
-        shifted[index]
-    } else {
-        normal[index]
-    }))
+fn login_character(
+    text: &str,
+    evdev: u32,
+    shift: [bool; 2],
+    caps: bool,
+    num_lock: bool,
+    altgr: bool,
+) -> Option<char> {
+    // Only owned text crosses threads in Login's Mutex. XKB's raw-pointer
+    // objects are local to this event, so no unsafe Send implementation is needed.
+    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+    let map = xkb::Keymap::new_from_string(
+        &context,
+        text.to_owned(),
+        xkb::KEYMAP_FORMAT_TEXT_V1,
+        xkb::KEYMAP_COMPILE_NO_FLAGS,
+    )?;
+    let mut state = xkb::State::new(&map);
+    let mut locked = 0;
+    for (active, name) in [(caps, "Lock"), (num_lock, "NumLock")] {
+        let index = map.mod_get_index(name);
+        if active && index < 32 {
+            locked |= 1 << index;
+        }
+    }
+    state.update_mask(0, 0, locked, 0, 0, 0);
+    for (held, key) in [(shift[0], 42u32), (shift[1], 54), (altgr, 100)] {
+        if held {
+            state.update_key((key + 8).into(), xkb::KeyDirection::Down);
+        }
+    }
+    state.key_get_utf8((evdev + 8).into()).chars().next()
 }
 fn form(size: DesktopSize) -> (i32, i32, i32) {
     let width = 420.min(i32::from(size.width).saturating_sub(20)).max(1);
@@ -560,13 +622,14 @@ fn render(state: &State) -> anyhow::Result<ironrdp_server::BitmapUpdate> {
         },
         [255, 255, 255],
     );
+    let keyboard_hint = format!("Tab switches fields. {} keyboard.", state.keyboard_layout);
     canvas.text(
         left,
         top + 222,
         if state.failed {
             "Login failed. Try again."
         } else {
-            "Tab switches fields. JP106 keyboard."
+            &keyboard_hint
         },
         [200, 200, 200],
     );
@@ -691,8 +754,22 @@ mod tests {
         os::unix::net::UnixListener,
     };
 
+    fn keyboard_map(model: &str, layout: &str) -> String {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        xkb::Keymap::new_from_names(
+            &context,
+            "evdev",
+            model,
+            layout,
+            "",
+            Some(String::new()),
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap()
+        .get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+    }
     fn login(username: &str) -> Login {
-        Login::new(
+        let login = Login::new(
             PathBuf::from("/nonexistent-niri-rdp-test.sock"),
             "HEADLESS-1".into(),
             None,
@@ -701,7 +778,9 @@ mod tests {
                 height: 600,
             },
             username,
-        )
+        );
+        login.state.lock().unwrap().keymap = keyboard_map("jp106", "jp");
+        login
     }
     fn key(login: &mut Login, code: u8) {
         login.keyboard(KeyboardEvent::Pressed {
@@ -712,6 +791,44 @@ mod tests {
             code,
             extended: false,
         });
+    }
+
+    #[test]
+    fn login_inherits_host_keyboard_defaults_before_authentication() {
+        const CHILD: &str = "NIRI_RDP_LOGIN_KEYBOARD_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "login::tests::login_inherits_host_keyboard_defaults_before_authentication",
+                ])
+                .env(CHILD, "1")
+                .env("XKB_DEFAULT_RULES", "evdev")
+                .env("XKB_DEFAULT_MODEL", "jp106")
+                .env("XKB_DEFAULT_LAYOUT", "jp")
+                .env("XKB_DEFAULT_VARIANT", "")
+                .env("XKB_DEFAULT_OPTIONS", "")
+                .status()
+                .unwrap();
+            assert!(status.success());
+            return;
+        }
+        let mut login = Login::new(
+            PathBuf::new(),
+            "HEADLESS-1".into(),
+            None,
+            DesktopSize {
+                width: 800,
+                height: 600,
+            },
+            "alice",
+        );
+        for code in [26, 27, 40, 0x73, 0x7d] {
+            key(&mut login, code);
+        }
+        assert_eq!(login.state.lock().unwrap().password.0, "@[:\\\\");
+        assert_eq!(login.state.lock().unwrap().keyboard_layout, "Japanese");
+        assert!(login.state.lock().unwrap().desktop.is_none());
     }
 
     #[test]
@@ -745,11 +862,75 @@ mod tests {
             (0x73, '\\', '_'),
             (0x7d, '\\', '|'),
         ] {
-            assert_eq!(jp_character(code, false, false), Some(normal));
-            assert_eq!(jp_character(code, true, false), Some(shifted));
+            let map = keyboard_map("jp106", "jp");
+            let evdev = crate::evdev_key(code, false).unwrap();
+            assert_eq!(
+                login_character(&map, evdev, [false; 2], false, false, false),
+                Some(normal)
+            );
+            assert_eq!(
+                login_character(&map, evdev, [true, false], false, false, false),
+                Some(shifted)
+            );
         }
-        assert_eq!(jp_character(41, false, false), None);
+        let map = keyboard_map("jp106", "jp");
+        assert_eq!(
+            login_character(&map, 41, [false; 2], false, false, false),
+            None
+        );
+        assert_eq!(
+            login_character(&map, 11, [true, false], false, false, false),
+            Some('~')
+        );
     }
+    #[test]
+    fn login_uses_configured_layout_and_supports_altgr_and_keypad() {
+        for (layout, normal, shifted) in [("us", '[', '{'), ("se", 'å', 'Å')] {
+            let mut login = login("alice");
+            login.state.lock().unwrap().keymap = keyboard_map("pc105", layout);
+            key(&mut login, 26);
+            login.keyboard(KeyboardEvent::Pressed {
+                code: 42,
+                extended: false,
+            });
+            key(&mut login, 26);
+            login.keyboard(KeyboardEvent::Released {
+                code: 42,
+                extended: false,
+            });
+            assert_eq!(
+                login.state.lock().unwrap().password.0,
+                format!("{normal}{shifted}")
+            );
+        }
+        let mut login = login("alice");
+        login.state.lock().unwrap().keymap = keyboard_map("pc105", "se");
+        login.keyboard(KeyboardEvent::Pressed {
+            code: 29,
+            extended: false,
+        });
+        login.keyboard(KeyboardEvent::Pressed {
+            code: 56,
+            extended: true,
+        });
+        key(&mut login, 3); // Windows AltGr (Ctrl+right Alt) + 2 is @.
+        login.keyboard(KeyboardEvent::Released {
+            code: 56,
+            extended: true,
+        });
+        login.keyboard(KeyboardEvent::Released {
+            code: 29,
+            extended: false,
+        });
+        key(&mut login, 69); // Num Lock enables the keypad.
+        key(&mut login, 79);
+        login.keyboard(KeyboardEvent::Pressed {
+            code: 0x35,
+            extended: true,
+        });
+        assert_eq!(login.state.lock().unwrap().password.0, "@1/");
+    }
+
     #[test]
     fn form_handles_jp_keyboard_focus_mouse_and_bounded_secrets() {
         let mut login = login("");

@@ -217,18 +217,28 @@ a preserved session retains its old startup environment until that session logs 
 
 ### Input methods and keyboard layouts
 
-The worker carries the account's configured input-method, keyboard, and locale
-settings from its user environment and `environment.d` into the remote desktop.
-The selected Niri configuration can override them as usual. No input framework
-or module is selected automatically.
+The worker reads the host's saved XKB layout, model, variant, and options from
+localed's `/etc/vconsole.conf` and `/etc/X11/xorg.conf.d/00-keyboard.conf`.
+User environment and `environment.d` settings take precedence. The selected
+Niri configuration can override them as usual. This also works with an empty
+`xkb` section in the headless build, including Japanese `jp` / `jp106` settings.
+The login screen uses XKB with the host defaults for physical keyboard events;
+Unicode input supplied by the RDP client is preserved directly.
 
 The remote desktop runs the same XDG autostart entries under `~/.config/autostart/`
 and the system XDG configuration directories, honoring user overrides and disabled
-entries. Input frameworks such as Fcitx5 and IBus start through that normal path
-or your existing Niri startup commands, using their usual profiles. D-Bus
-activation receives the remote display before startup applications launch.
+entries. When the configured environment selects Fcitx or IBus, that framework
+starts on the private display before startup applications launch. Installing a
+framework alone does not select it. Disabled autostart overrides are respected,
+and duplicate framework entries are skipped. Fcitx receives a private copy of
+its configured profile so remote layout changes cannot rewrite the host profile.
+IBus receives a private address and discovery file. D-Bus activation receives
+the remote display before startup applications launch.
 The private bus and display remain session-specific; shared user systemd services
 are not restarted or given the remote display.
+
+Changes to the remote Fcitx profile last for that remote session. Make persistent
+profile changes in the host configuration before starting a fresh remote login.
 
 The RDP bridge takes its physical keyboard map from Niri, including your configured
 layouts, variants, and options. It preserves layout switching and updates when

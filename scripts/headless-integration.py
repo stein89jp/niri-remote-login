@@ -129,7 +129,10 @@ def main():
     if gfx_setting not in ("0", "1"):
         raise RuntimeError("NIRI_RDP_LAB_GFX must be 0 or 1")
     gfx = encoder == "nvenc" and gfx_setting == "1"
-    username, password = "disposable-" + secrets.token_hex(8), secrets.token_hex(24)
+    username = "disposable-" + secrets.token_hex(8)
+    # The login client types physical JIS scancodes, including punctuation
+    # which differs from US. Only the namespace's fake broker sees this secret.
+    password = secrets.token_hex(24) + '@"^&:[]'
     tls_contract = os.environ.get("NIRI_RDP_LAB_TLS_CONTRACT") == "1"
     login_screen = os.environ.get("NIRI_RDP_LAB_LOGIN_SCREEN") == "1"
     if login_screen and not tls_contract:
@@ -137,7 +140,8 @@ def main():
     # The namespace supplies only these explicit environment values.
     env = {k: os.environ[k] for k in ("PATH", "HOME", "XDG_RUNTIME_DIR", "LD_LIBRARY_PATH",
                                     "LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER", "XKB_CONFIG_ROOT",
-                                    "NIRI_RDP_RENDERER")
+                                    "NIRI_RDP_RENDERER", "XKB_DEFAULT_RULES", "XKB_DEFAULT_MODEL",
+                                    "XKB_DEFAULT_LAYOUT", "XKB_DEFAULT_VARIANT", "XKB_DEFAULT_OPTIONS")
            if k in os.environ}
     env["NIRI_BACKEND"] = "headless"
     with socket.socket() as port:
@@ -332,6 +336,8 @@ def main():
                 key = ("tls_login_screen_rejection_authentication_desktop_and_lease_eof" if login_screen else
                        "tls_clientinfo_broker_fd_binding_and_lease_eof")
                 results[key] = "passed using namespace test broker; no PAM"
+                if login_screen:
+                    results["tls_login_screen_jis_punctuation_password_scancodes"] = "passed"
             results["pam_logind_boot_windows_monitor_off"] = "pending separate machines"
         except Exception:
             for log in logs:

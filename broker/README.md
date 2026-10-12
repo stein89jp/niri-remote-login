@@ -73,11 +73,13 @@ use `niri --session`, import environment into the user manager, or start
 required by logind; this is not a separate Unix security boundary.
 
 Before the compositor starts, a UID-owned helper reads the account's configured
-input-method, locale, keyboard, and XDG configuration settings. After the private
+input-method, locale, keyboard, and XDG configuration settings. Saved localed XKB
+defaults also reach the headless build when Niri's `xkb` section is empty. After the private
 display exists, Niri synchronously exports its application environment to the
 private bus before any startup applications launch. An XDG autostart helper then
-runs the usual configured desktop entries. It does not select an input framework
-or import the remote display into the shared user manager.
+runs the usual configured desktop entries. An explicitly configured Fcitx or IBus
+starts before user applications, with private writable profile/transport state.
+The remote display is never imported into the shared user manager.
 
 ## Wire contract v1
 

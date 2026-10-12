@@ -4,7 +4,7 @@
 # Export a portable source bundle with makepkg --allsource.
 pkgname=niri-remote-login
 pkgver=0.1.0
-pkgrel=11
+pkgrel=12
 pkgdesc='Niri remote desktop host with a PAM/logind broker and dedicated headless compositor'
 arch=('x86_64')
 # Niri is GPL-3.0-or-later; the bridge links Arch's GPL-licensed FFmpeg.
@@ -95,6 +95,14 @@ prepare() {
   done
 
   cd "$srcdir/niri-$_revision"
+  # makepkg extracts over a reused src tree. Files introduced by our patch are
+  # absent from the archive and otherwise survive extraction, breaking rebuilds.
+  # Preserve the old generated file before the patch creates its replacement.
+  if [[ -f src/protocols/virtual_keyboard.rs ]]; then
+    local previous
+    previous=$(mktemp -d "$srcdir/niri-rdp-previous-patch.XXXXXX")
+    mv src/protocols/virtual_keyboard.rs "$previous/virtual_keyboard.rs"
+  fi
   patch -Np1 -i "$srcdir/niri-remote-login-$pkgver/compositor/patches/0001-remote-headless-bounds-and-startup.patch"
   export CARGO_HOME="$srcdir/cargo-home"
   cargo fetch --locked

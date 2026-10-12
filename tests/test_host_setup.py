@@ -36,6 +36,159 @@ autostart_loader.exec_module(autostart)
 
 
 class HostSetupTests(unittest.TestCase):
+    def test_input_framework_requires_explicit_configuration_and_handles_toolkit_fallbacks(self):
+        helper = autostart.input_method
+        self.assertIsNone(helper.configured_framework({}))
+        for values, expected in (({"XMODIFIERS": "@im=fcitx"}, "fcitx"),
+                                 ({"INPUT_METHOD": "ibus", "QT_IM_MODULE": "fcitx"}, "ibus"),
+                                 ({"QT_IM_MODULES": "wayland;ibus"}, "ibus"),
+                                 ({"GTK_IM_MODULE": "wayland"}, None)):
+            self.assertEqual(helper.configured_framework(values), expected)
+
+    def test_ibus_transport_is_private_and_exported_for_dbus_activation(self):
+        helper = autostart.input_method
+        environment = {"NIRI_RDP_RUNTIME_DIR": "/private/remote", "QT_IM_MODULE": "ibus",
+                       "IBUS_ADDRESS": "unix:path=/physical/ibus",
+                       "IBUS_ADDRESS_FILE": "/physical/address"}
+        actual = helper.private_settings(environment)
+        self.assertEqual(actual["IBUS_ADDRESS"], "unix:path=/private/remote/ibus/bus")
+        self.assertEqual(actual["IBUS_ADDRESS_FILE"], "/private/remote/ibus/address")
+        with patch.object(autostart.subprocess, "run") as update:
+            autostart.activation_environment(actual)
+        arguments = update.call_args.args[0]
+        self.assertIn("IBUS_ADDRESS=" + actual["IBUS_ADDRESS"], arguments)
+        self.assertIn("IBUS_ADDRESS_FILE=" + actual["IBUS_ADDRESS_FILE"], arguments)
+        self.assertNotIn("--systemd", arguments)
+        other = helper.private_settings(dict(environment, QT_IM_MODULE="fcitx"))
+        self.assertNotIn("IBUS_ADDRESS", other)
+        self.assertEqual(environment["IBUS_ADDRESS"], "unix:path=/physical/ibus")
+
+    def test_fcitx_profile_snapshot_prevents_remote_layout_changes_overwriting_host(self):
+        helper = autostart.input_method
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            host = directory / "host/fcitx5"
+            host.mkdir(parents=True)
+            profile = host / "profile"
+            profile.write_text("[Groups/0]\nDefault Layout=jp\nDefaultIM=mozc\n")
+            # A user symlink must become a copy, not a write path to the host.
+            (host / "config").symlink_to(profile)
+            runtime = directory / "remote"
+            runtime.mkdir()
+            environment = {"HOME": str(directory), "XDG_CONFIG_HOME": str(host.parent),
+                           "NIRI_RDP_RUNTIME_DIR": str(runtime), "XDG_RUNTIME_DIR": str(runtime),
+                           "QT_IM_MODULE": "fcitx", "WAYLAND_DISPLAY": "wayland-0",
+                           "DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus"}
+            with patch.object(helper.shutil, "which", return_value="/usr/bin/fcitx5"), \
+                    patch.object(helper, "owns_name", side_effect=[False, True]), \
+                    patch.object(helper.subprocess, "Popen") as start:
+                helper.start(environment)
+            self.assertEqual(start.call_args.args[0], ["/usr/bin/fcitx5", "-D"])
+            child = start.call_args.kwargs["env"]
+            copied = Path(child["XDG_CONFIG_HOME"]) / "fcitx5"
+            self.assertEqual((copied / "profile").read_text(), profile.read_text())
+            self.assertFalse((copied / "config").is_symlink())
+            (copied / "profile").write_text("Default Layout=us\n")
+            (copied / "config").write_text("Default Layout=us\n")
+            self.assertIn("Default Layout=jp", profile.read_text())
+            self.assertEqual(child["DBUS_SESSION_BUS_ADDRESS"], environment["DBUS_SESSION_BUS_ADDRESS"])
+            self.assertEqual(environment["XDG_CONFIG_HOME"], str(host.parent))
+
+    def test_ibus_starts_daemon_directly_with_private_address_without_replacement(self):
+        helper = autostart.input_method
+        with tempfile.TemporaryDirectory() as runtime:
+            environment = helper.private_settings({"NIRI_RDP_RUNTIME_DIR": runtime,
+                           "XDG_RUNTIME_DIR": runtime, "WAYLAND_DISPLAY": "wayland-0",
+                           "DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus", "INPUT_METHOD": "ibus"})
+            with patch.object(helper.shutil, "which", return_value="/usr/bin/ibus-daemon"), \
+                    patch.object(helper, "owns_name", side_effect=[False, True]), \
+                    patch.object(helper.subprocess, "Popen") as start:
+                helper.start(environment)
+            self.assertEqual(start.call_args.args[0], [helper.sys.executable,
+                             str(ROOT / "broker/config/session-input-method"), "--supervise-ibus"])
+            with patch.object(helper.shutil, "which", side_effect=["/usr/bin/ibus-daemon", None]), \
+                    patch.object(helper.os, "access", return_value=False):
+                self.assertEqual(helper.ibus_arguments(environment), ["/usr/bin/ibus-daemon", "--xim",
+                                 "--desktop=niri", "--address=" + environment["IBUS_ADDRESS"]])
+            self.assertEqual(start.call_args.kwargs["env"], environment)
+            self.assertTrue((Path(runtime) / "ibus").is_dir())
+
+    def test_ibus_native_wayland_panel_is_requested_when_available(self):
+        helper = autostart.input_method
+        with patch.object(helper.shutil, "which", side_effect=["/usr/bin/ibus-daemon", None]), \
+                patch.object(helper.os, "access", side_effect=lambda path, mode: path == "/usr/lib/ibus/ibus-ui-gtk3"):
+            arguments = helper.ibus_arguments({"IBUS_ADDRESS": "unix:path=/private/ibus/bus"})
+        self.assertIn("--panel=/usr/lib/ibus/ibus-ui-gtk3 --enable-wayland-im", arguments)
+
+    def test_ibus_supervisor_stays_alive_until_foreground_daemon_exits(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            executable = directory / "ibus-daemon"
+            executable.write_text("#!/usr/bin/python3\nimport os, time\n"
+                                  "print(os.getppid(), flush=True)\n"
+                                  "time.sleep(0.15)\nraise SystemExit(7)\n")
+            executable.chmod(0o755)
+            environment = dict(os.environ, PATH=temporary, IBUS_ADDRESS="unix:path=/private/ibus/bus")
+            with subprocess.Popen(["/usr/bin/python3", str(ROOT / "broker/config/session-input-method"),
+                                   "--supervise-ibus"], env=environment, stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE, text=True) as supervisor:
+                self.assertEqual(int(supervisor.stdout.readline()), supervisor.pid)
+                self.assertIsNone(supervisor.poll())
+                _, errors = supervisor.communicate(timeout=3)
+                self.assertEqual(supervisor.returncode, 7, errors)
+
+    def test_eligible_fcitx_autostart_without_toolkit_settings_uses_private_profile_startup(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "autostart"
+            directory.mkdir()
+            (directory / "org.fcitx.Fcitx5.desktop").write_text(
+                "[Desktop Entry]\nType=Application\nName=Fcitx\nExec=/usr/bin/fcitx5\nOnlyShowIn=niri;\n")
+            environment = {"HOME": temporary, "XDG_CONFIG_HOME": temporary,
+                           "XDG_CONFIG_DIRS": "/missing", "XDG_CURRENT_DESKTOP": "niri"}
+            with patch.dict(os.environ, environment, clear=True), \
+                    patch.object(autostart, "start_input_method") as start:
+                autostart.launch_entries(environment)
+            start.assert_called_once_with(dict(environment, INPUT_METHOD="fcitx"))
+
+    def test_input_startup_respects_user_disabled_entry_and_suppresses_shared_service_launcher(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / "autostart"
+            directory.mkdir()
+            entry = directory / "org.freedesktop.IBus.desktop"
+            entry.write_text("[Desktop Entry]\nType=Application\nName=IBus\nExec=ibus start\n"
+                             "OnlyShowIn=GNOME;\nHidden=true\n")
+            environment = {"HOME": temporary, "XDG_CONFIG_HOME": temporary,
+                           "XDG_CONFIG_DIRS": "/missing", "INPUT_METHOD": "ibus"}
+            with patch.object(autostart.input_method, "start") as start:
+                autostart.start_input_method(environment)
+            start.assert_called_once_with(environment, disabled=True)
+            entry.write_text(entry.read_text().replace("Hidden=true", "Hidden=false"))
+            self.assertFalse(autostart.input_method_disabled(environment))
+            import gi
+            gi.require_version("GioUnix", "2.0")
+            from gi.repository import GioUnix
+            entry.write_text(entry.read_text().replace("OnlyShowIn=GNOME;", "OnlyShowIn=niri;"))
+            with patch.dict(os.environ, dict(environment, XDG_CURRENT_DESKTOP="niri"), clear=True), \
+                    patch.object(GioUnix.DesktopAppInfo, "launch") as launch:
+                autostart.launch_entries(environment)
+            launch.assert_not_called()
+
+    def test_input_startup_never_replaces_existing_owner_and_reports_failure_without_breaking_desktop(self):
+        helper = autostart.input_method
+        environment = {"NIRI_RDP_RUNTIME_DIR": "/private/remote", "XDG_RUNTIME_DIR": "/private/remote",
+                       "WAYLAND_DISPLAY": "wayland-0", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus",
+                       "QT_IM_MODULE": "fcitx"}
+        with patch.object(helper.shutil, "which", return_value="/usr/bin/fcitx5"), \
+                patch.object(helper, "owns_name", return_value=True), \
+                patch.object(helper.subprocess, "Popen") as start:
+            helper.start(environment)
+        start.assert_not_called()
+        with patch.object(autostart, "input_method_disabled", return_value=False), \
+                patch.object(helper, "start", side_effect=RuntimeError("startup timed out")), \
+                patch("builtins.print") as report:
+            autostart.start_input_method(environment)
+        self.assertIn("startup timed out", report.call_args.args[0])
+
     def test_generic_activation_preserves_configured_input_method_and_private_transport(self):
         for module in ("fcitx", "ibus"):
             environment = {"XDG_RUNTIME_DIR": "/private/remote", "WAYLAND_DISPLAY": "wayland-1",
@@ -94,13 +247,16 @@ class HostSetupTests(unittest.TestCase):
             with patch.dict(os.environ, environment, clear=True), \
                     patch.object(autostart, "activation_environment") as update, \
                     patch.object(autostart, "launch_entries") as launch, \
+                    patch.object(autostart, "start_input_method") as start_input, \
                     patch.object(autostart.sys, "argv", ["session-autostart", "--prepare"]):
                 autostart.main()
                 update.assert_called_once_with(environment)
                 launch.assert_not_called()
+                start_input.assert_called_once_with(environment)
             with patch.dict(os.environ, environment, clear=True), \
                     patch.object(autostart, "activation_environment"), \
                     patch.object(autostart, "launch_entries") as launch, \
+                    patch.object(autostart, "start_input_method"), \
                     patch.object(autostart.sys, "argv", ["session-autostart"]):
                 autostart.main()
                 autostart.main()

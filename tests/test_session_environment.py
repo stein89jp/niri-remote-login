@@ -71,6 +71,32 @@ class SessionEnvironmentTests(unittest.TestCase):
         self.assertIn("--address=unix:path=/run/user/1000/bus", run.call_args.args[0])
         self.assertEqual(run.call_args.kwargs["env"], environment)
 
+    def test_localed_jp106_fallback_and_x11_precedence(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            vconsole = Path(temporary) / "vconsole.conf"
+            xorg = Path(temporary) / "00-keyboard.conf"
+            vconsole.write_text('KEYMAP=jp106\nXKBLAYOUT=us\nXKBMODEL=pc105\n'
+                                'XKBOPTIONS=terminate:ctrl_alt_bksp\n')
+            xorg.write_text('Section "InputClass"\nIdentifier "other-keyboard"\n'
+                            'MatchIsKeyboard "on"\nOption "XkbLayout" "de"\nEndSection\n'
+                            'Section "InputClass"\nIdentifier "system-keyboard"\n'
+                            'MatchIsKeyboard "on"\nOption "XkbLayout" "jp"\n'
+                            'Option "XkbModel" "jp106"\nOption "XkbVariant" ""\nEndSection\n')
+            self.assertEqual(environment_helper.keyboard_settings(vconsole, xorg), {
+                "XKB_DEFAULT_LAYOUT": "jp", "XKB_DEFAULT_MODEL": "jp106",
+                "XKB_DEFAULT_VARIANT": "", "XKB_DEFAULT_OPTIONS": "terminate:ctrl_alt_bksp"})
+
+    def test_console_keymap_is_not_mistaken_for_xkb_layout(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "vconsole.conf"
+            path.write_text('KEYMAP=jp106\nLANG=ja_JP.UTF-8\n')
+            self.assertEqual(environment_helper.keyboard_settings(path, Path(temporary) / "missing"), {})
+            path.write_text('XKBLAYOUT="us,se"\nXKBMODEL=pc105\nXKBVARIANT=,nodeadkeys\n'
+                            'XKBOPTIONS="grp:alt_shift_toggle"\n')
+            self.assertEqual(environment_helper.keyboard_settings(path, Path(temporary) / "missing"), {
+                "XKB_DEFAULT_LAYOUT": "us,se", "XKB_DEFAULT_MODEL": "pc105",
+                "XKB_DEFAULT_VARIANT": ",nodeadkeys", "XKB_DEFAULT_OPTIONS": "grp:alt_shift_toggle"})
+
     def test_manager_unavailable_is_optional(self):
         with patch.object(environment_helper.subprocess, "run",
                           side_effect=subprocess.CalledProcessError(1, ["busctl"])):
@@ -98,19 +124,55 @@ class SessionEnvironmentTests(unittest.TestCase):
                     self.assertRaises(RuntimeError):
                 environment_helper.main()
 
+    def test_frontend_receives_system_keyboard_without_importing_user_desktop(self):
+        base = {"XKB_DEFAULT_OPTIONS": "", "CREDENTIALS_DIRECTORY": "/run/credentials/frontend"}
+        with patch.object(environment_helper.sys, "argv", ["session-environment", "--frontend"]), \
+                patch.object(environment_helper.os, "geteuid", return_value=900), \
+                patch.object(environment_helper.os, "environ", base), \
+                patch.object(environment_helper, "keyboard_settings", return_value={
+                    "XKB_DEFAULT_LAYOUT": "jp", "XKB_DEFAULT_MODEL": "jp106",
+                    "XKB_DEFAULT_OPTIONS": "terminate:ctrl_alt_bksp"}), \
+                patch.object(environment_helper, "session_environment") as desktop, \
+                patch.object(environment_helper.os, "execve") as execute:
+            environment_helper.main()
+        desktop.assert_not_called()
+        execute.assert_called_once_with(environment_helper.FRONTEND, [environment_helper.FRONTEND],
+                                       dict(base, XKB_DEFAULT_LAYOUT="jp", XKB_DEFAULT_MODEL="jp106"))
+        with patch.object(environment_helper.sys, "argv", ["helper", "--frontend"]), \
+                patch.object(environment_helper.os, "geteuid", return_value=0), \
+                self.assertRaises(RuntimeError):
+            environment_helper.main()
+
     def test_environment_d_overrides_manager_without_guessing_framework(self):
         base = {"LANG": "C.UTF-8", "XDG_RUNTIME_DIR": "/run/user/1000",
+                "NIRI_RDP_RUNTIME_DIR": "/private/remote",
                 "DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus"}
         generated = subprocess.CompletedProcess([], 0,
             'QT_IM_MODULE=ibus\nXMODIFIERS=@im=ibus\nXKB_DEFAULT_LAYOUT=us,se\n'
             'XDG_RUNTIME_DIR=/host\nDBUS_SESSION_BUS_ADDRESS=host-bus\n')
         with patch.object(environment_helper, "locale_settings", return_value={"LANG": "sv_SE.UTF-8"}), \
+                patch.object(environment_helper, "keyboard_settings", return_value={}), \
                 patch.object(environment_helper, "manager_settings", return_value={"QT_IM_MODULE": "fcitx"}), \
                 patch.object(environment_helper.subprocess, "run", return_value=generated):
             actual = environment_helper.session_environment(base)
         self.assertEqual(actual, dict(base, LANG="sv_SE.UTF-8", QT_IM_MODULE="ibus",
-                                     XMODIFIERS="@im=ibus", XKB_DEFAULT_LAYOUT="us,se"))
+                                     XMODIFIERS="@im=ibus", XKB_DEFAULT_LAYOUT="us,se",
+                                     IBUS_ADDRESS="unix:path=/private/remote/ibus/bus",
+                                     IBUS_ADDRESS_FILE="/private/remote/ibus/address"))
         self.assertNotIn("GTK_IM_MODULE", actual)
+
+    def test_user_keyboard_defaults_override_system_fallback(self):
+        generated = subprocess.CompletedProcess([], 0, 'XKB_DEFAULT_LAYOUT=us,se\nXKB_DEFAULT_OPTIONS=\n')
+        with patch.object(environment_helper, "keyboard_settings", return_value={
+                "XKB_DEFAULT_LAYOUT": "jp", "XKB_DEFAULT_MODEL": "jp106",
+                "XKB_DEFAULT_OPTIONS": "terminate:ctrl_alt_bksp"}), \
+                patch.object(environment_helper, "locale_settings", return_value={}), \
+                patch.object(environment_helper, "manager_settings", return_value={"XKB_DEFAULT_MODEL": "pc105"}), \
+                patch.object(environment_helper.subprocess, "run", return_value=generated):
+            actual = environment_helper.session_environment({"XDG_RUNTIME_DIR": "/run/user/1000"})
+        self.assertEqual(actual["XKB_DEFAULT_LAYOUT"], "us,se")
+        self.assertEqual(actual["XKB_DEFAULT_MODEL"], "pc105")
+        self.assertEqual(actual["XKB_DEFAULT_OPTIONS"], "")
 
     def test_real_native_generator_supports_home_config_and_variable_expansion(self):
         if not Path(environment_helper.GENERATOR).exists():

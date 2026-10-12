@@ -219,7 +219,7 @@ index b45dd03c..d8e343bb 100644
                  }
                  TimeoutAction::Drop
              })
-@@ -241,3 +391,176 @@ impl Default for Headless {
+@@ -241,3 +391,237 @@ impl Default for Headless {
          Self::new()
      }
  }
@@ -231,6 +231,67 @@ index b45dd03c..d8e343bb 100644
 +    use smithay::reexports::wayland_server::Display;
 +
 +    use crate::niri::State;
++
++    #[test]
++    fn host_keyboard_defaults_survive_startup_and_reload() {
++        // Spawn this one test with its own environment: changing process-wide
++        // variables inside a parallel Rust test suite would race other XKB users.
++        const CHILD: &str = "NIRI_RDP_HOST_KEYBOARD_TEST_CHILD";
++        if std::env::var_os(CHILD).is_none() {
++            let status = std::process::Command::new(std::env::current_exe().unwrap())
++                .args([
++                    "--exact",
++                    "backend::headless::remote_tests::host_keyboard_defaults_survive_startup_and_reload",
++                    "--nocapture",
++                ])
++                .env(CHILD, "1")
++                .env("XKB_DEFAULT_RULES", "evdev")
++                .env("XKB_DEFAULT_MODEL", "jp106")
++                .env("XKB_DEFAULT_LAYOUT", "jp")
++                .env("XKB_DEFAULT_VARIANT", "")
++                .env("XKB_DEFAULT_OPTIONS", "")
++                .status()
++                .unwrap();
++            assert!(status.success());
++            return;
++        }
++
++        fn text(state: &mut State, evdev: u32) -> String {
++            state.niri.seat.get_keyboard().unwrap().with_xkb_state(
++                state,
++                |context| {
++                    let current = context.xkb().lock().unwrap();
++                    // SAFETY: only owned text leaves the locked XKB context.
++                    unsafe { current.state() }.key_get_utf8((evdev + 8).into())
++                },
++            )
++        }
++
++        let event_loop = EventLoop::<State>::try_new().unwrap();
++        let mut state = State::new(
++            Config::default(),
++            event_loop.handle(),
++            event_loop.get_signal(),
++            Display::new().unwrap(),
++            true,
++            false,
++            false,
++        )
++        .unwrap();
++        assert_eq!(text(&mut state, 26), "@");
++        assert_eq!(text(&mut state, 89), "\\");
++        assert_eq!(text(&mut state, 124), "\\");
++
++        // An explicit desktop layout takes priority over the host fallback.
++        let mut config = Config::default();
++        config.input.keyboard.xkb.layout = "se".into();
++        state.reload_config(Ok(config));
++        assert_eq!(text(&mut state, 26), "å");
++
++        state.reload_config(Ok(Config::default()));
++        assert_eq!(text(&mut state, 26), "@");
++        assert_eq!(text(&mut state, 124), "\\");
++    }
 +
 +    #[test]
 +    fn resize_preserves_output_identity_and_rejects_invalid_modes() {

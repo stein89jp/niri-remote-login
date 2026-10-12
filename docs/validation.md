@@ -407,3 +407,35 @@ CARGO_HOME="$PWD/poc/.cargo-cache" cargo build --release --locked --offline --ma
 System deployment requires root. An installed frontend continues using the
 old binary until it is updated and restarted. The package rebuild workflow in
 `docs/upgrade.md` includes the new `bridge/src/keyboard.rs` automatically.
+
+## Host keyboard and input-method inheritance (2026-10-12)
+
+Installed-host investigation found `jp` / `jp106` still saved in localed's
+configuration. The user's usual Niri `xkb` section was empty. The packaged
+headless build disables desktop D-Bus integration, including the locale1
+keyboard watcher, so it had fallen back to US. A remote session also rewrote
+the shared Fcitx profile. The later login attempt had no authenticated session
+or PAM failure counter; this does not prove which typed character failed.
+
+The environment helper now exports saved host XKB defaults before both the
+remote compositor and frontend start. The login form uses XKB rather than a
+fixed ASCII table. Configured Fcitx/IBus starts before applications, with a
+private Fcitx profile snapshot and private IBus address/discovery file.
+
+Regression checks cover localed parsing and user precedence; inherited JP106
+punctuation, Ro and Yen in a real headless seat at startup and reload; explicit
+Swedish override; login JP106, US, Swedish, AltGr, keypad and Unicode handling;
+private bus activation; input-method selection, disabled overrides, duplicate
+startup suppression and isolation of host profile writes. The maintained patch
+applies to the pinned source archive, and its hash matches `pins.json`.
+
+Release 12's package checks passed: 67 bridge tests, three headless compositor
+tests, 12 native broker groups and 52 Python tests (one optional transport test
+skipped). The isolated RDP login integration also authenticated a disposable
+password containing JIS punctuation through physical scancodes and Shift events.
+An isolated Fcitx startup loaded Mozc and the native Wayland input method, reused
+one daemon on repeated startup and preserved the source profile through teardown.
+
+Windows 10 mstsc and a physical Japanese keyboard require a fresh login on the
+updated installed host for final confirmation. The automated checks do not
+claim that device test has passed.

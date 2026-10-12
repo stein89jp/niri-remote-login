@@ -1,0 +1,135 @@
+#!/usr/bin/python3
+"""Reuse the selected input framework without touching the physical session."""
+import os
+from pathlib import Path
+import shutil
+import shlex
+import subprocess
+import sys
+import time
+
+
+def configured_framework(environment):
+    # Installation alone is not a selection. Prefer the explicit selector, then
+    # XIM, then toolkit settings (which may include a Wayland fallback).
+    values = [environment.get("INPUT_METHOD", ""),
+              environment.get("XMODIFIERS", "").removeprefix("@im=")]
+    values.extend(environment.get(key, "") for key in
+                  ("QT_IM_MODULE", "GTK_IM_MODULE", "QT_IM_MODULES",
+                   "SDL_IM_MODULE", "CLUTTER_IM_MODULE", "GLFW_IM_MODULE"))
+    for value in values:
+        for token in value.lower().split(";"):
+            if token.strip() in ("fcitx", "fcitx5", "ibus"):
+                return "fcitx" if token.strip().startswith("fcitx") else "ibus"
+    return None
+
+
+def private_settings(environment):
+    result = dict(environment)
+    # Never carry a physical IBus transport into a remote compositor. IBus's
+    # default address file uses WAYLAND_DISPLAY, often wayland-0 on both seats.
+    result.pop("IBUS_ADDRESS", None)
+    result.pop("IBUS_ADDRESS_FILE", None)
+    if configured_framework(result) == "ibus":
+        directory = Path(result["NIRI_RDP_RUNTIME_DIR"]) / "ibus"
+        result["IBUS_ADDRESS"] = "unix:path=" + str(directory / "bus")
+        result["IBUS_ADDRESS_FILE"] = str(directory / "address")
+    return result
+
+
+def entry_framework(application, entry):
+    executable = (application.get_executable() or "") if application else ""
+    name = Path(executable).name
+    if name in ("fcitx", "fcitx5") or entry.name in (
+            "fcitx.desktop", "fcitx5.desktop", "org.fcitx.Fcitx5.desktop"):
+        return "fcitx"
+    if name in ("ibus", "ibus-daemon", "ibus-ui-gtk3") or entry.name in (
+            "ibus.desktop", "ibus-daemon.desktop", "ibus-wayland.desktop",
+            "org.freedesktop.IBus.desktop", "org.freedesktop.IBus.Panel.Wayland.Gtk3.desktop"):
+        return "ibus"
+    return None
+
+
+def ibus_arguments(environment):
+    executable = shutil.which("ibus-daemon")
+    arguments = [executable, "--xim", "--desktop=niri", "--address=" + environment["IBUS_ADDRESS"]]
+    # The regular panel does not provide the Wayland input-method protocol.
+    # Distribution libexec paths are not normally present in PATH.
+    candidates = [shutil.which("ibus-ui-gtk3"), "/usr/lib/ibus/ibus-ui-gtk3",
+                  "/usr/libexec/ibus-ui-gtk3"]
+    panel = next((path for path in candidates if path and os.access(path, os.X_OK)), None)
+    if panel:
+        arguments.append("--panel=" + shlex.join([panel, "--enable-wayland-im"]))
+    return arguments
+
+
+def owns_name(environment, name):
+    result = subprocess.run([
+        "/usr/bin/busctl", "--address=" + environment["DBUS_SESSION_BUS_ADDRESS"],
+        "--timeout=1", "call", "org.freedesktop.DBus", "/org/freedesktop/DBus",
+        "org.freedesktop.DBus", "NameHasOwner", "s", name,
+    ], env=environment, capture_output=True, text=True, check=True, timeout=2)
+    return result.stdout.strip() == "b true"
+
+
+def start(environment, disabled=False):
+    framework = configured_framework(environment)
+    if framework is None or disabled:
+        return
+    runtime = Path(environment["NIRI_RDP_RUNTIME_DIR"])
+    if environment.get("XDG_RUNTIME_DIR") != str(runtime):
+        raise RuntimeError("input method requires the private runtime")
+    if not environment.get("WAYLAND_DISPLAY") or not environment.get("DBUS_SESSION_BUS_ADDRESS"):
+        raise RuntimeError("input method requires the private display and bus")
+    if framework == "fcitx":
+        executable = shutil.which("fcitx5") or shutil.which("fcitx")
+        name = "org.fcitx.Fcitx5" if executable and Path(executable).name == "fcitx5" else "org.fcitx.Fcitx"
+        arguments = [executable, "-D"]
+    else:
+        executable = shutil.which("ibus-daemon")
+        name = "org.freedesktop.IBus"
+        # Foreground IBus exits when its parent exits. A persistent supervisor
+        # keeps it alive after the short-lived preparation helper completes.
+        arguments = [sys.executable, str(Path(__file__).absolute()), "--supervise-ibus"]
+    if executable is None:
+        print("niri-rdp: configured " + framework + " executable is unavailable", file=sys.stderr)
+        return
+    if owns_name(environment, name):
+        return
+    launch_environment = dict(environment)
+    if framework == "fcitx":
+        # Fcitx may save its group layout on disconnect. Give it a snapshot so
+        # two desktops cannot overwrite each other's profile and addon settings.
+        default_home = Path(environment["HOME"]) / ".config"
+        source_home = Path(environment.get("XDG_CONFIG_HOME") or str(default_home))
+        if not source_home.is_absolute():
+            source_home = default_home
+        private_home = runtime / "input-method-config"
+        private_home.mkdir(mode=0o700, exist_ok=True)
+        directory = Path(executable).name
+        source = source_home / directory
+        destination = private_home / directory
+        if source.is_dir() and not destination.exists():
+            shutil.copytree(source, destination)
+        launch_environment["XDG_CONFIG_HOME"] = str(private_home)
+    else:
+        (runtime / "ibus").mkdir(mode=0o700, exist_ok=True)
+    # Fcitx and the IBus supervisor remain in the compositor's process group.
+    # `ibus start` would instead delegate to the shared systemd user manager.
+    process = subprocess.Popen(arguments, env=launch_environment)
+    deadline = time.monotonic() + 5
+    while time.monotonic() < deadline:
+        if owns_name(environment, name):
+            return
+        if process.poll() is not None:
+            raise RuntimeError("configured " + framework + " exited before acquiring its private bus name")
+        time.sleep(0.05)
+    raise RuntimeError("configured " + framework + " startup timed out")
+
+
+if __name__ == "__main__":
+    if sys.argv[1:] != ["--supervise-ibus"]:
+        raise RuntimeError("unknown input method arguments")
+    # IBus creates its own group, but its parent-death signal stops it when the
+    # broker tears down this supervisor along with the compositor's group.
+    sys.exit(subprocess.call(ibus_arguments(os.environ), env=dict(os.environ)))

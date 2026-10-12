@@ -1,10 +1,17 @@
 #!/usr/bin/python3
 """Run the account's ordinary XDG desktop autostart on the private display."""
 import os
+import importlib.util
+from importlib.machinery import SourceFileLoader
 from pathlib import Path
 import shutil
 import subprocess
 import sys
+
+
+input_loader = SourceFileLoader("niri_rdp_input_method", str(Path(__file__).with_name("session-input-method")))
+input_method = importlib.util.module_from_spec(importlib.util.spec_from_loader(input_loader.name, input_loader))
+input_loader.exec_module(input_method)
 
 
 def activation_environment(environment):
@@ -14,7 +21,7 @@ def activation_environment(environment):
     settings = ("XMODIFIERS", "GTK_IM_MODULE", "QT_IM_MODULE", "QT_IM_MODULES",
                 "SDL_IM_MODULE", "CLUTTER_IM_MODULE", "GLFW_IM_MODULE", "INPUT_METHOD",
                 "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_DATA_HOME", "XDG_DATA_DIRS",
-                "XDG_CACHE_HOME", "LANG", "LANGUAGE")
+                "XDG_CACHE_HOME", "LANG", "LANGUAGE", "IBUS_ADDRESS", "IBUS_ADDRESS_FILE")
     values = {key: environment.get(key, "") for key in variables}
     values.update({key: value for key, value in environment.items()
                    if key in settings or key.startswith("LC_") or key.startswith("XKB_")})
@@ -41,6 +48,43 @@ def autostart_entries(environment):
     return entries.values()
 
 
+def input_method_disabled(environment):
+    import gi
+    gi.require_version("GioUnix", "2.0")
+    from gi.repository import GioUnix, GLib
+    selected = input_method.configured_framework(environment)
+    if selected is None:
+        return False
+    for entry in autostart_entries(environment):
+        try:
+            application = GioUnix.DesktopAppInfo.new_from_filename(str(entry))
+        except TypeError:
+            application = None
+        if input_method.entry_framework(application, entry) != selected:
+            continue
+        # Hidden overrides can omit Exec, and GIO rejects missing executables.
+        # Read these disable switches even when no launchable application exists.
+        settings = GLib.KeyFile()
+        try:
+            settings.load_from_file(str(entry), GLib.KeyFileFlags.NONE)
+            for key, disabled_value in (("Hidden", True), ("X-GNOME-Autostart-enabled", False)):
+                try:
+                    if settings.get_boolean("Desktop Entry", key) == disabled_value:
+                        return True
+                except GLib.Error:
+                    pass
+        except GLib.Error:
+            continue
+    return False
+
+
+def start_input_method(environment):
+    try:
+        input_method.start(environment, disabled=input_method_disabled(environment))
+    except (OSError, subprocess.SubprocessError, RuntimeError) as error:
+        print("niri-rdp: input method startup failed: " + str(error), file=sys.stderr)
+
+
 def launch_entries(environment):
     # GIO implements Desktop Entry Exec quoting, field codes, working directory,
     # terminal handling, and TryExec; never interpret Exec as shell code.
@@ -61,6 +105,11 @@ def launch_entries(environment):
                 continue
             if application is None or application.get_is_hidden() or not application.get_show_in(None):
                 continue
+            if (input_method.configured_framework(environment) and
+                    input_method.entry_framework(application, entry)):
+                # The selected daemon already started before startup applications.
+                # Desktop launchers can otherwise call shared systemd services.
+                continue
             if application.get_boolean("X-systemd-skip"):
                 continue
             if (application.has_key("X-GNOME-Autostart-enabled") and
@@ -78,6 +127,12 @@ def launch_entries(environment):
                         break
             if skip:
                 continue
+            if (input_method.configured_framework(environment) is None and
+                    input_method.entry_framework(application, entry) == "fcitx"):
+                # An eligible autostart entry is also an explicit selection.
+                # Protect its profile even when toolkit selectors are absent.
+                start_input_method(dict(environment, INPUT_METHOD="fcitx"))
+                continue
             application.launch([], context)
         except (GLib.Error, OSError, subprocess.TimeoutExpired) as error:
             print("remote autostart failed for " + entry.name + ": " + str(error), file=sys.stderr)
@@ -92,6 +147,7 @@ def main():
     environment = dict(os.environ)
     activation_environment(environment)
     if sys.argv[1:] == ["--prepare"]:
+        start_input_method(environment)
         return
     if sys.argv[1:]:
         raise RuntimeError("unknown autostart arguments")
@@ -101,6 +157,7 @@ def main():
     except FileExistsError:
         return
     os.close(descriptor)
+    start_input_method(environment)
     launch_entries(environment)
 
 

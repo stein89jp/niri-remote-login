@@ -43,6 +43,15 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+Package release 12 fixes keyboard inheritance when the usual Niri `xkb` section
+is empty. The headless build now receives the saved system XKB settings before
+startup. The frontend also uses those settings with XKB translation in its login
+form. Configured Fcitx/IBus startup uses private session state; Fcitx profile writes
+cannot change the host profile, and IBus cannot reuse the host address file.
+Reload systemd and restart the frontend after installing so the login form uses
+the new environment launcher. End retained remote desktops and start a fresh
+login to receive the new keyboard defaults and input-method startup.
+
 Package release 10 adds private file open/save portals and updates the
 private D-Bus activation environment after the remote display is available.
 This fixes Firefox downloads whose save dialog previously failed in remote
@@ -85,7 +94,7 @@ has its own Wayland runtime and D-Bus bus; shared systemd desktop services are
 not started or given its environment.
 
 Remote startup now inherits configured input-method and locale settings and runs
-ordinary XDG autostart on the private display and bus. It does not force an input
-framework. The bridge inherits Niri's keyboard map instead of supplying a fixed
+ordinary XDG autostart on the private display and bus. The configured input
+framework also starts before user applications. The bridge inherits Niri's keyboard map instead of supplying a fixed
 Japanese layout. Existing language profiles and startup configuration are reused.
 Log out and start a fresh remote login to receive the new startup environment.

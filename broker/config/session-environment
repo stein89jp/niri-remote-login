@@ -1,6 +1,8 @@
 #!/usr/bin/python3
 """Reuse configured input and locale settings before starting the private desktop."""
 import json
+import importlib.util
+from importlib.machinery import SourceFileLoader
 import os
 from pathlib import Path
 import re
@@ -10,6 +12,7 @@ import sys
 
 
 WORKER = "/usr/lib/niri-rdp/session-worker"
+FRONTEND = "/usr/lib/niri-rdp/niri-rdp-bridge"
 GENERATOR = "/usr/lib/systemd/user-environment-generators/30-systemd-environment-d-generator"
 SETTINGS = {
     "LANG", "LANGUAGE", "INPUT_METHOD", "XMODIFIERS", "QT_IM_MODULE",
@@ -19,6 +22,9 @@ SETTINGS = {
 }
 VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
 ESCAPES = dict(zip('abfnrtv\\\"\'$`', '\a\b\f\n\r\t\v\\\"\'$`'))
+input_loader = SourceFileLoader("niri_rdp_environment_input", str(Path(__file__).with_name("session-input-method")))
+input_method = importlib.util.module_from_spec(importlib.util.spec_from_loader(input_loader.name, input_loader))
+input_loader.exec_module(input_method)
 
 
 def selected(name):
@@ -93,6 +99,53 @@ def locale_settings(path=Path("/etc/locale.conf")):
     return settings
 
 
+def keyboard_settings(vconsole=Path("/etc/vconsole.conf"),
+                      xorg=Path("/etc/X11/xorg.conf.d/00-keyboard.conf")):
+    """Read localed's saved XKB defaults without executing configuration.
+
+    The headless compositor is built without Niri's desktop D-Bus integration.
+    KEYMAP is a console map, not an XKB layout: only read the XKB assignments.
+    localed's X11 InputClass takes precedence over the console conversion.
+    """
+    fields = {"layout": "LAYOUT", "model": "MODEL", "variant": "VARIANT",
+              "options": "OPTIONS"}
+    settings = {}
+    try:
+        assignments = shlex.split(vconsole.read_text(), comments=True)
+        for assignment in assignments:
+            name, separator, value = assignment.partition("=")
+            for field in fields.values():
+                if separator and name == "XKB" + field:
+                    settings["XKB_DEFAULT_" + field] = value
+    except (OSError, ValueError):
+        pass
+    try:
+        section = None
+        for line in xorg.read_text().splitlines():
+            tokens = shlex.split(line, comments=True)
+            if not tokens:
+                continue
+            directive = tokens[0].lower()
+            if directive == "section":
+                section = {"type": tokens[1].lower()} if len(tokens) == 2 else None
+            elif directive == "endsection":
+                if (section and section.get("type") == "inputclass" and
+                        section.get("identifier") == "system-keyboard" and
+                        section.get("matchiskeyboard", "").lower() in ("on", "true", "yes", "1")):
+                    settings.update(section.get("settings", {}))
+                section = None
+            elif section is not None and len(tokens) == 2:
+                section[directive] = tokens[1]
+            elif section is not None and directive == "option" and len(tokens) == 3:
+                name = tokens[1].lower()
+                for field, suffix in fields.items():
+                    if name == "xkb" + field:
+                        section.setdefault("settings", {})["XKB_DEFAULT_" + suffix] = tokens[2]
+    except (OSError, ValueError):
+        pass
+    return settings
+
+
 def manager_settings(environment):
     runtime = environment.get("XDG_RUNTIME_DIR", "")
     if not runtime or not Path(runtime).is_absolute():
@@ -122,7 +175,8 @@ def manager_settings(environment):
 
 
 def session_environment(environment):
-    result = dict(environment)
+    result = keyboard_settings()
+    result.update(environment)
     result.update(locale_settings())
     result.update(manager_settings(environment))
     try:
@@ -133,10 +187,17 @@ def session_environment(environment):
     except (OSError, subprocess.SubprocessError, ValueError):
         # Do not print environment contents: even ignored settings may be secret.
         print("niri-rdp: could not import environment.d settings", file=sys.stderr)
-    return result
+    return input_method.private_settings(result)
 
 
 def main():
+    if sys.argv[1:] == ["--frontend"]:
+        if os.geteuid() == 0:
+            raise RuntimeError("frontend environment must run as the service user")
+        environment = keyboard_settings()
+        environment.update(os.environ)
+        os.execve(FRONTEND, [FRONTEND], environment)
+        return
     if sys.argv[1:] != [WORKER, "--environment-ready"]:
         raise RuntimeError("session-environment requires the fixed session worker")
     if os.geteuid() == 0:
