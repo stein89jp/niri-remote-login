@@ -43,9 +43,11 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
-Package release 13 prepares NVIDIA device nodes automatically before every
-frontend start. This fixes headless NVENC startup after reboot when the driver
-is loaded but `/dev/nvidia0` and `/dev/nvidiactl` have not been created.
+Package release 14 prepares the NVIDIA GPU, control, and UVM device nodes
+automatically before every frontend start. Release 13 did not explicitly create
+`/dev/nvidiactl` or the UVM nodes, leaving CUDA startup dependent on another GPU
+application or udev. The helper now requests the control-device minor with
+`nvidia-modprobe -c 0 -c 255` and UVM nodes with `nvidia-modprobe -u -c 0`.
 Existing NVIDIA encoder drop-ins continue to work. Install the rebuilt package,
 reload systemd and restart the frontend; no separate helper enablement is needed.
 If you applied the earlier manual workaround, its
@@ -53,6 +55,17 @@ If you applied the earlier manual workaround, its
 `/etc/systemd/system/niri-rdp-frontend.service.d/nvidia-devices.conf` are now
 redundant. Remove those two local files to use the package-owned helper, keeping
 the `nvidia.conf` encoder override, then reload systemd.
+After reboot, check both service journals before running `nvidia-smi` or another
+GPU application; the frontend must start and report `NVENC H.264 preflight passed`
+without that manual initialization. See the [cold-boot check](install.md#optional-nvidia-encoding).
+
+Release 14 also waits for WirePlumber's default-device policy before selecting
+the private remote audio sink. Previously a correct password could authenticate
+successfully, then fail desktop startup with `pactl set-default-sink` reporting
+`Not supported`. The login screen now distinguishes account/password rejection
+from desktop startup failures and keeps the latter out of the failed-password
+attempt limit. Restart both services after upgrading to load the new bridge and
+worker; retained desktops must end before the updated audio startup runs.
 
 Package release 12 fixes keyboard inheritance when the usual Niri `xkb` section
 is empty. The headless build now receives the saved system XKB settings before
@@ -80,9 +93,12 @@ of that desktop and start a fresh login to load the new capture relay as well.
 Stopping the broker logs out all retained desktops, so save application work
 before following the full upgrade procedure below.
 
-On the intended host, update the checkout and run `makepkg -si` again from
+On the intended host, update the checkout and run `makepkg -fsi` again from
 `packaging/arch/niri-rdp`. The local sources are copied under content-addressed
-names so changed files cannot accidentally reuse stale cached inputs. Stop both
+names so changed files cannot accidentally reuse stale cached inputs, including
+uncommitted edits. The `-f` forces a rebuild even when a package archive with
+the same version already exists; otherwise `makepkg -si` can install that
+archive without building changed sources. Stop both
 services before updating and review `.pacnew` files before restarting them.
 Existing TLS files are not package-owned and are preserved by first-start setup.
 When migrating from the old loopback configuration, pacman preserves your edited

@@ -31,6 +31,21 @@ impl Drop for Password {
         self.clear();
     }
 }
+#[derive(Debug, PartialEq, Eq)]
+enum LoginFailure {
+    MissingCredentials,
+    Rejected,
+    DesktopUnavailable,
+}
+impl LoginFailure {
+    fn message(&self) -> &'static str {
+        match self {
+            Self::MissingCredentials => "Enter your username and password.",
+            Self::Rejected => "Login denied. Check account and password.",
+            Self::DesktopUnavailable => "Desktop unavailable. Try again.",
+        }
+    }
+}
 struct State {
     size: DesktopSize,
     username: String,
@@ -42,11 +57,12 @@ struct State {
     keymap: String,
     keyboard_layout: String,
     unicode: crate::keyboard::UnicodeInput,
+    compose: crate::login_compose::ComposeInput,
     synchronize: Option<KeyboardEvent>,
     control: [bool; 2],
     alt: [bool; 2],
     busy: bool,
-    failed: bool,
+    failure: Option<LoginFailure>,
     attempts: u8,
     retry_at: Instant,
     stopped: bool,
@@ -114,11 +130,12 @@ impl Login {
                 keymap,
                 keyboard_layout,
                 unicode: Default::default(),
+                compose: Default::default(),
                 synchronize: None,
                 control: [false; 2],
                 alt: [false; 2],
                 busy: false,
-                failed: false,
+                failure: None,
                 attempts: 0,
                 retry_at: Instant::now(),
                 stopped: false,
@@ -146,6 +163,8 @@ impl Login {
         state.stopped = true;
         self.audio.clear();
         state.password.clear();
+        state.compose.reset();
+        state.unicode = Default::default();
         if let Some(desktop) = state.desktop.take() {
             desktop.stop();
         }
@@ -167,14 +186,17 @@ impl Login {
                 return;
             }
             if state.username.is_empty() || state.password.0.is_empty() {
-                state.failed = true;
+                state.compose.reset();
+                state.unicode = Default::default();
+                state.failure = Some(LoginFailure::MissingCredentials);
                 drop(state);
                 self.notify();
                 return;
             }
             state.busy = true;
-            state.failed = false;
-            state.attempts += 1;
+            state.failure = None;
+            state.compose.reset();
+            state.unicode = Default::default();
             let password = std::mem::take(&mut state.password);
             (state.username.clone(), password, state.size)
         };
@@ -241,12 +263,18 @@ impl Login {
                         state.desktop = Some(desktop);
                     }
                     Ok(Some((desktop, _))) => desktop.stop(),
-                    _ => {
-                        state.failed = true;
+                    Ok(None) => {
+                        state.failure = Some(LoginFailure::Rejected);
+                        state.attempts += 1;
                         state.retry_at = Instant::now() + Duration::from_secs(2);
                         if state.attempts >= 5 {
                             state.stopped = true;
                         }
+                    }
+                    Err(error) => {
+                        eprintln!("remote desktop startup failed: {error}");
+                        state.failure = Some(LoginFailure::DesktopUnavailable);
+                        state.retry_at = Instant::now() + Duration::from_secs(2);
                     }
                 }
                 drop(state);
@@ -269,7 +297,7 @@ impl Login {
         } else if state.username.len() + character.len_utf8() <= 64 {
             state.username.push(character);
         }
-        state.failed = false;
+        state.failure = None;
         drop(state);
         self.notify();
     }
@@ -316,7 +344,12 @@ impl RdpServerInputHandler for Login {
                 extended: true,
             } => (98, true),
             KeyboardEvent::UnicodePressed(value) => {
-                let character = self.state.lock().unwrap().unicode.press(value);
+                let character = {
+                    let mut state = self.state.lock().unwrap();
+                    // Unicode events are text already composed by the client.
+                    state.compose.reset();
+                    state.unicode.press(value)
+                };
                 if let Some(character) = character {
                     match character {
                         '\r' | '\n' => self.submit(),
@@ -366,8 +399,12 @@ impl RdpServerInputHandler for Login {
             return;
         }
         match code {
-            15 => state.password_focus = !state.password_focus,
+            15 => {
+                state.compose.reset();
+                state.password_focus = !state.password_focus;
+            }
             14 => {
+                state.compose.reset();
                 if state.password_focus {
                     // Overwrite the removed character's bytes before truncating.
                     if let Some((index, _)) = state.password.0.char_indices().next_back() {
@@ -387,18 +424,22 @@ impl RdpServerInputHandler for Login {
                     crate::evdev_key(code, false)
                 };
                 let character = evdev.and_then(|key| {
-                    login_character(
-                        &state.keymap,
-                        key,
-                        state.shift,
-                        state.caps,
-                        state.num_lock,
-                        state.alt[1],
-                    )
+                    let State {
+                        keymap,
+                        shift,
+                        caps,
+                        num_lock,
+                        alt,
+                        compose,
+                        ..
+                    } = &mut *state;
+                    login_text(keymap, key, *shift, *caps, *num_lock, alt[1], compose)
                 });
                 drop(state);
-                if let Some(character) = character {
-                    self.character(character);
+                if let Some(text) = character {
+                    for character in text.chars() {
+                        self.character(character);
+                    }
                 }
                 return;
             }
@@ -425,11 +466,16 @@ impl RdpServerInputHandler for Login {
                 return;
             }
             let y = i32::from(y) - top;
+            let previous_focus = state.password_focus;
             if (60..92).contains(&y) {
                 state.password_focus = false;
             }
             if (122..154).contains(&y) {
                 state.password_focus = true;
+            }
+            if state.password_focus != previous_focus {
+                state.compose.reset();
+                state.unicode = Default::default();
             }
             drop(state);
             self.notify();
@@ -516,14 +562,15 @@ impl RdpServerDisplayUpdates for Updates {
         }
     }
 }
-fn login_character(
+fn login_text(
     text: &str,
     evdev: u32,
     shift: [bool; 2],
     caps: bool,
     num_lock: bool,
     altgr: bool,
-) -> Option<char> {
+    compose: &mut crate::login_compose::ComposeInput,
+) -> Option<String> {
     // Only owned text crosses threads in Login's Mutex. XKB's raw-pointer
     // objects are local to this event, so no unsafe Send implementation is needed.
     let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
@@ -547,7 +594,34 @@ fn login_character(
             state.update_key((key + 8).into(), xkb::KeyDirection::Down);
         }
     }
-    state.key_get_utf8((evdev + 8).into()).chars().next()
+    let code = (evdev + 8).into();
+    let text = compose.press(
+        &context,
+        state.key_get_one_sym(code),
+        state.key_get_utf8(code),
+    );
+    (!text.is_empty()).then_some(text)
+}
+#[cfg(test)]
+fn login_character(
+    text: &str,
+    evdev: u32,
+    shift: [bool; 2],
+    caps: bool,
+    num_lock: bool,
+    altgr: bool,
+) -> Option<char> {
+    login_text(
+        text,
+        evdev,
+        shift,
+        caps,
+        num_lock,
+        altgr,
+        &mut Default::default(),
+    )?
+    .chars()
+    .next()
 }
 fn form(size: DesktopSize) -> (i32, i32, i32) {
     let width = 420.min(i32::from(size.width).saturating_sub(20)).max(1);
@@ -586,13 +660,13 @@ fn render(state: &State) -> anyhow::Result<ironrdp_server::BitmapUpdate> {
         },
     );
     canvas.text(left + 8, top + 68, &state.username, [255, 255, 255]);
-    canvas.text(left, top + 102, "Password", [200, 200, 200]);
+    canvas.text(left, top + 102, "Password (length hidden)", [200, 200, 200]);
     canvas.rect(
         left,
         top + 122,
         width,
         32,
-        if state.failed {
+        if state.failure.is_some() {
             [80, 80, 140]
         } else if state.password_focus {
             [100, 80, 40]
@@ -626,11 +700,10 @@ fn render(state: &State) -> anyhow::Result<ironrdp_server::BitmapUpdate> {
     canvas.text(
         left,
         top + 222,
-        if state.failed {
-            "Login failed. Try again."
-        } else {
-            &keyboard_hint
-        },
+        state
+            .failure
+            .as_ref()
+            .map_or(keyboard_hint.as_str(), |failure| failure.message()),
         [200, 200, 200],
     );
     Ok(bitmap(
@@ -848,6 +921,76 @@ mod tests {
         assert!(login.state.lock().unwrap().password.0.is_empty());
     }
     #[test]
+    fn physical_login_composes_dead_keys_and_preserves_client_unicode() {
+        let mut login = login("alice");
+        login.state.lock().unwrap().keymap = keyboard_map("pc105", "de");
+        key(&mut login, 13); // German acute accent is a dead key.
+        assert!(login.state.lock().unwrap().password.0.is_empty());
+        key(&mut login, 30);
+        assert_eq!(login.state.lock().unwrap().password.0, "á");
+        key(&mut login, 13);
+        login.keyboard(KeyboardEvent::UnicodePressed('é' as u16));
+        login.keyboard(KeyboardEvent::UnicodeReleased('é' as u16));
+        key(&mut login, 30);
+        assert_eq!(login.state.lock().unwrap().password.0, "áéa");
+    }
+
+    #[test]
+    fn login_composition_resets_when_editing_switching_fields_and_submitting() {
+        let mut login = login("alice");
+        login.state.lock().unwrap().keymap = keyboard_map("pc105", "de");
+        key(&mut login, 13);
+        key(&mut login, 14); // Backspace cancels the pending accent.
+        key(&mut login, 30);
+        assert_eq!(login.state.lock().unwrap().password.0, "a");
+        key(&mut login, 13);
+        key(&mut login, 15); // A pending password accent cannot reach username.
+        key(&mut login, 30);
+        assert_eq!(login.state.lock().unwrap().username, "alicea");
+        key(&mut login, 13);
+        let (x, y, _) = form(login.state.lock().unwrap().size);
+        login.mouse(MouseEvent::Button {
+            x: (x + 10) as u16,
+            y: (y + 130) as u16,
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        key(&mut login, 30);
+        assert_eq!(login.state.lock().unwrap().password.0, "aa");
+        login.state.lock().unwrap().password.clear();
+        key(&mut login, 13);
+        login.submit(); // Missing credentials must also cancel composition.
+        key(&mut login, 30);
+        assert_eq!(login.state.lock().unwrap().password.0, "a");
+        login.stop();
+        assert!(login.state.lock().unwrap().password.0.is_empty());
+    }
+
+    #[test]
+    fn pending_unicode_surrogates_cannot_cross_focus_or_submission() {
+        let mut login = login("alice");
+        login.keyboard(KeyboardEvent::UnicodePressed(0xd83d));
+        let (x, y, _) = form(login.state.lock().unwrap().size);
+        login.mouse(MouseEvent::Button {
+            x: (x + 10) as u16,
+            y: (y + 70) as u16,
+            button: MouseButton::Left,
+            pressed: true,
+        });
+        login.keyboard(KeyboardEvent::UnicodePressed(0xde00));
+        assert_eq!(login.state.lock().unwrap().username, "alice");
+        key(&mut login, 15);
+        login.keyboard(KeyboardEvent::UnicodePressed(0xd83d));
+        login.submit(); // The form is missing a complete password.
+        login.keyboard(KeyboardEvent::UnicodePressed(0xde00));
+        assert!(login.state.lock().unwrap().password.0.is_empty());
+        login.keyboard(KeyboardEvent::UnicodePressed(u16::from(b'a')));
+        assert_eq!(login.state.lock().unwrap().password.0, "a");
+        login.stop();
+        assert!(login.state.lock().unwrap().password.0.is_empty());
+    }
+
+    #[test]
     fn japanese_login_punctuation_matches_jis_keys() {
         for (code, normal, shifted) in [
             (3, '2', '"'),
@@ -980,6 +1123,19 @@ mod tests {
     }
 
     #[test]
+    fn each_key_press_adds_one_character_under_the_fixed_password_mask() {
+        let mut login = login("alice");
+        key(&mut login, 30);
+        assert_eq!(login.state.lock().unwrap().password.0, "a");
+        let single = render(&login.state.lock().unwrap()).unwrap();
+        login.keyboard(KeyboardEvent::UnicodePressed(u16::from(b'b')));
+        login.keyboard(KeyboardEvent::UnicodeReleased(u16::from(b'b')));
+        assert_eq!(login.state.lock().unwrap().password.0, "ab");
+        let double = render(&login.state.lock().unwrap()).unwrap();
+        assert_eq!(single.data, double.data);
+    }
+
+    #[test]
     fn password_content_and_length_never_change_framebuffer_mask() {
         let login = login("alice");
         let first = {
@@ -1089,11 +1245,60 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
         let state = login.state.lock().unwrap();
-        assert!(state.failed);
+        assert_eq!(state.failure, Some(LoginFailure::Rejected));
         assert!(state.password.0.is_empty());
         assert!(state.desktop.is_none());
         assert_eq!(state.attempts, 1);
         drop(state);
+        worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn desktop_startup_failure_is_distinct_and_does_not_consume_auth_attempts() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("broker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            for _ in 0..6 {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut header = [0; 8];
+                socket.read_exact(&mut header).unwrap();
+                let length = usize::from(u16::from_be_bytes([header[4], header[5]]))
+                    + usize::from(u16::from_be_bytes([header[6], header[7]]));
+                let mut credentials = vec![0; length];
+                socket.read_exact(&mut credentials).unwrap();
+                credentials.fill(0);
+                // PAM accepted, but the broker's desktop worker failed.
+                socket.write_all(b"NRB1\x02").unwrap();
+            }
+        });
+        let login = Login::new(
+            path,
+            "HEADLESS-1".into(),
+            None,
+            DesktopSize {
+                width: 800,
+                height: 600,
+            },
+            "alice",
+        );
+        for _ in 0..6 {
+            login.state.lock().unwrap().retry_at = Instant::now();
+            login.character('a');
+            login.submit();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while login.state.lock().unwrap().busy {
+                assert!(Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let state = login.state.lock().unwrap();
+            assert_eq!(state.failure, Some(LoginFailure::DesktopUnavailable));
+            assert_eq!(state.attempts, 0);
+            assert!(!state.stopped);
+            assert!(state.password.0.is_empty());
+            assert!(state.desktop.is_none());
+            assert!(state.retry_at > Instant::now());
+        }
         worker.join().unwrap();
     }
 }

@@ -13,8 +13,82 @@ import tempfile
 import threading
 import time
 import unittest
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class AudioStartupTests(unittest.TestCase):
+    def setUp(self):
+        loader = importlib.machinery.SourceFileLoader("session_audio_startup", str(ROOT / "broker/config/session-audio"))
+        spec = importlib.util.spec_from_loader(loader.name, loader)
+        self.module = importlib.util.module_from_spec(spec)
+        loader.exec_module(self.module)
+        self.processes = [Mock(), Mock(), Mock()]
+        for process in self.processes:
+            process.poll.return_value = None
+
+    @staticmethod
+    def result(stdout=b"", stderr=b"", status=0):
+        return subprocess.CompletedProcess([], status, stdout, stderr)
+
+    def test_sink_visible_before_default_metadata_is_retried(self):
+        sinks = self.result(b"42\tniri-rdp-sink\tPipeWire\ts16le 2ch 48000Hz\tIDLE\n")
+        responses = [sinks, self.result(stderr=b"Failure: Not supported\n", status=1),
+                     sinks, self.result(), self.result(b"niri-rdp-sink\n")]
+        with patch.object(self.module.subprocess, "run", side_effect=responses) as run:
+            self.module.wait_for_sink(self.processes, {"PULSE_SERVER": "unix:/private/native"})
+        selections = [call for call in run.call_args_list if call.args[0][1] == "set-default-sink"]
+        self.assertEqual(len(selections), 2, "sink visibility must not make a transient metadata failure fatal")
+        self.assertEqual(run.call_args.args[0][1:], ["get-default-sink"])
+
+    def test_readiness_requires_observed_default_sink(self):
+        sinks = self.result(b"42\tniri-rdp-sink\tPipeWire\n")
+        responses = [sinks, self.result(), self.result(b"auto_null\n"),
+                     sinks, self.result(), self.result(b"niri-rdp-sink\n")]
+        with patch.object(self.module.subprocess, "run", side_effect=responses) as run:
+            self.module.wait_for_sink(self.processes, {})
+        observed = [call for call in run.call_args_list if call.args[0][1] == "get-default-sink"]
+        self.assertEqual(len(observed), 2, "wait until policy has applied the selected default")
+
+    def test_persistent_default_failure_respects_deadline(self):
+        elapsed = [0.0]
+        def sleep(duration):
+            elapsed[0] += duration
+        def query(command, **kwargs):
+            self.assertGreater(kwargs["timeout"], 0)
+            self.assertLessEqual(kwargs["timeout"], 0.1 - elapsed[0])
+            if command[1] == "list":
+                return self.result(b"42\tniri-rdp-sink\tPipeWire\n")
+            return self.result(stderr=b"Failure: Not supported\n", status=1)
+        with patch.object(self.module.time, "monotonic", side_effect=lambda: elapsed[0]), \
+                patch.object(self.module.time, "sleep", side_effect=sleep), \
+                patch.object(self.module.subprocess, "run", side_effect=query):
+            with self.assertRaisesRegex(RuntimeError, "private audio sink unavailable: Failure: Not supported"):
+                self.module.wait_for_sink(self.processes, {}, timeout=0.1)
+        self.assertEqual(elapsed[0], 0.1)
+
+    def test_daemon_exit_while_waiting_fails_promptly(self):
+        self.processes[2].poll.side_effect = [None, 1]
+        with patch.object(self.module.subprocess, "run", return_value=self.result(status=1)) as run:
+            with self.assertRaisesRegex(RuntimeError, "private audio daemon exited"):
+                self.module.wait_for_sink(self.processes, {})
+        self.assertEqual(run.call_count, 1)
+
+    def test_readiness_failure_cleans_up_every_audio_daemon(self):
+        with tempfile.TemporaryDirectory(prefix="niri-audio-startup-") as directory:
+            Path(directory, "pipewire-0").touch()
+            with patch.dict(self.module.os.environ, {"NIRI_RDP_RUNTIME_DIR": directory}), \
+                    patch.object(self.module.signal, "signal"), \
+                    patch.object(self.module.Path, "read_text", return_value="context.objects = [\n]\nwireplumber.profiles = {\n}\n"), \
+                    patch.object(self.module.subprocess, "Popen", side_effect=self.processes), \
+                    patch.object(self.module, "wait_for_sink", side_effect=RuntimeError("private audio sink unavailable")):
+                with self.assertRaisesRegex(RuntimeError, "private audio sink unavailable"):
+                    self.module.main()
+            self.assertFalse(Path(directory, "audio-0").exists())
+        for process in self.processes:
+            process.terminate.assert_called_once()
+            process.wait.assert_called_once_with(timeout=2)
 
 
 class CaptureBackpressureTests(unittest.TestCase):
@@ -133,8 +207,22 @@ class AudioIntegrationTests(unittest.TestCase):
             environment = dict(os.environ, NIRI_RDP_RUNTIME_DIR=directory,
                                XDG_RUNTIME_DIR=directory,
                                PULSE_SERVER="unix:" + directory + "/pulse/native")
+            # Delay policy startup to exercise the real interval where the
+            # sink is visible but set-default-sink returns "Not supported".
+            launcher = """
+import runpy
+import subprocess
+import sys
+spawn = subprocess.Popen
+def delayed_policy(command, *args, **kwargs):
+    if command == ["/usr/bin/wireplumber", "--profile=remote"]:
+        command = ["/usr/bin/sh", "-c", "sleep 0.5; exec /usr/bin/wireplumber --profile=remote"]
+    return spawn(command, *args, **kwargs)
+subprocess.Popen = delayed_policy
+runpy.run_path(sys.argv[1], run_name="__main__")
+"""
             with tempfile.TemporaryFile() as log:
-                server = subprocess.Popen(["dbus-run-session", "--", "python3",
+                server = subprocess.Popen(["dbus-run-session", "--", "python3", "-c", launcher,
                     str(ROOT / "broker/config/session-audio")], env=environment,
                     stdout=log, stderr=log, start_new_session=True)
                 try:
@@ -151,6 +239,8 @@ class AudioIntegrationTests(unittest.TestCase):
                     sinks = subprocess.check_output(["pactl", "list", "short", "sinks"], env=environment)
                     self.assertEqual(len(sinks.splitlines()), 1)
                     self.assertIn(b"niri-rdp-sink", sinks)
+                    default = subprocess.check_output(["pactl", "get-default-sink"], env=environment)
+                    self.assertEqual(default.strip(), b"niri-rdp-sink")
                     samples = b"".join(struct.pack("<hh", *([int(10000 * math.sin(
                         2 * math.pi * 440 * n / 48000))] * 2)) for n in range(48000))
                     for _ in range(2):

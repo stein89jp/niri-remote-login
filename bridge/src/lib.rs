@@ -3,6 +3,7 @@ pub mod audio;
 pub mod broker;
 pub(crate) mod keyboard;
 pub mod login;
+mod login_compose;
 pub mod performance;
 pub mod video;
 pub mod wayland;

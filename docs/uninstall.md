@@ -43,8 +43,8 @@ If you enabled NVIDIA encoding, its copied drop-in
 `/etc/systemd/system/niri-rdp-frontend.service.d/nvidia.conf` is also not
 package-owned. Remove that file when discarding the experiment, then run
 `sudo systemctl daemon-reload` again.
-Release 13's NVIDIA device-preparation helper is package-owned and is removed
-by pacman. If you installed the earlier manual workaround, also remove its
+The NVIDIA device-preparation helper is package-owned and is removed by pacman.
+If you installed the earlier manual workaround, also remove its
 local `/etc/systemd/system/niri-rdp-nvidia-devices.service` and
 `/etc/systemd/system/niri-rdp-frontend.service.d/nvidia-devices.conf`; pacman
 does not own those local files.
@@ -60,3 +60,7 @@ untouched by these packages. No replacement of stock Niri is required for either
 installation or removal.
 Your Niri configuration, input-method profiles, `environment.d`, and XDG autostart
 entries are preserved and reused when you reinstall.
+To reinstall your current checkout with new fixes, follow [install](install.md)
+using `makepkg -fsi` from its `packaging/arch/niri-rdp` directory. Removing the
+installed package does not remove old package archives from that build directory;
+the `-f` ensures those archives are rebuilt from the current source.

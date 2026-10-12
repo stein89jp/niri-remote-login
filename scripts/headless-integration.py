@@ -143,6 +143,10 @@ def main():
                                     "NIRI_RDP_RENDERER", "XKB_DEFAULT_RULES", "XKB_DEFAULT_MODEL",
                                     "XKB_DEFAULT_LAYOUT", "XKB_DEFAULT_VARIANT", "XKB_DEFAULT_OPTIONS")
            if k in os.environ}
+    # The restricted form cannot read a compositor keymap before login. Give
+    # it the same JIS defaults as lab/headless.kdl and the fixture's scancodes.
+    env.update(XKB_DEFAULT_RULES="evdev", XKB_DEFAULT_MODEL="jp106",
+               XKB_DEFAULT_LAYOUT="jp", XKB_DEFAULT_VARIANT="", XKB_DEFAULT_OPTIONS="")
     env["NIRI_BACKEND"] = "headless"
     with socket.socket() as port:
         port.bind(("127.0.0.1", 33991))

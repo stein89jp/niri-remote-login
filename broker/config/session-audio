@@ -105,6 +105,44 @@ def capture(connection, environment):
         process.stdout.close()
 
 
+def wait_for_sink(processes, environment, timeout=5):
+    """Wait for both the sink and WirePlumber's default-node policy.
+
+    PipeWire exposes the sink before WirePlumber creates its default metadata.
+    During that interval, setting the default fails with "Not supported" even
+    though listing sinks succeeds. Keep that startup race inside the deadline.
+    """
+    deadline = time.monotonic() + timeout
+    last_error = "private audio sink unavailable"
+
+    def pactl(*arguments):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise subprocess.TimeoutExpired(arguments, timeout)
+        return subprocess.run(["/usr/bin/pactl", *arguments], env=environment,
+                              capture_output=True, timeout=min(1, remaining))
+
+    while time.monotonic() < deadline:
+        if any(process.poll() is not None for process in processes):
+            raise RuntimeError("private audio daemon exited")
+        try:
+            sinks = pactl("list", "short", "sinks")
+            if sinks.returncode == 0 and any(
+                    len(fields := line.split()) > 1 and fields[1] == b"niri-rdp-sink"
+                    for line in sinks.stdout.splitlines()):
+                selected = pactl("set-default-sink", "niri-rdp-sink")
+                if selected.returncode == 0:
+                    default = pactl("get-default-sink")
+                    if default.returncode == 0 and default.stdout.strip() == b"niri-rdp-sink":
+                        return
+                else:
+                    last_error = selected.stderr.decode(errors="replace").strip() or last_error
+        except subprocess.TimeoutExpired:
+            last_error = "private audio readiness probe timed out"
+        time.sleep(min(0.05, max(0, deadline - time.monotonic())))
+    raise RuntimeError("private audio sink unavailable: " + last_error)
+
+
 def main():
     runtime = Path(os.environ["NIRI_RDP_RUNTIME_DIR"])
     os.umask(0o077)
@@ -162,18 +200,7 @@ def main():
                     time.sleep(0.05)
                 else:
                     raise RuntimeError("private PipeWire startup timed out")
-        for _ in range(100):
-            if any(p.poll() is not None for p in processes):
-                raise RuntimeError("private audio daemon exited")
-            probe = subprocess.run(["/usr/bin/pactl", "list", "short", "sinks"],
-                                   env=environment, capture_output=True, timeout=1)
-            if probe.returncode == 0 and b"niri-rdp-sink" in probe.stdout:
-                break
-            time.sleep(0.05)
-        else:
-            raise RuntimeError("private audio sink unavailable")
-        subprocess.run(["/usr/bin/pactl", "set-default-sink", "niri-rdp-sink"],
-                       env=environment, check=True, timeout=2)
+        wait_for_sink(processes, environment)
         with socket.socket(socket.AF_UNIX) as listener:
             listener.bind(str(runtime / "audio-0"))
             listener.listen(1)

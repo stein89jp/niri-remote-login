@@ -3,7 +3,7 @@
 Build on the **Arch Linux x86_64 machine that will host the remote desktop**.
 Use an up-to-date Arch installation and a normal, unprivileged build account.
 The repository is private, so cloning requires repository access. Rust 1.94 or
-newer is required; `makepkg -si` installs the declared build/runtime dependencies.
+newer is required; `makepkg -fsi` installs the declared build/runtime dependencies.
 The initial Rust/compositor build can take a while.
 
 ## Install, authorize, enable
@@ -12,7 +12,7 @@ The initial Rust/compositor build can take a while.
 sudo pacman -Syu --needed base-devel git
 git clone https://github.com/stein89jp/niri-remote-login.git
 cd niri-remote-login/packaging/arch/niri-rdp
-makepkg -si
+makepkg -fsi
 sudo usermod -aG niri-rdp-users "$USER"
 sudo systemctl enable --now niri-rdp-frontend.service
 ```
@@ -24,7 +24,7 @@ NVIDIA driver**, use this block instead of the one above:
 sudo pacman -Syu --needed base-devel git
 git clone https://github.com/stein89jp/niri-remote-login.git
 cd niri-remote-login/packaging/arch/niri-rdp
-makepkg -si
+makepkg -fsi
 sudo usermod -aG niri-rdp-users "$USER"
 
 sudo install -d -m 755 /etc/systemd/system/niri-rdp-frontend.service.d
@@ -35,14 +35,21 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now niri-rdp-frontend.service
 ```
 
+When reinstalling from an existing checkout, skip `git clone` and use that
+checkout's `packaging/arch/niri-rdp` directory. `makepkg -fsi` rebuilds from its
+current files, including local edits. The `-f` matters when a package archive
+already exists: without it, `makepkg -si` can reinstall that older archive
+without compiling the changes. Then run the account authorization, optional
+NVIDIA drop-in, and service commands from the appropriate block above.
+
 The NVIDIA drop-in enables hardware video encoding with a default 60 fps capture
 budget and gives the frontend service GPU access. Your remote Linux account also
 needs GPU device access for hardware compositor rendering; see
 [Optional NVIDIA encoding](#optional-nvidia-encoding) for permissions and checks.
 
-Package release 13 automatically prepares NVIDIA device nodes before every
-frontend start, including after a reboot. No separate device-preparation unit,
-udev rule, or manual `nvidia-smi` invocation is needed. The preparation helper
+Package release 14 automatically prepares NVIDIA device nodes before every
+frontend start, including after a reboot. No manual helper installation,
+udev rule, or `nvidia-smi` invocation is needed. The preparation helper
 skips hosts without a loaded NVIDIA GPU and does not need to be enabled separately.
 
 If the frontend was already running when you added the NVIDIA drop-in, restart
@@ -267,6 +274,16 @@ sudo journalctl -b -u niri-rdp-broker.service -u niri-rdp-frontend.service --no-
 ss -ltn 'sport = :33991'
 ```
 
+The login screen reports **Login denied. Check account and password.** for
+authentication or account-policy failures. **Desktop unavailable. Try again.**
+means the broker could not start or resume the desktop; check both service
+journals for the cause. These startup failures do not consume the login screen's
+failed-password attempt limit. Release 14 waits for the private WirePlumber
+default-device policy before selecting the remote audio output, fixing a startup
+race that previously rejected a correctly authenticated login.
+The **Password (length hidden)** field shows eight stars for any nonempty entry;
+physical dead keys and Compose sequences produce the completed character.
+
 A TLS-only fallback profile is available if a client's normal connection setup
 fails. Save this as `niri.rdp` on Windows, replace the address and account, and
 open it with the regular Remote Desktop client:
@@ -406,9 +423,11 @@ failure. Actual NVIDIA encoding and Windows graphics negotiation require the
 integration result does not establish their performance.
 
 The frontend automatically starts `niri-rdp-nvidia-devices.service` first.
-It runs `nvidia-modprobe -c 0` and `nvidia-modprobe -u` as root to prepare both
-the base NVIDIA and UVM device nodes. A headless boot can otherwise have the
-driver loaded but lack `/dev/nvidia0` or `/dev/nvidiactl`, causing
+It runs `nvidia-modprobe -c 0 -c 255` and `nvidia-modprobe -u -c 0` as root
+to prepare `/dev/nvidia0`, `/dev/nvidiactl`, `/dev/nvidia-uvm`, and
+`/dev/nvidia-uvm-tools`. Release 13 omitted the control-device minor and only
+loaded UVM without explicitly creating its nodes. A headless boot can otherwise
+have the driver loaded but lack the devices CUDA needs, causing
 `CUDA_ERROR_NO_DEVICE`. The frontend keeps `NoNewPrivileges=yes`, so it cannot
 use NVIDIA's setuid fallback to create those nodes itself. The helper also runs
 with existing NVIDIA drop-ins from older package releases. Inspect its journal
@@ -417,6 +436,20 @@ if device preparation fails:
 ```sh
 sudo journalctl -b -u niri-rdp-nvidia-devices.service --no-pager
 ```
+
+After reinstalling, reboot and use SSH or a TTY to inspect the journals before
+starting a local graphical session or running `nvidia-smi`, FFmpeg, or a GPU
+application. Those can create the missing nodes and conceal a boot failure:
+
+```sh
+sudo journalctl -b -u niri-rdp-nvidia-devices.service \
+  -u niri-rdp-frontend.service --no-pager
+systemctl is-active niri-rdp-frontend.service
+```
+
+The NVIDIA helper must succeed and the frontend journal must report
+`NVENC H.264 preflight passed`. The frontend must be active without a manual
+GPU initialization command.
 
 Test the encoder independently using the same service account, supplementary
 groups and GPU visibility. This probe opens no RDP listener and uses synthetic

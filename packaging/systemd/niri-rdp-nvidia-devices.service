@@ -8,9 +8,11 @@ ConditionPathExistsGlob=/proc/driver/nvidia/gpus/*/information
 Type=oneshot
 # Run as root before the hardened frontend: NoNewPrivileges prevents that
 # service from using nvidia-modprobe's setuid fallback to create missing nodes.
-# -u prepares UVM nodes instead of the base nodes, so both commands are needed.
-ExecStart=/usr/bin/nvidia-modprobe -c 0
-ExecStart=/usr/bin/nvidia-modprobe -u
+# Each node requires an explicit minor: -c 0 creates only /dev/nvidia0;
+# -c 255 creates /dev/nvidiactl. UVM also needs -c 0 to create its two nodes;
+# -u alone only loads the module. Keep base and UVM requests separate.
+ExecStart=/usr/bin/nvidia-modprobe -c 0 -c 255
+ExecStart=/usr/bin/nvidia-modprobe -u -c 0
 NoNewPrivileges=yes
 ProtectSystem=strict
 ProtectHome=yes

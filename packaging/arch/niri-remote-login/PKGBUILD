@@ -2,7 +2,7 @@
 # Build without -i/-s: never install dependencies or this package on the host.
 pkgname=niri-remote-login
 pkgver=0.1.0
-pkgrel=13
+pkgrel=14
 pkgdesc='Niri RDP host bridge and PAM/logind session broker'
 arch=('x86_64')
 # Bridge source is MIT; the combined binary links Arch's GPL-licensed FFmpeg.

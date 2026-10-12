@@ -48,7 +48,7 @@ class HostSetupTests(unittest.TestCase):
         self.assertEqual(frontend["Service"]["NoNewPrivileges"], "yes")
         self.assertEqual(frontend["Service"]["PrivateDevices"], "yes")
 
-    def test_nvidia_preparation_handles_base_and_uvm_nodes_on_every_start(self):
+    def test_nvidia_preparation_requests_gpu_control_and_uvm_nodes_on_every_start(self):
         path = ROOT / "packaging/systemd/niri-rdp-nvidia-devices.service"
         helper = configparser.ConfigParser(interpolation=None, strict=False)
         helper.read(path)
@@ -61,7 +61,8 @@ class HostSetupTests(unittest.TestCase):
         self.assertNotEqual(helper["Service"].get("RemainAfterExit", "no"), "yes")
         self.assertEqual([line.split("=", 1)[1] for line in path.read_text().splitlines()
                           if line.startswith("ExecStart=")],
-                         ["/usr/bin/nvidia-modprobe -c 0", "/usr/bin/nvidia-modprobe -u"])
+                         ["/usr/bin/nvidia-modprobe -c 0 -c 255",
+                          "/usr/bin/nvidia-modprobe -u -c 0"])
         self.assertNotIn("Install", helper, "frontend starts the helper without manual enablement")
 
     def test_input_framework_requires_explicit_configuration_and_handles_toolkit_fallbacks(self):

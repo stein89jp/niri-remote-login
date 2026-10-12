@@ -1,5 +1,59 @@
 # Validation record
 
+## NVIDIA cold-boot and authenticated desktop startup fixes, 2026-10-12
+
+The installed release 13 frontend still failed with `CUDA_ERROR_NO_DEVICE`
+after boot even though its NVIDIA helper exited successfully. Host device
+timestamps show `/dev/nvidia0` and UVM nodes at 10:46, but `/dev/nvidiactl`
+appeared only at 10:48 after manual GPU initialization. NVIDIA's
+[utility implementation](https://github.com/NVIDIA/nvidia-modprobe/blob/main/nvidia-modprobe.c)
+creates only the explicitly requested device minors: `-c 0` does not create
+the control node, and `-u` without `-c` only loads the UVM module.
+Release 14 requests `-c 0 -c 255` and then `-u -c 0`, preparing the GPU,
+control, UVM, and UVM-tools nodes before the hardened frontend starts.
+
+The same journal shows PAM accepting the account and opening its session at
+10:48:41. At 10:48:42, private audio startup failed because
+`pactl set-default-sink niri-rdp-sink` returned `Failure: Not supported`.
+The sink was already visible while WirePlumber's default metadata was still
+starting. Release 14 waits within a bounded deadline for default selection
+and confirms the selected sink. Login now distinguishes an account/password
+rejection from a desktop startup error; infrastructure failures do not consume
+the five rejected-login allowance.
+
+The password field deliberately displays a fixed eight-star mask for any
+nonempty password. A new keyboard regression verifies that one scancode press
+and release adds one character and that one Unicode press and release adds
+one character, while the displayed mask stays identical. The field labels
+this behavior explicitly. Physical dead-key composition also preserves
+accented password characters and resets between fields and submissions.
+
+Validation evidence is stored under `artifacts/boot-login-fix/`. The Python
+suite passed 67 tests with two opt-in tests skipped; all 12 native broker
+groups passed. Eight audio tests include a deliberately delayed private
+WirePlumber launch, default-output verification, actual playback/capture and
+reconnect, startup deadline and daemon failure, and cleanup regressions.
+All 73 bridge library tests and the frontend lifecycle test passed, including
+dead-key/Unicode input, field-reset, fixed-mask, and infrastructure-failure
+regressions. Rust formatting and the packaged systemd units passed their checks.
+The combined `0.1.0-14` package built successfully with its required checks,
+then passed structure/preservation validation. Its extracted NVIDIA unit and
+audio helper match the edited sources. The packaged binaries passed disposable
+TLS login rejection/authentication, JIS password input, real desktop input,
+dynamic resizing, reconnect, held-input release, and compositor-crash checks
+using the namespace broker fixture. The fixture now supplies the same JIS
+defaults to the login form as its existing compositor configuration; its
+previous default invocation paired a US login map with JIS password scancodes.
+Report: `artifacts/boot-login-fix/rdp-integration.json`. This fixture does not
+authenticate Linux accounts or exercise an installed systemd boot.
+
+Private socket tests required execution outside the sandbox. A proposed
+disposable mount-namespace NVIDIA node test could not run because `sudo -n`
+required authentication. No host package, service, driver configuration, or
+session was changed. Installed cold-boot and Windows login validation remain
+pending; capture the boot journals before running `nvidia-smi`, FFmpeg, or a
+local graphical session, following [acceptance.md](acceptance.md).
+
 ## Audio delay and adaptive NVENC bitrate, 2026-10-12
 
 Package release `0.1.0-9` separates audio receipt credits from playback feedback,
