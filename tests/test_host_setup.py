@@ -110,6 +110,7 @@ class HostSetupTests(unittest.TestCase):
                            "DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus"}
             with patch.object(helper.shutil, "which", return_value="/usr/bin/fcitx5"), \
                     patch.object(helper, "owns_name", side_effect=[False, True]), \
+                    patch.object(helper, "ready", return_value=True), \
                     patch.object(helper.subprocess, "Popen") as start:
                 helper.start(environment)
             self.assertEqual(start.call_args.args[0], ["/usr/bin/fcitx5", "-D"])

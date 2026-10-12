@@ -1,5 +1,77 @@
 # Validation record
 
+## Audio playback feedback and Fcitx5, 2026-10-12
+
+Release `0.1.0-15` fixes two audio feedback errors: a receipt confirmation with a
+positive timestamp delta previously hid later playback feedback, and eight-bit
+block numbers could wrap while an older wave still awaited playback. Increasing
+feedback remains valid; clients demonstrating paired confirmations wait for
+playback progress before reusing those numbers. Equal replies and later FIFO
+progress retire missing earlier confirmations. This follows the
+[MS-RDPEA confirmation timestamp rule](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/a4e42263-dc78-4748-9752-173e5bfa3dfb).
+
+The frontend automatically prefers 48 kHz stereo MS ADPCM when offered by the
+client, reducing payload traffic from PCM's 1536 kbit/s to about 389 kbit/s.
+Independent 1024-byte blocks contain 1012 sample frames and use the exact
+21.083333 ms cadence. PCM remains the fallback. Wave2 timestamps record frontend
+capture acquisition before pacing, using the
+[boot-relative timestamp specified by MS-RDPEA](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/25cebccb-d679-4302-8dd0-df7fb9a4f9b5).
+These do not provide upstream sample timestamps or a shared client presentation clock.
+
+The installed release 14 journal identified the Fcitx failure directly:
+`zwp_virtual_keyboard_v1#22: error 0: invalid virtual keyboard keymap data`.
+The pinned Smithay input-method grab sends an unsealed keymap without a trailing
+NUL, which Fcitx forwards unchanged. The maintained patch now accepts that form
+alongside sealed bridge keymaps. Forwarded keys from the input-method grab's
+owner reach applications without reentering the grab or applying XKB and
+bindings twice. The same journal showed a five-second input-method startup
+timeout and a Wayland registry timeout. Preparation now serves Wayland events
+while waiting for Fcitx's loaded controller; failed helper startup reaps its
+launched daemon before retry. The existing profile snapshot remains private.
+Committed Unicode retains its device map and shares the grab's FIFO with
+physical keys, preserving mixed input order and physical modifiers. Five native
+tests cover keymap files, ownership, map/modifier preservation and a delayed
+input method with a repeated grab. The latter reproduces deferred Wayland
+resource initialization, which must be handled before recording the new grab.
+The client protocol test enables the existing locked `wayland-protocols-misc`
+0.3.12 client feature: two dependency links change, while all 482 crate
+versions, checksums and source revisions remain identical. Both original and
+patched lockfile hashes are recorded in `compositor/pins.json`.
+
+`make check BRIDGE_CARGO_HOME="$PWD/poc/.cargo-cache"` passed: 71 Python tests
+(two opt-in checks skipped), five PoC Rust tests, four startup checks, all 12
+native broker groups, 80 bridge library tests and the frontend lifecycle test.
+Fourteen bridge audio tests include more than a minute of simulated encoded RDP
+traffic across timestamp/block wrapping, positive receipt then long playback
+feedback, duplicate/missing replies, healthy PCM and ADPCM quantum continuity,
+backpressure and reconnect cleanup. The native codec fixture independently
+decodes dropped ADPCM blocks and checks exact sample counts, stereo signal
+quality, guarded input buffers and recovery after invalid lengths. Rust formatting
+passed. Clippy reports only five existing login/Wayland warnings.
+
+The default lab FreeRDP 3.32.1 build accepts the 48 kHz stereo PCM fallback but
+filters MS ADPCM with its experimental DSP codecs disabled; see its
+[codec filter](https://raw.githubusercontent.com/FreeRDP/FreeRDP/3.32.1/libfreerdp/codec/dsp_ffmpeg.c).
+The codec negotiation/packet and FFmpeg decode checks do not establish Windows
+acceptance of the precise ADPCM format. Actual mstsc lip-sync, codec selection
+and recovery after congestion remain the [audio/video acceptance check](acceptance.md).
+The previous session's private audio socket had already stopped, so no live
+application or client playback latency was measured from that session.
+
+Disposable compositor/RDP/Fcitx checks and build evidence are under
+`artifacts/av-ime-fix/`. The input fixture uses a private bus, synthetic account,
+copied profile and native Wayland text input. No installed services, host input
+profiles or packages were changed; no Git commit was created.
+The combined release 15 package built with all required checks, including three
+headless and five protocol regressions, and passed package structure/preservation
+validation. Its extracted binaries passed NVIDIA EGL/NVENC video decoding, TLS
+login rejection/authentication, live resizing, reconnect, held-input release and
+compositor-crash checks. Real Fcitx5/Mozc tests committed `日本` and F7-converted
+Katakana `ニホン`, preserved consecutive JIS/Shift/Unicode input with Fcitx running,
+and preserved committed Unicode while Mozc was active. Startup preparation
+completed while Wayland remained responsive. The packaged helper hashes match
+the checkout; report: `artifacts/av-ime-fix/package-integration.json`.
+
 ## NVIDIA cold-boot and authenticated desktop startup fixes, 2026-10-12
 
 The installed release 13 frontend still failed with `CUDA_ERROR_NO_DEVICE`

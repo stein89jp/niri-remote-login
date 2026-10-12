@@ -27,6 +27,7 @@ are in `scripts/headless-integration.py`; they do not substitute for this matrix
 | Resume authorization | Reject wrong password, expired/locked account and removed `niri-rdp-users` membership on resume; preserve the detached desktop without creating another session | Pending real PAM tests |
 | Frontend/broker crash | Frontend stop/SIGKILL retains desktop for reconnect within the 45-second grace window; broker stop/SIGKILL ends desktops. Test `ExecStopPost` recovery and orphan scope teardown, restart and log in again | Pending |
 | Input disconnect | Disconnect while key and button held; verify releases and no state carried into next connection | Automated real-app test passed |
+| Fcitx5 input | Start a fresh remote desktop with the existing Fcitx profile; toggle with the configured hotkey, type and convert Japanese in native Wayland, GTK/Qt and XWayland apps; reconnect and verify the daemon survives and the saved host profile is unchanged | Automated native Wayland Fcitx5/Mozc profile, Ctrl+Space and Japanese commit passed; installed toolkit/Windows checks pending |
 | GNOME preservation | Compare GRD/GDM enablement/listeners and local session before/after test-machine experiment; do not alter working host | Packages have no GNOME configuration or stock Niri replacement |
 
 Useful read-only observations on the test installation:
@@ -63,7 +64,8 @@ Single-session frontend, Japanese JP106 physical-key input, normal transform and
 the current contract. The frontend follows client-selected initial dimensions
 and supports live single-display resolution requests through Display Control.
 Rebuild both packages; see the [resolution contract](../bridge/README.md#dynamic-resolution). No
-multi-monitor, clipboard or remote IME composition claim is made. Session audio
+multi-monitor, clipboard or client-side RDP IME composition claim is made. Host
+Fcitx5/Mozc native Wayland composition is covered by the disposable integration test. Session audio
 has private PipeWire capture and RDP packet tests; installed-service playback
 through Windows mstsc, including reconnect, still requires actual-machine validation.
 Broker mode retains

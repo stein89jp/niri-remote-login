@@ -246,6 +246,9 @@ and duplicate framework entries are skipped. Fcitx receives a private copy of
 its configured profile so remote layout changes cannot rewrite the host profile.
 IBus receives a private address and discovery file. D-Bus activation receives
 the remote display before startup applications launch.
+Fcitx5 startup waits for its configured groups to be available while Wayland
+continues serving clients. Its ordinary typing, input-method switching, and
+native Wayland composition use the existing profile and hotkeys automatically.
 The private bus and display remain session-specific; shared user systemd services
 are not restarted or given the remote display.
 
@@ -356,16 +359,19 @@ frame rate or ceiling for limited networks; increasing the ceiling can improve
 AVC420 quality when the connection has enough bandwidth. Bitmap fallback does
 not use this bitrate controller.
 
-Audio is paced in 20 ms blocks and keeps recent capture samples when the source
-or network stalls. The frontend also observes playback confirmations after
-receipt confirmations, so a client reporting excessive playback buffering can
-drain before current sound resumes. Recovery may skip sound during congestion.
-These controls limit accumulating delay; they do not establish a shared audio
-and video presentation clock or guarantee a particular sound offset on mstsc.
-Uncompressed stereo audio itself uses about 1.54 Mbps before framing.
+Audio automatically prefers MS ADPCM when the client supports it, reducing
+stereo playback traffic from about 1.54 Mbps to 0.39 Mbps before framing. Other
+clients receive PCM. Blocks are paced by their exact sample duration and keep
+recent capture samples when the source or network stalls. Playback feedback
+continues to be tracked after receipt confirmations, including long delays and
+block-number wrapping, so an excessive client buffer can drain before current
+sound resumes. Recovery may skip sound during congestion. No manual delay or
+codec setting is needed. These controls limit accumulating delay; actual mstsc
+audio/video presentation still needs the playback check below.
 
-To investigate remaining delay, inspect the frontend journal for `RDP audio
-client playback delay` and `RDP graphics adaptive H.264 target`. Test a clip with visible
+To inspect playback, the frontend journal reports `RDP audio MS ADPCM` or
+`RDP audio PCM`, plus `RDP audio client playback delay` during buffer recovery
+and `RDP graphics adaptive H.264 target` during video adaptation. Test a clip with visible
 claps or simultaneous flash/tone for several minutes, then repeat after a short
 network stall. Record whether the offset stays constant or keeps growing; see
 the [audio/video acceptance check](acceptance.md). When upgrading from an active

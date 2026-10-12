@@ -106,8 +106,59 @@ def resize_roundtrip(environment, ipc_path, log_path):
             log_path.write_text("".join(output) + errors)
 
 
+def fcitx_environment(environment, runtime, private, launch, bus_log="ime-bus.log"):
+    """Configure a disposable user's profile and isolated bus."""
+    bus_path = runtime / "ime-bus"
+    bus = launch(["/usr/bin/dbus-daemon", "--session", "--nofork", "--nopidfile",
+                  "--address=unix:path=" + str(bus_path)], environment, bus_log)
+    wait_for(bus_path, bus)
+    config = private / "config"
+    profile = config / "fcitx5/profile"
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text("[Groups/0]\nName=Default\nDefault Layout=jp\nDefaultIM=mozc\n"
+                       "[Groups/0/Items/0]\nName=keyboard-jp\n"
+                       "[Groups/0/Items/1]\nName=mozc\n[GroupOrder]\n0=Default\n")
+    environment = dict(environment, NIRI_RDP_RUNTIME_DIR=str(runtime),
+                       XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY="wayland-0",
+                       DBUS_SESSION_BUS_ADDRESS="unix:path=" + str(bus_path),
+                       XDG_CONFIG_HOME=str(config), INPUT_METHOD="fcitx", QT_IM_MODULE="fcitx")
+    return environment
+
+
+def start_fcitx(environment, runtime, private, launch):
+    """Use the production profile snapshot on a disposable private bus."""
+    environment = fcitx_environment(environment, runtime, private, launch)
+    # Keep the daemon in a tracked child group even after this helper exits.
+    helper = launch(["/usr/bin/python3", "-c",
+                     "import os, importlib.util; from importlib.machinery import SourceFileLoader; "
+                     "loader=SourceFileLoader('input_method', '/work/broker/config/session-input-method'); "
+                     "helper=importlib.util.module_from_spec(importlib.util.spec_from_loader(loader.name, loader)); "
+                     "loader.exec_module(helper); "
+                     "helper.start(os.environ)"], environment, "fcitx.log")
+    if helper.wait(timeout=10):
+        raise RuntimeError("private Fcitx profile startup failed")
+    copied = runtime / "input-method-config/fcitx5/profile"
+    if not copied.exists() or copied.read_bytes() != (private / "config/fcitx5/profile").read_bytes():
+        raise RuntimeError("Fcitx did not inherit the disposable configured profile")
+    for arguments in (["-s", "mozc"], ["-c"]):
+        subprocess.run(["/usr/bin/fcitx5-remote", *arguments], env=environment,
+                       check=True, capture_output=True, timeout=5)
+    return environment
+
+
+def require_fcitx(environment):
+    current = subprocess.run(["/usr/bin/fcitx5-remote", "-n"], env=environment,
+                             check=True, capture_output=True, text=True, timeout=5)
+    if not current.stdout.strip():
+        raise RuntimeError("Fcitx lost its private bus name during remote input")
+
+
 def main():
     gpu_rendering = os.environ.get("NIRI_RDP_LAB_NVIDIA_RENDERER") == "1"
+    fcitx = os.environ.get("NIRI_RDP_LAB_FCITX") == "1"
+    if fcitx and (not shutil.which("fcitx5") or not shutil.which("fcitx5-remote") or
+                  not Path("/usr/share/fcitx5/inputmethod/mozc.conf").exists()):
+        raise RuntimeError("the opt-in IME check requires Fcitx5 and its Mozc addon")
     dri = Path("/dev/dri")
     if dri.exists():
         if not gpu_rendering or any(
@@ -119,6 +170,15 @@ def main():
     if (ROOT != Path("/work") or
             Path("/dev/input").exists() or os.environ.get("DISPLAY")):
         raise RuntimeError("run only inside lab/run-isolated.sh with private devices")
+    if fcitx:
+        # D-Bus and Mozc need a name for this namespace's unprivileged UID.
+        # /etc is disposable; no host account database is mounted here.
+        if Path("/etc/passwd").exists():
+            raise RuntimeError("IME integration requires a disposable account database")
+        Path("/etc/passwd").write_text(
+            f"test:x:{os.getuid()}:{os.getgid()}:Disposable test:/home/test:/bin/sh\n")
+        Path("/etc/group").write_text(f"test:x:{os.getgid()}:\n")
+        Path("/etc/nsswitch.conf").write_text("passwd: files\ngroup: files\n")
     runtime = Path(os.environ["XDG_RUNTIME_DIR"])
     encoder = os.environ.get("NIRI_RDP_LAB_ENCODER", "bitmap")
     if encoder not in ("bitmap", "nvenc"):
@@ -189,7 +249,10 @@ def main():
                         raise RuntimeError("requested NVIDIA renderer and DMA-BUF support were not confirmed")
                     time.sleep(0.05)
                 results["nvidia_renderer"] = "hardware EGL device and application DMA-BUF formats confirmed"
-            app = launch([str(ROOT / "lab/dynamic-app")], dict(env, WAYLAND_DISPLAY="wayland-0"), "app.log")
+            app_env = dict(env, WAYLAND_DISPLAY="wayland-0")
+            if fcitx:
+                app_env["NIRI_RDP_TEST_IME"] = "1"
+            app = launch([str(ROOT / "lab/dynamic-app")], app_env, "app.log")
             time.sleep(1)
             bridge_env = dict(env, NIRI_RDP_MODE="disposable", NIRI_RDP_CERT=str(private / "cert.pem"),
                               NIRI_RDP_KEY=str(private / "key.pem"), NIRI_RDP_USERNAME=username,
@@ -276,6 +339,36 @@ def main():
                         raise RuntimeError(f"Japanese conversion key did not arrive: {key} {state}")
             results["jp106_punctuation_ro_yen_and_phone_unicode_surrogate_shift_roundtrip"] = "passed"
             results["wayland_application_events_and_animation"] = "passed"
+            if fcitx:
+                ime_env = start_fcitx(env, runtime, private, launch)
+                forward_offset = (private / "app.log").stat().st_size
+                forwarded = resize_roundtrip(client_env, ipc_path, private / "client-fcitx-forwarded.log")
+                if forwarded.returncode or "NIRI_RDP_APP_KEY_POINTER_RELEASE_OK" not in forwarded.stdout:
+                    raise RuntimeError("Fcitx did not forward ordinary RDP keys")
+                forwarded_log = (private / "app.log").read_bytes()[forward_offset:].decode()
+                for text in ["abc123ABc", '@"^&:[]\\\\', 'Phone@"日本😀Aa@']:
+                    if f"XKB_TEXT {text}" not in forwarded_log:
+                        raise RuntimeError(f"Fcitx changed forwarded text or committed Unicode: {text!r}")
+                require_fcitx(ime_env)
+                composed = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")],
+                                          env=dict(client_env, NIRI_RDP_TEST_IME="1"),
+                                          capture_output=True, text=True, timeout=25)
+                (private / "client-fcitx-compose.log").write_text(composed.stdout + composed.stderr)
+                if composed.returncode or "NIRI_RDP_IME_SEQUENCE_SENT" not in composed.stdout:
+                    raise RuntimeError("RDP Japanese composition sequence failed")
+                deadline = time.monotonic() + 5
+                while not all(text in (private / "app.log").read_text()
+                              for text in ("IME_COMMIT 日本", "IME_COMMIT ニホン", 'XKB_TEXT U@日本😀')):
+                    if time.monotonic() >= deadline:
+                        raise RuntimeError("Fcitx/Mozc Japanese, Katakana or committed Unicode input failed")
+                    time.sleep(0.05)
+                require_fcitx(ime_env)
+                subprocess.run(["/usr/bin/fcitx5-remote", "-c"], env=ime_env,
+                               check=True, capture_output=True, timeout=5)
+                results["fcitx_private_profile_forwarded_keys_ctrl_space_mozc_japanese_commit"] = "passed"
+                results["fcitx_forwarded_jis_shift_and_committed_unicode"] = "passed"
+                results["fcitx_mozc_katakana_conversion_through_rdp_f7"] = "passed"
+                results["committed_unicode_with_mozc_active"] = "passed"
             if gpu_rendering:
                 results["no_physical_input_or_drm_modesetting_or_inherited_display"] = "passed; DRM render nodes only"
             else:
@@ -313,6 +406,31 @@ def main():
             if crashing.returncode != 2 or bridge.poll() is not None:
                 raise RuntimeError("compositor crash did not close the active RDP connection cleanly")
             results["compositor_crash_closes_active_rdp_frontend_survives"] = "passed"
+            if fcitx and os.environ.get("NIRI_RDP_LAB_INPUT_METHOD_STARTUP") == "1":
+                startup_runtime = private / "startup-runtime"
+                startup_runtime.mkdir(mode=0o700)
+                startup_env = fcitx_environment(env, startup_runtime, private, launch, "startup-bus.log")
+                startup = launch([str(ROOT / os.environ.get("NIRI_RDP_LAB_NIRI", "compositor/upstream/target/debug/niri")),
+                                  "--config", str(ROOT / "lab/headless.kdl")], startup_env, "startup-niri.log")
+                wait_for(startup_runtime / "wayland-0", startup)
+                deadline = time.monotonic() + 10
+                while True:
+                    query = subprocess.run([
+                        "/usr/bin/busctl", "--address=" + startup_env["DBUS_SESSION_BUS_ADDRESS"],
+                        "--auto-start=no", "--timeout=1", "call", "org.fcitx.Fcitx5", "/controller",
+                        "org.fcitx.Fcitx.Controller1", "CurrentInputMethodGroup",
+                    ], env=startup_env, capture_output=True, text=True, timeout=2)
+                    if query.returncode == 0 and query.stdout.strip() == 's "Default"':
+                        break
+                    if startup.poll() is not None or time.monotonic() >= deadline:
+                        raise RuntimeError("compositor startup did not prepare Fcitx while serving Wayland")
+                    time.sleep(0.05)
+                # With no focused application, CurrentInputMethod may be empty;
+                # the controller group reply proves profile and bus readiness.
+                startup_log = (private / "startup-niri.log").read_text()
+                if "startup timed out" in startup_log or "activation preparation failed" in startup_log:
+                    raise RuntimeError("compositor startup reported input-method preparation failure")
+                results["fcitx_ready_during_compositor_prepare_without_wayland_deadlock"] = "passed"
             if encoder == "nvenc":
                 bridge_log = (private / "bridge.log").read_text()
                 if "NVENC H.264 preflight passed" not in bridge_log:
@@ -321,7 +439,8 @@ def main():
                 # held-input and crash probes retain their initial desktop.
                 # Login and desktop share a graphics wrapper and the same
                 # negotiated size, so authentication reuses the login surface.
-                expected_graphics = 3 * len(DESKTOP_SIZES) + 2 if gfx else 0
+                expected_graphics = (3 * len(DESKTOP_SIZES) + 2 +
+                                     (len(DESKTOP_SIZES) + 1 if fcitx else 0)) if gfx else 0
                 actual_graphics = bridge_log.count("RDP graphics using NVENC H.264 AVC420")
                 if actual_graphics != expected_graphics:
                     raise RuntimeError(f"expected {expected_graphics} NVENC AVC420 initializations, "
@@ -333,8 +452,10 @@ def main():
                 deadline = time.monotonic() + 3
                 while fixture.closed != fixture.accepted and time.monotonic() < deadline:
                     time.sleep(0.05)
-                expected_rejections = 6 if login_screen else 1
-                if fixture.rejected < expected_rejections or fixture.accepted != 5 or fixture.closed != 5:
+                expected_connections = 7 if fcitx else 5
+                expected_rejections = (6 + (2 if fcitx else 0)) if login_screen else 1
+                if (fixture.rejected < expected_rejections or fixture.accepted != expected_connections or
+                        fixture.closed != expected_connections):
                     raise RuntimeError("TLS broker FD/lease lifecycle counts do not match the RDP connections: "
                                        f"rejected={fixture.rejected}, accepted={fixture.accepted}, closed={fixture.closed}")
                 key = ("tls_login_screen_rejection_authentication_desktop_and_lease_eof" if login_screen else

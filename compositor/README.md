@@ -59,12 +59,36 @@ implementation sent events directly to `wl_keyboard` and maintained a separate
 client keymap; it bypassed compositor shortcuts such as Mod+D. The compositor
 now uses Niri's configured keymap, preserves the selected layout group during
 remote modifier synchronization, and releases held keys on disconnect. Temporary
-Unicode maps restore the previous map and modifiers without undoing a later
-configuration reload. The isolated integration fixture decodes the actual
+Unicode maps stay specific to the text device; the seat's map and modifiers
+remain intact. Their events share the input-method queue with physical keys,
+preserving order when a client sends a burst. The isolated integration fixture decodes the actual
 Wayland XKB map and requires consecutive `abc123ABc`, Return and a Mod+D compositor
 binding, in addition to capture, resize and disconnect checks.
 
 Private remote startup publishes the compositor's application environment to its
 private D-Bus bus synchronously before startup applications can activate services.
 This hook runs only in a headless broker session and uses the fixed packaged
-autostart helper.
+autostart helper. It serves Wayland events while waiting for input-method
+readiness, so a daemon's startup roundtrips cannot block the compositor.
+
+Input-method virtual keyboards are handled separately from remote physical
+keyboards. Fcitx's forwarded keys reach applications without reentering its
+own grab or applying XKB/keybindings twice. Both sealed, NUL-terminated bridge
+keymaps and the pinned Smithay grab's unsealed text keymaps are accepted.
+
+With Fcitx5 and Mozc installed, the opt-in disposable check validates inherited
+profiles, forwarded typing, Ctrl+Space, Japanese and Katakana native Wayland composition,
+and compositor startup readiness:
+
+```sh
+lab/build-app.sh
+lab/run-isolated.sh --input-method-startup env NIRI_RDP_LAB_FCITX=1 \
+  NIRI_RDP_LAB_NIRI=compositor/upstream/target/release/niri \
+  NIRI_RDP_LAB_BRIDGE=bridge/target/release/niri-rdp-bridge \
+  python3 scripts/headless-integration.py
+```
+
+The fixture's text-input protocol XML is copied from the pinned
+`wayland-protocols` 0.32.13 crate with its upstream license intact; its hash is
+recorded in `pins.json`. The test mounts checkout startup helpers only in the
+private namespace and uses a disposable account database, bus and profile.

@@ -234,28 +234,38 @@ only a broker-authorized raw PCM descriptor, without access to the user's runtim
 This follows GNOME Remote Login's session-playback model: capture an audio sink
 and send it through RDP ([GNOME implementation](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dvc-audio-playback.c)).
 
-Playback is stereo 48 kHz, signed 16-bit little-endian PCM, in 20 ms blocks
-(about 1.54 Mbit/s before framing). A client must enable remote playback and
-accept this format. No microphone redirection is provided. Audio starts after
+Capture is stereo 48 kHz, signed 16-bit little-endian PCM. The frontend
+automatically prefers MS ADPCM when the client accepts it: independent 1024-byte
+blocks represent 1012 stereo sample frames (21.083 ms), using about 389 kbit/s
+before framing. PCM remains the fallback, using 20 ms blocks and about
+1.54 Mbit/s. No additional audio configuration is required. A client must enable
+remote playback and accept one of these formats. No microphone redirection is provided. Audio starts after
 successful Linux authentication, including submission through the login form.
 Disconnect closes capture; authenticated reconnect opens a fresh monitor of the
 retained desktop. At most four waves await receipt confirmation. A separate
 bounded history retains playback feedback after receipt acknowledgements: when
 the client reports more than 120 ms of playback buffering, capture is discarded
-while that buffer drains. A client sending only one confirmation remains usable.
-The bridge paces blocks at a 20 ms cadence and retains a three-block (60 ms)
+while that buffer drains. Receipt feedback with a positive delay no longer
+hides later playback feedback. Once paired confirmations are observed, block
+numbers are not reused ahead of playback progress; later progress also retires
+missing earlier confirmations. A client sending only one confirmation remains usable.
+The bridge paces blocks by their exact sample duration and retains a three-block
 capture FIFO to absorb ordinary PipeWire batching. Excess backlog drops the
 oldest complete blocks while preserving partial-sample alignment. The session monitor
 also drains capture continuously through socket stalls with bounded buffers.
-This trades skipped sound during congestion for recovery to current playback.
+Wave2 timestamps use the boot-relative clock and are recorded when the frontend
+acquires capture blocks, before pacing. The raw monitor stream carries no upstream
+sample timestamps. This trades skipped sound during congestion for recovery to current playback.
 It does not synchronize the client's audio and graphics presentation clocks;
 actual Windows lip-sync and recovery still need measurement.
 Disposable compositor mode has no audio backend.
 
 `python3 -m unittest tests.test_audio -v` runs real private PipeWire playback,
-captures a tone and repeats after reconnect. Rust tests negotiate the sound
-channel, decode the PCM Wave2 PDU, verify the client's format index, and check
-backpressure and disconnect cleanup. Installed-service and Windows mstsc sound
+captures a tone and repeats after reconnect, and verifies independent ADPCM
+encode/decode blocks with guarded source buffers. Rust tests negotiate both
+formats, decode Wave2 PDUs, verify the client's format index, and check
+backpressure, long playback feedback, timestamp/block wrapping, healthy sample
+continuity and disconnect cleanup. Installed-service and Windows mstsc sound
 playback remain actual-machine acceptance checks.
 
 ## Dynamic resolution

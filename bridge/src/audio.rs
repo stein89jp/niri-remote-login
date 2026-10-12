@@ -1,4 +1,4 @@
-//! Session PCM playback through the TLS-protected RDP sound channel.
+//! Session audio through the TLS-protected RDP sound channel.
 use ironrdp_rdpsnd::{
     pdu::{AudioFormat, WaveFormat},
     server::{NegotiatedFormat, RdpsndError},
@@ -8,6 +8,7 @@ use ironrdp_server::{
 };
 use std::{
     collections::VecDeque,
+    ffi::{CStr, c_char, c_void},
     io::{Read, Write},
     os::unix::net::UnixStream,
     sync::{
@@ -20,19 +21,120 @@ use std::{
 use tokio::sync::mpsc::UnboundedSender;
 
 pub const BLOCK_BYTES: usize = 48000 * 2 * 2 / 50; // 20 ms, stereo S16LE
+const ADPCM_SAMPLES: usize = 1012;
+const ADPCM_BLOCK_BYTES: usize = 1024;
 // IronRDP keeps at most four waves per event batch. Stay below that limit
 // so every queued wave receives a block number and can be acknowledged.
 const MAX_PENDING: usize = 4;
-const MAX_CAPTURE_BLOCKS: usize = 3; // 60 ms of normal capture batching/jitter
-const BLOCK_DURATION: Duration = Duration::from_millis(20);
+const MAX_CAPTURE_BLOCKS: usize = 3; // At most 64 ms of capture batching/jitter
 const PLAYBACK_BUDGET: Duration = Duration::from_millis(120);
+
+unsafe extern "C" {
+    fn niri_audio_new(error: *mut c_char, length: usize) -> *mut c_void;
+    fn niri_audio_free(encoder: *mut c_void);
+    fn niri_audio_extra(encoder: *mut c_void, data: *mut u8, capacity: usize) -> i32;
+    fn niri_audio_encode(
+        encoder: *mut c_void,
+        pcm: *const u8,
+        length: usize,
+        data: *mut *const u8,
+        error: *mut c_char,
+        error_length: usize,
+    ) -> i32;
+}
+
+struct Adpcm {
+    ptr: *mut c_void,
+    format: AudioFormat,
+}
+// The FFmpeg context has one owner, moved to the capture worker after negotiation.
+unsafe impl Send for Adpcm {}
+impl Drop for Adpcm {
+    fn drop(&mut self) {
+        unsafe { niri_audio_free(self.ptr) };
+    }
+}
+impl Adpcm {
+    fn new() -> anyhow::Result<Self> {
+        let mut error = [0 as c_char; 256];
+        let ptr = unsafe { niri_audio_new(error.as_mut_ptr(), error.len()) };
+        anyhow::ensure!(
+            !ptr.is_null(),
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        let mut encoder = Self {
+            ptr,
+            format: AudioFormat {
+                format: WaveFormat::ADPCM,
+                n_channels: 2,
+                n_samples_per_sec: 48000,
+                n_avg_bytes_per_sec: (48000 * ADPCM_BLOCK_BYTES / ADPCM_SAMPLES) as u32,
+                n_block_align: ADPCM_BLOCK_BYTES as u16,
+                bits_per_sample: 4,
+                data: None,
+            },
+        };
+        let mut extra = vec![0; 32];
+        anyhow::ensure!(
+            unsafe { niri_audio_extra(ptr, extra.as_mut_ptr(), extra.len()) } == 32,
+            "invalid MS ADPCM format data"
+        );
+        encoder.format.data = Some(extra);
+        Ok(encoder)
+    }
+    fn encode(&mut self, pcm: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut error = [0 as c_char; 256];
+        let mut data = std::ptr::null();
+        let length = unsafe {
+            niri_audio_encode(
+                self.ptr,
+                pcm.as_ptr(),
+                pcm.len(),
+                &mut data,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        anyhow::ensure!(
+            length == ADPCM_BLOCK_BYTES as i32 && !data.is_null(),
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        Ok(unsafe { std::slice::from_raw_parts(data, length as usize) }.to_vec())
+    }
+}
+
+fn pcm_format() -> AudioFormat {
+    AudioFormat {
+        format: WaveFormat::PCM,
+        n_channels: 2,
+        n_samples_per_sec: 48000,
+        n_avg_bytes_per_sec: 192000,
+        n_block_align: 4,
+        bits_per_sample: 16,
+        data: None,
+    }
+}
+
+fn monotonic_millis() -> std::io::Result<u32> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok((time.tv_sec as u64 * 1000 + time.tv_nsec as u64 / 1_000_000) as u32)
+}
 
 #[derive(Debug)]
 struct SentWave {
     number: u8,
     timestamp: u16,
     acknowledged: bool,
-    rendered: bool,
+    feedback_ms: u16,
+    playback_confirmed: bool,
 }
 
 /// Arrival confirms release transport credit, but do not mean the sound played.
@@ -46,10 +148,19 @@ struct FlowControl {
     hold_until: Option<Instant>,
     last_warning: Option<Instant>,
     latest_sent: Option<Instant>,
+    paired_confirms: bool,
 }
 impl FlowControl {
     fn can_send(&self, now: Instant) -> bool {
-        self.pending < MAX_PENDING && self.hold_until.is_none_or(|until| now >= until)
+        self.pending < MAX_PENDING
+            && self.hold_until.is_none_or(|until| now >= until)
+            // Block IDs wrap after about five seconds. Once the client has
+            // demonstrated separate receipt/playback confirms, do not reuse
+            // an ID still awaiting playback. A late render ACK otherwise
+            // looks like a confirmation of the newer wave with that ID.
+            && !(self.paired_confirms
+                && self.recent.len() == 256
+                && self.recent.front().is_some_and(|wave| !wave.playback_confirmed))
     }
     fn sent(&mut self, number: u8, timestamp: u16, now: Instant) {
         if self.recent.len() == 256 {
@@ -68,33 +179,49 @@ impl FlowControl {
             number,
             timestamp,
             acknowledged: false,
-            rendered: false,
+            feedback_ms: 0,
+            playback_confirmed: false,
         });
     }
     fn confirm(&mut self, number: u8, timestamp: u16, now: Instant) {
-        let Some(wave) = self
-            .recent
-            .iter_mut()
-            .rev()
-            .find(|wave| wave.number == number)
-        else {
+        let Some(position) = self.recent.iter().rposition(|wave| wave.number == number) else {
             return;
         };
+        let wave = &mut self.recent[position];
         let held_ms = timestamp.wrapping_sub(wave.timestamp);
-        if held_ms >= 0x8000 || wave.rendered {
+        if held_ms >= 0x8000 {
             return;
         }
-        if !wave.acknowledged {
+        let already_acknowledged = wave.acknowledged;
+        if !already_acknowledged {
             wave.acknowledged = true;
             self.pending -= 1;
         }
-        // An exact echo can be the arrival confirm, including duplicates.
-        // Nonzero held time carries playback feedback, even for clients with
-        // only a single confirmation. Ignore duplicate render feedback.
-        if held_ms == 0 {
+        let increased = held_ms > wave.feedback_ms;
+        let playback_confirmed = already_acknowledged && (increased || self.paired_confirms);
+        if already_acknowledged && increased {
+            self.paired_confirms = true;
+        }
+        if playback_confirmed {
+            // Audio is consumed in stream order. Completion of a later wave
+            // also retires a missing earlier confirm, so one lost/equal ACK
+            // cannot permanently mute a paired client at block-number reuse.
+            for old in self.recent.iter_mut().take(position + 1) {
+                old.playback_confirmed = true;
+                if !old.acknowledged {
+                    old.acknowledged = true;
+                    self.pending -= 1;
+                }
+            }
+        }
+        // Receipt itself can take a few milliseconds: a positive first
+        // confirmation does not prove playback finished. Keep accepting
+        // increased feedback for this wave, including the later render ACK.
+        // Duplicate or reordered smaller reports must not restart recovery.
+        if !increased {
             return;
         }
-        wave.rendered = true;
+        self.recent[position].feedback_ms = held_ms;
         let held = Duration::from_millis(u64::from(held_ms));
         if held > PLAYBACK_BUDGET {
             // Anchor to the queued tail, not the receipt of a delayed render
@@ -142,18 +269,22 @@ impl ServerEventSender for Factory {
 }
 impl SoundServerFactory for Factory {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
+        let encoder = Adpcm::new()
+            .map_err(|error| {
+                eprintln!("RDP audio MS ADPCM unavailable; offering PCM: {error}");
+                error
+            })
+            .ok();
+        let mut formats = Vec::new();
+        if let Some(encoder) = &encoder {
+            formats.push(encoder.format.clone());
+        }
+        formats.push(pcm_format());
         Box::new(Backend {
             audio: self.audio.clone(),
             sender: self.sender.clone().expect("sound factory sender"),
-            formats: vec![AudioFormat {
-                format: WaveFormat::PCM,
-                n_channels: 2,
-                n_samples_per_sec: 48000,
-                n_avg_bytes_per_sec: 192000,
-                n_block_align: 4,
-                bits_per_sample: 16,
-                data: None,
-            }],
+            formats,
+            encoder,
             stopped: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(Mutex::new(FlowControl::default())),
             worker: None,
@@ -164,6 +295,7 @@ struct Backend {
     audio: Audio,
     sender: UnboundedSender<ServerEvent>,
     formats: Vec<AudioFormat>,
+    encoder: Option<Adpcm>,
     stopped: Arc<AtomicBool>,
     pending: Arc<Mutex<FlowControl>>,
     worker: Option<thread::JoinHandle<()>>,
@@ -183,7 +315,31 @@ impl RdpsndServerHandler for Backend {
     ) -> Option<&'a NegotiatedFormat> {
         common.first()
     }
-    fn start(&mut self, _: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+    fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
+        let mut encoder = if format.format().format == WaveFormat::ADPCM {
+            Some(self.encoder.take().ok_or_else(|| {
+                Box::new(std::io::Error::other("MS ADPCM encoder unavailable"))
+                    as Box<dyn RdpsndError>
+            })?)
+        } else {
+            self.encoder.take();
+            None
+        };
+        let block_bytes = if encoder.is_some() {
+            ADPCM_SAMPLES * 4
+        } else {
+            BLOCK_BYTES
+        };
+        let block_duration = Duration::from_secs_f64(block_bytes as f64 / 192000.0);
+        let start_timestamp =
+            monotonic_millis().map_err(|e| Box::new(e) as Box<dyn RdpsndError>)?;
+        let clock_start = Instant::now();
+        eprintln!(
+            "RDP audio {}: 48 kHz stereo, {} kbps, {:.2} ms blocks",
+            if encoder.is_some() { "MS ADPCM" } else { "PCM" },
+            format.format().n_avg_bytes_per_sec * 8 / 1000,
+            block_duration.as_secs_f64() * 1000.0,
+        );
         let audio = self.audio.clone();
         let sender = self.sender.clone();
         let stopped = self.stopped.clone();
@@ -206,7 +362,7 @@ impl RdpsndServerHandler for Backend {
                         return;
                     }
                     let start = Instant::now();
-                    let mut block = [0u8; BLOCK_BYTES];
+                    let mut block = vec![0u8; block_bytes];
                     let mut captured = VecDeque::new();
                     let mut filled = 0;
                     let mut number = 0u8;
@@ -214,7 +370,7 @@ impl RdpsndServerHandler for Backend {
                     'capture: while !stopped.load(Ordering::Acquire) {
                         // Keep a small FIFO for normal PipeWire quantum batching
                         // and scheduling jitter. Drop only capture exceeding the
-                        // 60 ms budget, preventing a stall from replaying old sound.
+                        // three-block budget, preventing replay after a stall.
                         // Keep partial blocks intact to preserve stereo alignment.
                         let mut drained = false;
                         for _ in 0..64 {
@@ -231,11 +387,16 @@ impl RdpsndServerHandler for Backend {
                                 }
                                 Err(_) => break 'capture,
                             }
-                            if filled == BLOCK_BYTES {
+                            if filled == block_bytes {
                                 if captured.len() == MAX_CAPTURE_BLOCKS {
                                     captured.pop_front();
                                 }
-                                captured.push_back(block);
+                                // Wave2 timestamps describe capture, and use
+                                // the boot-relative millisecond clock required
+                                // by MS-RDPEA, even when paced after a quantum.
+                                let timestamp = start_timestamp
+                                    .wrapping_add(clock_start.elapsed().as_millis() as u32);
+                                captured.push_back((block.clone(), timestamp));
                                 filled = 0;
                             }
                         }
@@ -249,24 +410,33 @@ impl RdpsndServerHandler for Backend {
                             // credit or playback recovery. Resume with fresh sound.
                             captured.clear();
                         } else if now >= next_send
-                            && let Some(data) = captured.pop_front()
+                            && let Some((data, timestamp)) = captured.pop_front()
                         {
-                            let timestamp = start.elapsed().as_millis() as u32;
+                            let data = if let Some(encoder) = &mut encoder {
+                                match encoder.encode(&data) {
+                                    Ok(data) => data,
+                                    Err(error) => {
+                                        eprintln!("RDP audio encoding stopped: {error}");
+                                        break;
+                                    }
+                                }
+                            } else {
+                                data
+                            };
                             queue.sent(number, timestamp as u16, now);
                             number = number.wrapping_add(1);
                             if sender
                                 .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(
-                                    data.to_vec(),
-                                    timestamp,
+                                    data, timestamp,
                                 )))
                                 .is_err()
                             {
                                 break;
                             }
-                            next_send = if now.duration_since(next_send) >= BLOCK_DURATION {
-                                now + BLOCK_DURATION
+                            next_send = if now.duration_since(next_send) >= block_duration {
+                                now + block_duration
                             } else {
-                                next_send + BLOCK_DURATION
+                                next_send + block_duration
                             };
                         }
                         drop(queue);
@@ -341,15 +511,132 @@ mod tests {
     }
 
     fn pcm() -> AudioFormat {
-        AudioFormat {
-            format: WaveFormat::PCM,
-            n_channels: 2,
-            n_samples_per_sec: 48000,
-            n_avg_bytes_per_sec: 192000,
-            n_block_align: 4,
-            bits_per_sample: 16,
-            data: None,
+        pcm_format()
+    }
+
+    #[test]
+    fn negotiated_adpcm_prefers_compact_audio_with_pcm_fallback() {
+        let audio = Audio::default();
+        let format = Adpcm::new().unwrap().format.clone();
+        let (mut server, mut receiver) = negotiate(&audio, vec![pcm(), format.clone()]);
+        let (mut source, capture) = UnixStream::pair().unwrap();
+        source
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        audio.attach(Some(capture));
+        source.read_exact(&mut [0]).unwrap();
+        source.write_all(&vec![0x35; ADPCM_SAMPLES * 4]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (data, timestamp) = loop {
+            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                receiver.try_recv()
+            {
+                break (data, timestamp);
+            }
+            assert!(
+                Instant::now() < deadline,
+                "capture must produce an ADPCM packet"
+            );
+            thread::sleep(Duration::from_millis(1));
+        };
+        assert_eq!(data.len(), ADPCM_BLOCK_BYTES);
+        assert!(
+            data.len() * 3 < ADPCM_SAMPLES * 4,
+            "compact audio must reduce transport traffic"
+        );
+        assert!(monotonic_millis().unwrap().wrapping_sub(timestamp) < 2000);
+        let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
+        let ServerAudioOutputPdu::Wave2(wave) =
+            decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
+        else {
+            panic!("expected wave2");
+        };
+        assert_eq!(
+            wave.format_no, 1,
+            "server preference must keep the client's index"
+        );
+        assert_eq!(wave.audio_timestamp, timestamp);
+        assert_eq!(wave.data.len(), usize::from(format.n_block_align));
+        drop(server);
+        assert_eq!(
+            source.read(&mut [0]).unwrap(),
+            0,
+            "disconnect must release the encoder and capture FD"
+        );
+        // Existing PCM wire/continuity tests exercise the fallback when the
+        // client accepts only PCM, even though the server offered MS ADPCM.
+        let (server, receiver) = negotiate(&audio, vec![pcm()]);
+        assert!(server.is_ready() && receiver.is_empty());
+        drop(server);
+    }
+
+    #[test]
+    fn adpcm_wire_and_flow_survive_more_than_a_minute_of_both_timestamp_wraps() {
+        let audio = Audio::default();
+        let mut encoder = Adpcm::new().unwrap();
+        let (mut server, _receiver) = negotiate(&audio, vec![pcm(), encoder.format.clone()]);
+        let start = Instant::now();
+        let pcm = vec![0x35; ADPCM_SAMPLES * 4];
+        let mut flow = FlowControl::default();
+        for sequence in 0..3400u32 {
+            let elapsed_ms = u64::from(sequence) * ADPCM_SAMPLES as u64 * 1000 / 48000;
+            let now = start + Duration::from_millis(elapsed_ms);
+            let timestamp = 65000 + elapsed_ms as u32;
+            assert!(flow.can_send(now));
+            let messages: Vec<_> = server
+                .wave(encoder.encode(&pcm).unwrap(), timestamp)
+                .unwrap()
+                .into();
+            let ServerAudioOutputPdu::Wave2(wave) =
+                decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
+            else {
+                panic!("expected wave2");
+            };
+            assert_eq!(wave.block_no, sequence as u8);
+            assert_eq!(wave.timestamp, timestamp as u16);
+            assert_eq!(wave.audio_timestamp, timestamp);
+            assert_eq!(wave.data.len(), ADPCM_BLOCK_BYTES);
+            flow.sent(wave.block_no, wave.timestamp, now);
+            flow.confirm(
+                wave.block_no,
+                wave.timestamp.wrapping_add(3),
+                now + Duration::from_millis(3),
+            );
+            flow.confirm(
+                wave.block_no,
+                wave.timestamp.wrapping_add(30),
+                now + Duration::from_millis(30),
+            );
+            assert_eq!(flow.pending, 0);
+            assert!(
+                flow.hold_until.is_none(),
+                "healthy playback must not be muted at either wrap"
+            );
         }
+        assert!(flow.paired_confirms);
+        assert_eq!(flow.recent.len(), 256);
+        drop(server);
+    }
+
+    #[test]
+    fn closed_event_receiver_stops_capture_and_releases_the_codec() {
+        let audio = Audio::default();
+        let format = Adpcm::new().unwrap().format.clone();
+        let (server, receiver) = negotiate(&audio, vec![format]);
+        drop(receiver);
+        let (mut source, capture) = UnixStream::pair().unwrap();
+        source
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        audio.attach(Some(capture));
+        source.read_exact(&mut [0]).unwrap();
+        source.write_all(&vec![0x35; ADPCM_SAMPLES * 4]).unwrap();
+        assert_eq!(
+            source.read(&mut [0]).unwrap(),
+            0,
+            "failed event send must close the source socket"
+        );
+        drop(server);
     }
 
     #[test]
@@ -453,10 +740,131 @@ mod tests {
         assert!(flow.can_send(start + Duration::from_secs(4)));
         flow.confirm(
             1,
-            65501u16.wrapping_add(5000),
+            65501u16.wrapping_add(3000),
             start + Duration::from_secs(5),
         );
         assert_eq!(flow.hold_until, deadline, "duplicate render ACK is ignored");
+        flow.confirm(
+            1,
+            65501u16.wrapping_add(2000),
+            start + Duration::from_secs(5),
+        );
+        assert_eq!(
+            flow.hold_until, deadline,
+            "older feedback cannot restart recovery"
+        );
+    }
+
+    #[test]
+    fn nonzero_receipt_confirm_does_not_hide_later_nine_second_playback_delay() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 65000, start);
+        flow.confirm(0, 65003, start + Duration::from_millis(3));
+        assert_eq!(flow.pending, 0);
+        // Another wave is queued while the first is held by the device. Its
+        // future playback, rather than ACK arrival time, anchors the pause.
+        flow.sent(
+            1,
+            65000u16.wrapping_add(8000),
+            start + Duration::from_secs(8),
+        );
+        flow.confirm(
+            1,
+            65000u16.wrapping_add(8003),
+            start + Duration::from_secs(8),
+        );
+        flow.confirm(
+            0,
+            65000u16.wrapping_add(9000),
+            start + Duration::from_secs(9),
+        );
+        assert!(flow.paired_confirms);
+        assert!(
+            !flow.can_send(start + Duration::from_secs(9)),
+            "actual playback feedback must stop queue growth"
+        );
+        let deadline = flow.hold_until.unwrap();
+        assert_eq!(deadline, start + Duration::from_millis(16880));
+        flow.confirm(
+            0,
+            65000u16.wrapping_add(9000),
+            start + Duration::from_secs(10),
+        );
+        assert_eq!(
+            flow.pending, 0,
+            "duplicates must not release another wave's credit"
+        );
+        assert_eq!(flow.hold_until, Some(deadline));
+        assert!(flow.can_send(deadline));
+    }
+
+    #[test]
+    fn paired_clients_do_not_reuse_ids_still_awaiting_playback_feedback() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 1000, start);
+        flow.confirm(0, 1001, start);
+        flow.confirm(0, 1020, start);
+        for sequence in 1..=256u16 {
+            let timestamp = 1000 + sequence * 20;
+            assert!(flow.can_send(start + Duration::from_millis(u64::from(sequence) * 20)));
+            flow.sent(
+                sequence as u8,
+                timestamp,
+                start + Duration::from_millis(u64::from(sequence) * 20),
+            );
+            flow.confirm(sequence as u8, timestamp + 1, start);
+        }
+        assert!(
+            !flow.can_send(start + Duration::from_secs(6)),
+            "block one must not be reused ahead of its playback ACK"
+        );
+        flow.confirm(1, 1020 + 9000, start + Duration::from_secs(9));
+        assert_eq!(flow.recent.front().unwrap().number, 1);
+        assert_eq!(
+            flow.recent.front().unwrap().feedback_ms,
+            9000,
+            "late playback feedback must still match the original wave"
+        );
+        assert!(!flow.can_send(start + Duration::from_secs(9)));
+        assert!(flow.can_send(start + Duration::from_secs(14)));
+    }
+
+    #[test]
+    fn equal_and_missing_playback_confirms_retire_at_the_playback_frontier() {
+        let now = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 100, now);
+        flow.confirm(0, 100, now);
+        flow.confirm(0, 120, now);
+        assert!(flow.paired_confirms);
+        flow.sent(1, 120, now);
+        flow.confirm(1, 120, now);
+        flow.confirm(1, 120, now);
+        assert!(
+            flow.recent[1].playback_confirmed,
+            "zero-latency second confirm remains valid"
+        );
+        flow.sent(2, 140, now);
+        // Both confirms for block two go missing, but block three finishes.
+        flow.sent(3, 160, now);
+        flow.confirm(3, 160, now);
+        flow.confirm(3, 190, now);
+        assert_eq!(
+            flow.pending, 0,
+            "later playback proves the earlier queued wave was consumed"
+        );
+        assert!(flow.recent.iter().all(|wave| wave.playback_confirmed));
+        for sequence in 4..=260u16 {
+            flow.sent(sequence as u8, 100 + sequence * 20, now);
+            flow.confirm(sequence as u8, 100 + sequence * 20, now);
+            flow.confirm(sequence as u8, 100 + sequence * 20, now);
+            assert!(
+                flow.can_send(now),
+                "one missing confirm must not mute at number reuse"
+            );
+        }
     }
 
     #[test]
@@ -547,7 +955,7 @@ mod tests {
         else {
             panic!("expected wave2");
         };
-        for held_ms in [0, 400] {
+        for held_ms in [3, 400] {
             server
                 .process(
                     &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
@@ -581,8 +989,22 @@ mod tests {
 
     #[test]
     fn healthy_pipewire_quantum_batching_preserves_every_sample() {
+        healthy_capture_batching(pcm(), BLOCK_BYTES, None);
+    }
+
+    #[test]
+    fn healthy_adpcm_quantum_batching_preserves_every_complete_frame() {
+        let encoder = Adpcm::new().unwrap();
+        healthy_capture_batching(encoder.format.clone(), ADPCM_SAMPLES * 4, Some(encoder));
+    }
+
+    fn healthy_capture_batching(
+        format: AudioFormat,
+        block_bytes: usize,
+        mut encoder: Option<Adpcm>,
+    ) {
         let audio = Audio::default();
-        let (mut server, mut receiver) = negotiate(&audio, vec![pcm()]);
+        let (mut server, mut receiver) = negotiate(&audio, vec![format]);
         let (mut source, capture) = UnixStream::pair().unwrap();
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -593,7 +1015,15 @@ mod tests {
         let samples: Vec<u8> = (0..QUANTUM_BYTES * 32 / 4)
             .flat_map(|sample| (sample as u32).to_le_bytes())
             .collect();
-        let expected = samples[..samples.len() / BLOCK_BYTES * BLOCK_BYTES].to_vec();
+        let complete = &samples[..samples.len() / block_bytes * block_bytes];
+        let expected = if let Some(encoder) = &mut encoder {
+            complete
+                .chunks(block_bytes)
+                .flat_map(|pcm| encoder.encode(pcm).unwrap())
+                .collect()
+        } else {
+            complete.to_vec()
+        };
         let producer = thread::spawn(move || {
             let start = Instant::now();
             for (number, chunk) in samples.chunks(QUANTUM_BYTES).enumerate() {

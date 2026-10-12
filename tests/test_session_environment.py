@@ -6,7 +6,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
 loader = importlib.machinery.SourceFileLoader(
@@ -173,6 +173,80 @@ class SessionEnvironmentTests(unittest.TestCase):
         self.assertEqual(actual["XKB_DEFAULT_LAYOUT"], "us,se")
         self.assertEqual(actual["XKB_DEFAULT_MODEL"], "pc105")
         self.assertEqual(actual["XKB_DEFAULT_OPTIONS"], "")
+
+    def test_fcitx_readiness_requires_controller_reply_on_private_bus(self):
+        helper = environment_helper.input_method
+        environment = {"DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/input-bus"}
+        with patch.object(helper.subprocess, "run") as run:
+            self.assertTrue(helper.ready(environment, "org.fcitx.Fcitx5"))
+        self.assertEqual(run.call_args.args[0], [
+            "/usr/bin/busctl", "--address=unix:path=/private/input-bus", "--timeout=1",
+            "call", "org.fcitx.Fcitx5", "/controller", "org.fcitx.Fcitx.Controller1",
+            "CurrentInputMethodGroup"])
+        self.assertEqual(run.call_args.kwargs["env"], environment)
+        for error in (subprocess.CalledProcessError(1, ["busctl"]),
+                      subprocess.TimeoutExpired(["busctl"], 2)):
+            with self.subTest(error=error), \
+                    patch.object(helper.subprocess, "run", side_effect=error):
+                self.assertFalse(helper.ready(environment, "org.fcitx.Fcitx5"))
+        with patch.object(helper.subprocess, "run") as run:
+            self.assertTrue(helper.ready(environment, "org.freedesktop.IBus"))
+        run.assert_not_called()
+
+    def test_fcitx_startup_waits_for_loaded_profile_after_name_ownership(self):
+        helper = environment_helper.input_method
+        with tempfile.TemporaryDirectory() as runtime:
+            environment = {"HOME": runtime, "NIRI_RDP_RUNTIME_DIR": runtime,
+                           "XDG_RUNTIME_DIR": runtime, "WAYLAND_DISPLAY": "wayland-0",
+                           "DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus",
+                           "INPUT_METHOD": "fcitx"}
+            process = Mock()
+            process.poll.return_value = None
+            with patch.object(helper.shutil, "which", return_value="/usr/bin/fcitx5"), \
+                    patch.object(helper, "owns_name", side_effect=[False, True, True]), \
+                    patch.object(helper, "ready", side_effect=[False, True]) as ready, \
+                    patch.object(helper.subprocess, "Popen", return_value=process), \
+                    patch.object(helper.time, "monotonic", return_value=0), \
+                    patch.object(helper.time, "sleep") as sleep:
+                helper.start(environment)
+            self.assertEqual(ready.call_count, 2)
+            sleep.assert_called_once_with(0.05)
+            process.terminate.assert_not_called()
+            process.kill.assert_not_called()
+
+    def test_failed_fcitx_startup_reaps_only_launched_process_before_retry(self):
+        helper = environment_helper.input_method
+        for failure in ("timeout", "bus-error", "exited"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as runtime:
+                environment = {"HOME": runtime, "NIRI_RDP_RUNTIME_DIR": runtime,
+                               "XDG_RUNTIME_DIR": runtime, "WAYLAND_DISPLAY": "wayland-0",
+                               "DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus",
+                               "INPUT_METHOD": "fcitx"}
+                process = Mock()
+                process.poll.return_value = 7 if failure == "exited" else None
+                owners = [False, subprocess.CalledProcessError(1, ["busctl"])] \
+                    if failure == "bus-error" else [False, False]
+                times = [0, 0, 6] if failure == "timeout" else [0, 0]
+                if failure == "timeout":
+                    process.wait.side_effect = [subprocess.TimeoutExpired(["fcitx5"], 2), 0]
+                with patch.object(helper.shutil, "which", return_value="/usr/bin/fcitx5"), \
+                        patch.object(helper, "owns_name", side_effect=owners), \
+                        patch.object(helper.subprocess, "Popen", return_value=process), \
+                        patch.object(helper.time, "monotonic", side_effect=times), \
+                        patch.object(helper.time, "sleep"), \
+                        self.assertRaises((RuntimeError, subprocess.CalledProcessError)):
+                    helper.start(environment)
+                if failure == "exited":
+                    process.terminate.assert_not_called()
+                    process.wait.assert_not_called()
+                else:
+                    process.terminate.assert_called_once_with()
+                    self.assertEqual(process.wait.call_args.kwargs, {"timeout": 2})
+                    if failure == "timeout":
+                        process.kill.assert_called_once_with()
+                        self.assertEqual(process.wait.call_count, 2)
+                    else:
+                        process.kill.assert_not_called()
 
     def test_real_native_generator_supports_home_config_and_variable_expansion(self):
         if not Path(environment_helper.GENERATOR).exists():

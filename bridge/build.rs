@@ -1,6 +1,8 @@
 fn main() {
+    println!("cargo:rerun-if-changed=src/audio.c");
     println!("cargo:rerun-if-changed=src/video.c");
     let mut build = cc::Build::new();
+    build.file("src/audio.c");
     build.file("src/video.c").flag_if_supported("-std=c11");
     for name in ["libavcodec", "libavutil", "libswscale"] {
         let library = pkg_config::Config::new()

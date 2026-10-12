@@ -5,6 +5,7 @@ import math
 import os
 from pathlib import Path
 import shutil
+import shlex
 import signal
 import socket
 import struct
@@ -16,6 +17,29 @@ import unittest
 from unittest.mock import Mock, patch
 
 ROOT = Path(__file__).resolve().parents[1]
+
+
+class AudioCodecTests(unittest.TestCase):
+    def test_ms_adpcm_roundtrip_and_independent_dropped_blocks(self):
+        if not shutil.which("cc") or not shutil.which("pkg-config"):
+            self.skipTest("C compiler and FFmpeg development libraries required")
+        flags = subprocess.run(
+            ["pkg-config", "--cflags", "--libs", "libavcodec", "libavutil"],
+            capture_output=True, text=True,
+        )
+        if flags.returncode:
+            self.skipTest("FFmpeg development libraries required")
+        with tempfile.TemporaryDirectory(prefix="niri-audio-codec-") as directory:
+            executable = str(Path(directory) / "audio-codec")
+            subprocess.run(
+                ["cc", "-std=c17", "-O2", "-Wall", "-Wextra", "-Werror",
+                 str(ROOT / "tests/audio_codec.c"), "-o", executable,
+                 *shlex.split(flags.stdout), "-lm"],
+                check=True, capture_output=True, text=True,
+            )
+            result = subprocess.run([executable], capture_output=True, text=True, timeout=10)
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertIn("PASS:", result.stdout)
 
 
 class AudioStartupTests(unittest.TestCase):

@@ -43,6 +43,15 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+Package release 15 fixes audio playback feedback that could be hidden by a
+receipt confirmation and adds automatic MS ADPCM negotiation with PCM fallback.
+It also fixes Fcitx5 disconnection on its native Wayland keymap, forwarded-key
+handling, and startup waits that previously blocked Wayland. Existing Fcitx
+profiles, environment settings and hotkeys are reused. Rebuild the whole package
+and start a fresh remote desktop so both the frontend and compositor fixes apply.
+The normal [uninstall](uninstall.md) and [install](install.md) procedures are sufficient;
+no extra audio or input-method configuration is required.
+
 Package release 14 prepares the NVIDIA GPU, control, and UVM device nodes
 automatically before every frontend start. Release 13 did not explicitly create
 `/dev/nvidiactl` or the UVM nodes, leaving CUDA startup dependent on another GPU

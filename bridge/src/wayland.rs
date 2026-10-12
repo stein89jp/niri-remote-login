@@ -864,8 +864,8 @@ impl Input {
         self.text_keyboard.modifiers(0, 0, 0, 0);
         self.text_keyboard.key(self.time(), 247, 1);
         self.text_keyboard.key(self.time(), 247, 0);
-        // Niri's protocol adapter uses one seat keymap for virtual devices.
-        // Restore it in protocol order before any subsequent hardware event.
+        // Committed Unicode uses this device's temporary map without changing
+        // the seat. Restore its map and masks for subsequent protocol events.
         self.text_keyboard.keymap(
             1,
             self.physical_keymap.file.as_fd(),

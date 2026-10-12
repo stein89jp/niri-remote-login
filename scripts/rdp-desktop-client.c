@@ -183,9 +183,22 @@ static BOOL end_paint(rdpContext *ctx) {
                                            probe->pointer_x, probe->pointer_y)) return FALSE;
         probe->phase = 3;
     } else if (probe->phase == 3 && contains_color(ctx->gdi, 180, 40, 30)) {
+        if (getenv("NIRI_RDP_TEST_IME")) {
+            if (!login_key(ctx, 1) ||
+                !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_DOWN, 29) ||
+                !login_key(ctx, 57) ||
+                !freerdp_input_send_keyboard_event(ctx->input, KBD_FLAGS_RELEASE, 29) ||
+                !login_text(ctx, "nihon") || !login_key(ctx, 57) || !login_key(ctx, 28) ||
+                !login_text(ctx, "nihon") || !login_key(ctx, 65) || !login_key(ctx, 28)) return FALSE;
+            static const UINT16 committed[] = {'U', '@', 0x65e5, 0x672c, 0xd83d, 0xde00};
+            for (unsigned i = 0; i < sizeof(committed) / sizeof(committed[0]); i++)
+                if (!unicode_unit(ctx, committed[i])) return FALSE;
+            if (!unicode_unit(ctx, '\r')) return FALSE;
+            puts("NIRI_RDP_IME_SEQUENCE_SENT");
+        }
         // Consecutive characters, modifier release, Enter and a compositor bind.
         // The Wayland fixture decodes this with the advertised XKB keymap.
-        if (getenv("NIRI_RDP_TEST_KEYBOARD")) {
+        if (getenv("NIRI_RDP_TEST_KEYBOARD") && !getenv("NIRI_RDP_TEST_IME")) {
             if (!login_key(ctx, 1) || !login_text(ctx, "abc123ABc") || !login_key(ctx, 28) ||
                 !login_text(ctx, "@\"^&:[]") || !login_key(ctx, 0x73) ||
                 !login_key(ctx, 0x7d) || !login_key(ctx, 28) ||
@@ -286,7 +299,8 @@ int main(void) {
     int result = 2;
     if (configured && freerdp_connect(rdp)) {
         Probe *probe = (Probe *)rdp->context;
-        const BOOL resize = !getenv("NIRI_RDP_TEST_HOLD") && !getenv("NIRI_RDP_TEST_CRASH");
+        const BOOL resize = !getenv("NIRI_RDP_TEST_HOLD") && !getenv("NIRI_RDP_TEST_CRASH") &&
+            !getenv("NIRI_RDP_TEST_IME");
         const unsigned final_layout = resize ? sizeof(layouts) / sizeof(layouts[0]) - 1 : 0;
         ULONGLONG deadline = GetTickCount64() + 20000;
         while ((probe->phase < 4 || probe->layout_index < final_layout) && GetTickCount64() < deadline) {

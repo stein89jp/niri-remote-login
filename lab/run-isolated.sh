@@ -45,4 +45,10 @@ if [[ ${1:-} == --nvenc || ${1:-} == --nvidia-renderer ]]; then
                --setenv NIRI_RDP_LAB_NVIDIA_RENDERER 1)
     fi
 fi
+if [[ ${1:-} == --input-method-startup ]]; then
+    shift
+    args+=(--ro-bind "$repo/broker/config/session-autostart" /usr/lib/niri-rdp/session-autostart
+           --ro-bind "$repo/broker/config/session-input-method" /usr/lib/niri-rdp/session-input-method
+           --setenv NIRI_RDP_LAB_INPUT_METHOD_STARTUP 1)
+fi
 exec bwrap "${args[@]}" /usr/bin/bash -c 'mkdir -m 700 /tmp/niri-rdp-runtime; exec "$@"' bash "$@"

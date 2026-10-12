@@ -72,6 +72,39 @@ def owns_name(environment, name):
     return result.stdout.strip() == "b true"
 
 
+def ready(environment, name):
+    if name != "org.fcitx.Fcitx5":
+        return True
+    # Fcitx acquires its bus name before loading its Wayland frontend and
+    # configured input-method groups. A controller reply means its event loop
+    # is serving applications; name ownership alone is too early.
+    try:
+        subprocess.run([
+            "/usr/bin/busctl", "--address=" + environment["DBUS_SESSION_BUS_ADDRESS"],
+            "--timeout=1", "call", name, "/controller",
+            "org.fcitx.Fcitx.Controller1", "CurrentInputMethodGroup",
+        ], env=environment, capture_output=True, check=True, timeout=2)
+        return True
+    except subprocess.SubprocessError:
+        return False
+
+
+def stop(process):
+    # Stop only the foreground daemon we started. Its process group also owns
+    # the compositor, so group-wide signals would destroy the remote desktop.
+    if process.poll() is not None:
+        return
+    try:
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+    except ProcessLookupError:
+        pass
+
+
 def start(environment, disabled=False):
     framework = configured_framework(environment)
     if framework is None or disabled:
@@ -117,14 +150,18 @@ def start(environment, disabled=False):
     # Fcitx and the IBus supervisor remain in the compositor's process group.
     # `ibus start` would instead delegate to the shared systemd user manager.
     process = subprocess.Popen(arguments, env=launch_environment)
-    deadline = time.monotonic() + 5
-    while time.monotonic() < deadline:
-        if owns_name(environment, name):
-            return
-        if process.poll() is not None:
-            raise RuntimeError("configured " + framework + " exited before acquiring its private bus name")
-        time.sleep(0.05)
-    raise RuntimeError("configured " + framework + " startup timed out")
+    try:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            if owns_name(environment, name) and ready(environment, name):
+                return
+            if process.poll() is not None:
+                raise RuntimeError("configured " + framework + " exited before its private input method was ready")
+            time.sleep(0.05)
+        raise RuntimeError("configured " + framework + " startup timed out")
+    except (OSError, subprocess.SubprocessError, RuntimeError):
+        stop(process)
+        raise
 
 
 if __name__ == "__main__":

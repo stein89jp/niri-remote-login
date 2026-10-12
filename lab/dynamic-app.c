@@ -1,6 +1,7 @@
 #define _GNU_SOURCE
 #include <wayland-client.h>
 #include "xdg-shell-client-protocol.h"
+#include "text-input-client-protocol.h"
 #include <linux/input-event-codes.h>
 #include <sys/mman.h>
 #include <unistd.h>
@@ -19,6 +20,9 @@ struct app {
     unsigned width, height, frames; bool configured, key, button, quit;
     struct xkb_context *xkb; struct xkb_state *xkb_state;
     char typed[128]; size_t typed_length;
+    struct zwp_text_input_manager_v3 *text_manager;
+    struct zwp_text_input_v3 *text_input;
+    char *pending_commit;
 };
 struct buffer { struct wl_buffer *wl; void *data; size_t size; };
 static void release(void *data, struct wl_buffer *wl) {
@@ -113,6 +117,42 @@ static void mods(void*d,struct wl_keyboard*k,uint32_t s,uint32_t dep,uint32_t la
 }
 static void repeat(void*d,struct wl_keyboard*k,int32_t rate,int32_t delay){(void)d;(void)k;(void)rate;(void)delay;}
 static const struct wl_keyboard_listener keyboard_listener={.keymap=keymap,.enter=kenter,.leave=kleave,.key=key,.modifiers=mods,.repeat_info=repeat};
+static void text_enter(void *data, struct zwp_text_input_v3 *input, struct wl_surface *surface) {
+    (void)data; (void)surface;
+    zwp_text_input_v3_enable(input);
+    zwp_text_input_v3_set_content_type(input, ZWP_TEXT_INPUT_V3_CONTENT_HINT_NONE,
+                                     ZWP_TEXT_INPUT_V3_CONTENT_PURPOSE_NORMAL);
+    zwp_text_input_v3_set_cursor_rectangle(input, 40, 40, 1, 20);
+    zwp_text_input_v3_commit(input);
+    puts("TEXT_INPUT_ENTER");
+}
+static void text_leave(void *data, struct zwp_text_input_v3 *input, struct wl_surface *surface) {
+    (void)data; (void)surface;
+    zwp_text_input_v3_disable(input); zwp_text_input_v3_commit(input);
+}
+static void text_preedit(void *data, struct zwp_text_input_v3 *input, const char *text,
+                         int32_t begin, int32_t end) {
+    (void)data; (void)input; (void)begin; (void)end;
+    if (text && *text) printf("IME_PREEDIT %s\n", text);
+}
+static void text_commit(void *data, struct zwp_text_input_v3 *input, const char *text) {
+    (void)input; struct app *a=data;
+    free(a->pending_commit); a->pending_commit=text ? strdup(text) : NULL;
+}
+static void text_delete(void *data, struct zwp_text_input_v3 *input, uint32_t before, uint32_t after) {
+    (void)data; (void)input; (void)before; (void)after;
+}
+static void text_done(void *data, struct zwp_text_input_v3 *input, uint32_t serial) {
+    (void)input; (void)serial; struct app *a=data;
+    if (a->pending_commit) {
+        printf("IME_COMMIT %s\n", a->pending_commit);
+        free(a->pending_commit); a->pending_commit=NULL;
+    }
+}
+static const struct zwp_text_input_v3_listener text_listener={
+    .enter=text_enter,.leave=text_leave,.preedit_string=text_preedit,.commit_string=text_commit,
+    .delete_surrounding_text=text_delete,.done=text_done
+};
 static void penter(void*d,struct wl_pointer*p,uint32_t s,struct wl_surface*f,wl_fixed_t x,wl_fixed_t y){(void)d;(void)p;(void)s;(void)f;printf("POINTER_ENTER %.1f %.1f\n",wl_fixed_to_double(x),wl_fixed_to_double(y));}
 static void pleave(void*d,struct wl_pointer*p,uint32_t s,struct wl_surface*f){(void)p;(void)s;(void)f;((struct app*)d)->button=false;puts("POINTER_LEAVE");}
 static void motion(void*d,struct wl_pointer*p,uint32_t time,wl_fixed_t x,wl_fixed_t y){(void)d;(void)p;(void)time;printf("MOTION %.1f %.1f\n",wl_fixed_to_double(x),wl_fixed_to_double(y));}
@@ -131,6 +171,8 @@ static void global(void*d,struct wl_registry*r,uint32_t n,const char*i,uint32_t 
     else if(!strcmp(i,"wl_shm"))a->shm=wl_registry_bind(r,n,&wl_shm_interface,1);
     else if(!strcmp(i,"xdg_wm_base")){a->wm=wl_registry_bind(r,n,&xdg_wm_base_interface,1);xdg_wm_base_add_listener(a->wm,&wm_listener,a);}
     else if(!strcmp(i,"wl_seat")){a->seat=wl_registry_bind(r,n,&wl_seat_interface,4);wl_seat_add_listener(a->seat,&seat_listener,a);}
+    else if(!strcmp(i,"zwp_text_input_manager_v3") && getenv("NIRI_RDP_TEST_IME"))
+        a->text_manager=wl_registry_bind(r,n,&zwp_text_input_manager_v3_interface,1);
 }
 static void removed(void*d,struct wl_registry*r,uint32_t n){(void)d;(void)r;(void)n;}
 static const struct wl_registry_listener registry_listener={.global=global,.global_remove=removed};
@@ -139,10 +181,15 @@ int main(void){
     a.display=wl_display_connect(NULL);if(!a.display){perror("Wayland connect");return 1;}
     wl_registry_add_listener(wl_display_get_registry(a.display),&registry_listener,&a);
     if(wl_display_roundtrip(a.display)<0||!a.compositor||!a.shm||!a.wm||!a.seat)return 1;
+    if(getenv("NIRI_RDP_TEST_IME")) {
+        if(!a.text_manager)return 1;
+        a.text_input=zwp_text_input_manager_v3_get_text_input(a.text_manager,a.seat);
+        zwp_text_input_v3_add_listener(a.text_input,&text_listener,&a);
+    }
     a.surface=wl_compositor_create_surface(a.compositor);a.xdg=xdg_wm_base_get_xdg_surface(a.wm,a.surface);
     xdg_surface_add_listener(a.xdg,&xdg_listener,&a);a.top=xdg_surface_get_toplevel(a.xdg);
     xdg_toplevel_add_listener(a.top,&top_listener,&a);xdg_toplevel_set_title(a.top,"Niri RDP input proof");
     xdg_toplevel_set_app_id(a.top,"niri-rdp-proof");wl_surface_commit(a.surface);
     while(!a.quit&&wl_display_dispatch(a.display)>=0){}
-    wl_display_disconnect(a.display);return 0;
+    free(a.pending_commit);wl_display_disconnect(a.display);return 0;
 }

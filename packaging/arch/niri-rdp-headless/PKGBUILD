@@ -1,7 +1,7 @@
 # Standalone patched binary: does not replace the installed /usr/bin/niri.
 pkgname=niri-rdp-headless
 pkgver=26.04.remote1
-pkgrel=5
+pkgrel=6
 pkgdesc='Pinned PR3953 Niri headless compositor for isolated remote-login sessions'
 arch=('x86_64')
 license=('GPL-3.0-or-later')
@@ -35,6 +35,9 @@ check() {
   cd "$srcdir/niri-$_revision"
   export CARGO_HOME="$srcdir/cargo-home"
   cargo test --locked --offline --no-default-features --lib backend::headless
+  local input_runtime
+  input_runtime=$(mktemp -d "$srcdir/input-tests.XXXXXX")
+  XDG_RUNTIME_DIR="$input_runtime" cargo test --locked --offline --no-default-features --lib protocols::
 }
 
 package() {

@@ -13,7 +13,8 @@
     "patches": [
       "patches/0001-remote-headless-bounds-and-startup.patch"
     ],
-    "patch_sha256": "12b6bfdb3c13a02a5d78596a2165740f75871f2d4dfdd7d08fb25a1785f8cf97"
+    "patch_sha256": "6b8b72743ce43f97275f4551f0f00096dad58b84dfa627950d7308bd0441f91e",
+    "patched_cargo_lock_sha256": "aa20e020290f1424de4e0dee6659eb9cf3213ff755883868d87eb042edfdc0e0"
   },
   "alternative": {
     "pull_request": 3800,
@@ -57,5 +58,11 @@
   "toolchain": {
     "rustc": "rustc 1.99.0 (b940084d7 2026-09-28) (Arch Linux rust 1:1.99.0-1)",
     "cargo": "cargo 1.99.0 (5f94df478 2026-08-27) (Arch Linux rust 1:1.99.0-1)"
+  },
+  "lab_text_input_protocol": {
+    "source_crate": "wayland-protocols",
+    "version": "0.32.13",
+    "path": "lab/text-input-unstable-v3.xml",
+    "sha256": "160815cda13c285a30df1971d8f0a5b3aac07071537df59916d2f748b18e4f59"
   }
 }
