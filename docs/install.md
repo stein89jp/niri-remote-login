@@ -366,10 +366,12 @@ Audio prefers GNOME Remote Login's stereo AAC-LC format at 96 kbit/s when the
 client accepts it; PCM is the fallback at about 1.54 Mbps before framing. PCM
 takes preference over the older MS ADPCM offer. Digital silence is suppressed
 after a short codec tail. Blocks are paced by their exact sample duration and keep
-recent capture samples when the source or network stalls. Playback feedback
-continues to be tracked after receipt confirmations, including long delays and
-block-number wrapping, so an excessive client buffer can drain before current
-sound resumes. Recovery may skip sound during congestion. No manual delay or
+recent capture samples when the source or network stalls. Recent, validated
+playback feedback can briefly discard capture to let a client buffer drain.
+Optional second confirmations never gate playback; missing replies and old idle
+waves cannot mute sound or continually reduce video quality. Recovery resumes
+consecutive fresh AAC packets after a bounded wait. Recovery may skip sound
+during congestion. No manual delay or
 codec setting is needed. These controls limit accumulating delay; actual mstsc
 audio/video presentation still needs the playback check below.
 

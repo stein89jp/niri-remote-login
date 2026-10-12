@@ -2,6 +2,7 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/audio_fifo.h>
 #include <libavutil/intreadwrite.h>
+#include <libavutil/log.h>
 #include <libswresample/swresample.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -195,6 +196,9 @@ struct niri_audio_aac *niri_audio_aac_new(char *error, size_t length) {
     }
     AVCodecContext *c = a->codec;
     c->sample_rate = 44100;
+    /* AAC's routine teardown statistics include "Qavg: nan" when negotiation
+       closes an unused encoder. Keep those at verbose level, retaining errors. */
+    c->log_level_offset = AV_LOG_VERBOSE - AV_LOG_INFO;
     c->sample_fmt = AV_SAMPLE_FMT_FLTP;
     c->bit_rate = 96000;
     c->profile = AV_PROFILE_AAC_LOW;

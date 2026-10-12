@@ -43,6 +43,14 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+Package release 18 fixes the release 17 audio recovery regression: missing
+optional playback confirmations could permanently mute AAC and repeatedly lower
+video quality. Playback feedback now expires, implausible timestamp delays are
+ignored, and recovery resumes consecutive packets instead of one AAC priming
+packet. The normal [uninstall](uninstall.md) and [install](install.md) procedures
+build the fix; no additional settings are required. Connection failure logs also
+include the underlying error so abandoned handshakes can be diagnosed.
+
 Package release 15 fixes audio playback feedback that could be hidden by a
 receipt confirmation and adds automatic MS ADPCM negotiation with PCM fallback.
 It also fixes Fcitx5 disconnection on its native Wayland keymap, forwarded-key

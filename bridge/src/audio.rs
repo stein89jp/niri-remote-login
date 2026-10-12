@@ -221,12 +221,11 @@ struct SentWave {
     feedback_ms: u16,
     feedback_elapsed: Duration,
     playback_confirmed: bool,
-    probe: bool,
 }
 
-/// A receipt confirmation releases transport credit. Clients that separately
-/// confirm rendering must also advance a short playback frontier. Keep older
-/// generations so a delayed echo can reveal that behavior after block-ID wrap.
+/// Receipt confirmations release transport credit. Playback confirmations are
+/// optional delay measurements, never a second credit that a client must return.
+/// Like GNOME Remote Desktop, only recent measurements can affect capture.
 #[derive(Default, Debug)]
 struct FlowControl {
     pending: usize,
@@ -234,16 +233,14 @@ struct FlowControl {
     hold_until: Option<Instant>,
     last_warning: Option<Instant>,
     latest_sent: Option<Instant>,
-    paired_confirms: bool,
     receipt_baseline: Option<Duration>,
     last_render_delay: Duration,
-    last_probe_at: Option<Instant>,
 }
 impl FlowControl {
     const HISTORY: usize = 2048;
     const INITIAL_RECEIPT_BUDGET: Duration = Duration::from_millis(500);
     const DISTINCT_CONFIRM_INTERVAL: Duration = Duration::from_millis(10);
-    const PROBE_INTERVAL: Duration = Duration::from_millis(500);
+    const FEEDBACK_WINDOW: Duration = Duration::from_secs(1);
 
     fn receipt_budget(&self) -> Duration {
         self.receipt_baseline
@@ -260,50 +257,21 @@ impl FlowControl {
             })
     }
     fn render_age(&self, now: Instant) -> Duration {
-        if !self.paired_confirms {
-            return Duration::ZERO;
+        // An absent optional rendering echo is not evidence that sound is
+        // still queued. In particular, silence or mixed single/double replies
+        // must not turn an old block into minutes of fabricated playback delay.
+        if self.hold_until.is_some_and(|until| now < until) {
+            self.last_render_delay
+        } else {
+            Duration::ZERO
         }
-        self.recent
-            .iter()
-            .find(|wave| !wave.playback_confirmed)
-            .map_or(Duration::ZERO, |wave| {
-                now.saturating_duration_since(wave.sent_at)
-                    .saturating_sub(self.receipt_baseline.unwrap_or(Duration::ZERO))
-            })
     }
     fn can_send(&self, now: Instant) -> bool {
         self.pending < MAX_PENDING
             && self.hold_until.is_none_or(|until| now >= until)
             && self.receipt_age(now) <= self.receipt_budget()
-            && (self.render_age(now) <= PLAYBACK_BUDGET || self.can_probe(now))
-            // A paired client cannot reuse an ID still awaiting rendering.
-            && !(self.paired_confirms
-                && self.recent.back().is_some_and(|last| {
-                    let next = last.number.wrapping_add(1);
-                    self.recent.iter().any(|wave| wave.number == next && !wave.playback_confirmed)
-                }))
-    }
-    fn can_probe(&self, now: Instant) -> bool {
-        // A missing final render ACK must not permanently mute a paused
-        // stream. One fresh wave can elicit later FIFO playback progress.
-        // Its receipt ACK alone never permits another probe, so a genuinely
-        // stalled playback device cannot accumulate repeated timer retries.
-        self.pending == 0
-            && self.render_age(now) >= Self::PROBE_INTERVAL
-            && self.hold_until.is_none_or(|until| now >= until)
-            && self
-                .last_probe_at
-                .is_none_or(|last| now.saturating_duration_since(last) >= Self::PROBE_INTERVAL)
-            && !self
-                .recent
-                .iter()
-                .any(|wave| wave.probe && !wave.playback_confirmed)
     }
     fn sent(&mut self, number: u8, timestamp: u16, now: Instant) {
-        let probe = self.render_age(now) > PLAYBACK_BUDGET && self.can_probe(now);
-        if probe {
-            self.last_probe_at = Some(now);
-        }
         // Reaching number reuse with four transport credits proves FIFO
         // dispatch reached this older wave. Retire a lost receipt credit, but
         // retain its timestamp so a delayed render echo can still be matched.
@@ -330,7 +298,6 @@ impl FlowControl {
             feedback_ms: 0,
             feedback_elapsed: Duration::ZERO,
             playback_confirmed: false,
-            probe,
         });
     }
     fn warn_delay(&mut self, now: Instant, receipt: Duration, render: Duration) {
@@ -367,17 +334,15 @@ impl FlowControl {
     fn confirm(&mut self, number: u8, timestamp: u16, now: Instant) {
         // With an immediate-playback zero reference, block numbers alone
         // identify the wave. Receipt belongs to the newest pending generation;
-        // a later confirm belongs to the oldest unfinished playback generation.
-        // Always choosing the newest would hide an equal render echo whenever
-        // its delay coincides with one or more 256-wave block-number wraps.
+        // an optional later echo belongs to the oldest unfinished generation.
+        // Its age is validated below before it affects current playback.
         let zero_reference = self
             .recent
             .iter()
             .filter(|wave| wave.number == number)
             .all(|wave| wave.timestamp == 0);
-        // An exact echo identifies a generation even when its eventual render
-        // confirm arrives over 32 seconds later. A modular difference alone
-        // would instead discard it as stale or attribute it to a reused ID.
+        // An exact echo identifies a nonzero-timestamp generation even after
+        // wrap. A modular difference alone could attribute it to a reused ID.
         let position = if zero_reference {
             self.recent
                 .iter()
@@ -431,8 +396,6 @@ impl FlowControl {
                     self.pending -= 1;
                 }
             }
-        } else if increased || distinct_second {
-            self.paired_confirms = true;
         }
         // Even an immediate equal second packet finishes this generation.
         // It need not prove paired rendering behavior, but leaving it unfinished
@@ -447,27 +410,39 @@ impl FlowControl {
                 }
             }
         }
-        // A delayed second echo is useful even when the client leaves its
-        // protocol timestamp unchanged. Subtract the fastest receipt round trip
-        // so a stable long network path is not mistaken for a playback queue.
-        let render = Duration::from_millis(u64::from(held_ms)).max(if playback_confirmed {
+        // Never interpret a clock-like or wrapped timestamp as seconds of
+        // buffering in a wave we sent milliseconds ago. A short allowance
+        // permits clients that acknowledge scheduled playback ahead of time.
+        // Old echoes can retire history but cannot restart capture recovery.
+        let reported = Duration::from_millis(u64::from(held_ms));
+        let reported = if reported <= elapsed + PLAYBACK_BUDGET {
+            reported
+        } else {
+            Duration::ZERO
+        };
+        let render = reported.max(if playback_confirmed && distinct_second {
             elapsed.saturating_sub(self.receipt_baseline.unwrap_or(Duration::ZERO))
         } else {
             Duration::ZERO
         });
         let wave = &mut self.recent[position];
-        wave.feedback_ms = wave.feedback_ms.max(held_ms);
-        if render <= wave.feedback_elapsed {
+        // Invalid timestamps must not hide a later valid latency report for
+        // this same wave by becoming the highest remembered feedback value.
+        wave.feedback_ms = wave.feedback_ms.max(reported.as_millis() as u16);
+        if elapsed > Self::FEEDBACK_WINDOW || render <= wave.feedback_elapsed {
             return;
         }
         wave.feedback_elapsed = render;
         if render > PLAYBACK_BUDGET {
-            // Anchor to the queued tail. Old confirmations cannot repeatedly
-            // restart a pause once their client buffer has already drained.
-            let until = self.latest_sent.unwrap_or(now) + (render - PLAYBACK_BUDGET);
-            self.hold_until = Some(self.hold_until.map_or(until, |old| old.max(until)));
-            self.last_render_delay = render;
-            self.warn_delay(now, self.receipt_age(now), render);
+            // Bound recovery, then resume a consecutive stream of fresh
+            // packets. AAC needs more than one priming packet to become audible.
+            let until = (self.latest_sent.unwrap_or(now) + (render - PLAYBACK_BUDGET))
+                .min(now + Self::FEEDBACK_WINDOW);
+            if until > now {
+                self.hold_until = Some(self.hold_until.map_or(until, |old| old.max(until)));
+                self.last_render_delay = render;
+                self.warn_delay(now, self.receipt_age(now), render);
+            }
         }
     }
 }
@@ -692,10 +667,9 @@ impl RdpsndServerHandler for Backend {
                         let mut queue = pending.lock().unwrap();
                         let pressure = queue.check_pressure(now);
                         let transport_pressure = queue.receipt_age(now) > queue.receipt_budget();
-                        // A missing final render ACK must not lower healthy video
-                        // forever after sound becomes silent. Keep transport
-                        // congestion actionable, and preserve the render history
-                        // for a bounded recovery probe when sound resumes.
+                        // Idle sound must not lower healthy video. Transport
+                        // congestion remains actionable; recent render feedback
+                        // expires without requiring a second reply for every wave.
                         if quiet_capture_blocks > SILENCE_TAIL_BLOCKS && !transport_pressure {
                             if !feedback_suspended && let Some(feedback) = &feedback {
                                 feedback.clear();
@@ -970,7 +944,7 @@ mod tests {
     }
 
     #[test]
-    fn aac_recovery_discards_codec_lookahead_before_fresh_sound() {
+    fn aac_transport_recovery_discards_codec_lookahead_before_fresh_sound() {
         let audio = Audio::default();
         let (mut server, mut receiver) = negotiate(&audio, vec![aac_format()]);
         let (mut source, capture) = UnixStream::pair().unwrap();
@@ -979,37 +953,51 @@ mod tests {
             .unwrap();
         audio.attach(Some(capture));
         source.read_exact(&mut [0]).unwrap();
-        source.write_all(&vec![0x11; BLOCK_BYTES * 3]).unwrap();
+        // Withhold receipt credit until the transport queue is full. Continue
+        // capturing so recovery must discard both old PCM and AAC lookahead.
+        for _ in 0..12 {
+            source.write_all(&vec![0x11; BLOCK_BYTES]).unwrap();
+            thread::sleep(Duration::from_millis(25));
+        }
         let deadline = Instant::now() + Duration::from_secs(2);
-        let (data, timestamp) = loop {
-            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
-                receiver.try_recv()
-            {
-                break (data, timestamp);
-            }
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(1));
-        };
-        let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
-        let ServerAudioOutputPdu::Wave2(wave) =
-            decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
-        else {
-            panic!("expected wave2");
-        };
-        for timestamp in [0, 400] {
-            server
-                .process(
-                    &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                        block_no: wave.block_no,
-                        timestamp,
-                    }))
-                    .unwrap(),
-                )
-                .unwrap();
+        while receiver.len() < MAX_PENDING {
+            assert!(
+                Instant::now() < deadline,
+                "AAC must fill bounded transport credit"
+            );
+            source.write_all(&vec![0x11; BLOCK_BYTES]).unwrap();
+            thread::sleep(Duration::from_millis(25));
+        }
+        let mut tail = 0;
+        for _ in 0..MAX_PENDING {
+            let ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp)) =
+                receiver.try_recv().unwrap()
+            else {
+                panic!("expected AAC wave")
+            };
+            let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
+            let ServerAudioOutputPdu::Wave2(wave) =
+                decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
+            else {
+                panic!("expected Wave2")
+            };
+            tail = wave.block_no;
         }
         source.write_all(&vec![0x22; BLOCK_BYTES * 20]).unwrap();
-        thread::sleep(Duration::from_millis(330));
-        assert!(receiver.is_empty());
+        thread::sleep(Duration::from_millis(80));
+        assert!(
+            receiver.is_empty(),
+            "unconfirmed transport cannot queue more sound"
+        );
+        server
+            .process(
+                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                    block_no: tail,
+                    timestamp: 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         let fresh = vec![0x33; BLOCK_BYTES];
         let mut encoder = Aac::new().unwrap();
         let expected = (0..3)
@@ -1022,13 +1010,143 @@ mod tests {
             {
                 assert_eq!(
                     data, expected,
-                    "post-hold packet must contain only fresh codec state"
+                    "recovery packet must contain only fresh codec state"
                 );
                 break;
             }
-            assert!(Instant::now() < deadline);
+            assert!(
+                Instant::now() < deadline,
+                "AAC must recover with fresh packets"
+            );
             thread::sleep(Duration::from_millis(1));
         }
+        drop(server);
+    }
+
+    #[test]
+    fn aac_idle_resume_keeps_audible_packets_after_missing_tail_feedback() {
+        let audio = Audio::default();
+        let (mut server, mut receiver) = negotiate(&audio, vec![aac_format()]);
+        let (mut source, capture) = UnixStream::pair().unwrap();
+        source
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        audio.attach(Some(capture));
+        source.read_exact(&mut [0]).unwrap();
+        let take_wave = |receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                    receiver.try_recv()
+                {
+                    assert_eq!(timestamp, 0);
+                    return data;
+                }
+                assert!(Instant::now() < deadline, "AAC playback must resume");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let acknowledge = |server: &mut RdpsndServer, data: Vec<u8>| {
+            let messages: Vec<_> = server.wave(data, 0).unwrap().into();
+            let ServerAudioOutputPdu::Wave2(wave) =
+                decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
+            else {
+                panic!("expected Wave2");
+            };
+            server
+                .process(
+                    &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                        block_no: wave.block_no,
+                        timestamp: 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            wave.block_no
+        };
+        let mut reference = Aac::new().unwrap();
+        let initial = vec![0x11; BLOCK_BYTES];
+        let first_expected = (0..3)
+            .find_map(|_| reference.encode(&initial).unwrap())
+            .unwrap();
+        source.write_all(&initial.repeat(3)).unwrap();
+        let first_data = take_wave(&mut receiver);
+        assert_eq!(first_data, first_expected);
+        let first = acknowledge(&mut server, first_data);
+        // Establish a client that sometimes sends a separate render echo.
+        thread::sleep(Duration::from_millis(20));
+        server
+            .process(
+                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                    block_no: first,
+                    timestamp: 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let tail_expected = reference.encode(&initial).unwrap().unwrap();
+        source.write_all(&initial).unwrap();
+        let tail = take_wave(&mut receiver);
+        assert_eq!(tail, tail_expected);
+        acknowledge(&mut server, tail);
+
+        // Flush the bounded codec tail, then stop idle silence traffic. Every
+        // later wave receives one confirmation; no final render echo follows.
+        let silence = vec![0; BLOCK_BYTES];
+        let mut expected = VecDeque::new();
+        for block in 0..SILENCE_TAIL_BLOCKS + 3 {
+            if block < SILENCE_TAIL_BLOCKS
+                && let Some(packet) = reference.encode(&silence).unwrap()
+            {
+                expected.push_back(packet);
+            }
+            source.write_all(&silence).unwrap();
+            thread::sleep(Duration::from_millis(25));
+            while let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) =
+                receiver.try_recv()
+            {
+                assert_eq!(Some(data.clone()), expected.pop_front());
+                acknowledge(&mut server, data);
+            }
+        }
+        while let Some(packet) = expected.pop_front() {
+            let data = take_wave(&mut receiver);
+            assert_eq!(data, packet);
+            acknowledge(&mut server, data);
+        }
+        thread::sleep(Duration::from_millis(550));
+        assert!(receiver.is_empty(), "idle capture must stay silent");
+
+        let fresh = vec![0x33; BLOCK_BYTES];
+        let mut resumed_packets = 0;
+        for _ in 0..12 {
+            if let Some(packet) = reference.encode(&fresh).unwrap() {
+                expected.push_back(packet);
+            }
+            source.write_all(&fresh).unwrap();
+            thread::sleep(Duration::from_millis(25));
+            while let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) =
+                receiver.try_recv()
+            {
+                assert_eq!(
+                    Some(data.clone()),
+                    expected.pop_front(),
+                    "missing render feedback must preserve fresh AAC samples"
+                );
+                acknowledge(&mut server, data);
+                resumed_packets += 1;
+            }
+        }
+        while let Some(packet) = expected.pop_front() {
+            let data = take_wave(&mut receiver);
+            assert_eq!(data, packet);
+            acknowledge(&mut server, data);
+            resumed_packets += 1;
+        }
+        assert!(
+            resumed_packets >= 8,
+            "resume must deliver audible AAC beyond the first priming packet"
+        );
         drop(server);
     }
 
@@ -1263,7 +1381,6 @@ mod tests {
                 "healthy playback must not be muted at either wrap"
             );
         }
-        assert!(flow.paired_confirms);
         assert_eq!(flow.recent.len(), FlowControl::HISTORY);
         drop(server);
     }
@@ -1361,330 +1478,195 @@ mod tests {
     }
 
     #[test]
-    fn render_feedback_survives_arrival_ack_and_does_not_extend_recovery() {
+    fn invalid_timestamp_does_not_hide_later_valid_render_feedback() {
         let start = Instant::now();
         let mut flow = FlowControl::default();
-        for number in 0..4 {
-            flow.sent(number, 65500 + u16::from(number), start);
-            flow.confirm(number, 65500 + u16::from(number), start);
-        }
+        flow.sent(0, 0, start);
+        flow.confirm(0, 0, start + Duration::from_millis(3));
+        flow.confirm(0, 56301, start + Duration::from_millis(4));
+        assert!(flow.hold_until.is_none());
+        flow.sent(1, 0, start + Duration::from_millis(580));
+        flow.confirm(1, 0, start + Duration::from_millis(583));
+        flow.confirm(0, 600, start + Duration::from_millis(600));
+        assert_eq!(flow.last_render_delay, Duration::from_millis(600));
+        assert!(flow.check_pressure(start + Duration::from_millis(600)));
+        assert!(!flow.can_send(start + Duration::from_millis(600)));
+        assert!(flow.can_send(start + Duration::from_millis(880)));
+        assert!(!flow.check_pressure(start + Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn recent_render_feedback_has_a_finite_hold_and_duplicates_do_not_extend_it() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 0, start);
+        flow.confirm(0, 0, start + Duration::from_millis(3));
+        // A later wave forms the queued tail before a recent playback report.
+        flow.sent(1, 0, start + Duration::from_millis(380));
+        flow.confirm(1, 0, start + Duration::from_millis(383));
+        flow.confirm(0, 400, start + Duration::from_millis(400));
+        assert_eq!(flow.pending, 0);
+        let deadline = flow.hold_until.unwrap();
+        assert_eq!(deadline, start + Duration::from_millis(480));
+        assert!(!flow.can_send(start + Duration::from_millis(450)));
+        assert!(flow.check_pressure(start + Duration::from_millis(450)));
+        flow.confirm(0, 400, start + Duration::from_millis(460));
+        assert_eq!(flow.hold_until, Some(deadline));
+        assert!(flow.can_send(deadline));
+        assert!(!flow.check_pressure(deadline));
+        // The later wave supplies only one confirmation. It never keeps
+        // capture muted after the measured recovery interval has elapsed.
+        assert!(flow.can_send(start + Duration::from_secs(120)));
         assert_eq!(
-            flow.pending, 0,
-            "arrival ACK releases only transport credit"
-        );
-        flow.confirm(
-            0,
-            65500u16.wrapping_add(3000),
-            start + Duration::from_secs(3),
-        );
-        assert!(!flow.can_send(start + Duration::from_secs(2)));
-        // Other queued waves finish later. They must not add another three
-        // seconds of muting to a buffer that is already finishing playback.
-        flow.confirm(
-            1,
-            65501u16.wrapping_add(3000),
-            start + Duration::from_secs(4),
-        );
-        let deadline = flow.hold_until;
-        assert!(deadline.is_some_and(|until| until <= start + Duration::from_secs(4)));
-        assert!(
-            flow.can_send(start + Duration::from_secs(4)),
-            "one fresh probe can recover missing tail feedback"
-        );
-        flow.confirm(
-            3,
-            65503u16.wrapping_add(3000),
-            start + Duration::from_secs(4),
-        );
-        assert!(flow.can_send(start + Duration::from_secs(4)));
-        flow.confirm(
-            1,
-            65501u16.wrapping_add(3000),
-            start + Duration::from_secs(5),
-        );
-        assert_eq!(flow.hold_until, deadline, "duplicate render ACK is ignored");
-        flow.confirm(
-            1,
-            65501u16.wrapping_add(2000),
-            start + Duration::from_secs(5),
-        );
-        assert_eq!(
-            flow.hold_until, deadline,
-            "older feedback cannot restart recovery"
+            flow.render_age(start + Duration::from_secs(120)),
+            Duration::ZERO
         );
     }
 
     #[test]
-    fn nonzero_receipt_confirm_does_not_hide_later_nine_second_playback_delay() {
+    fn stale_render_echo_after_long_idle_cannot_restart_recovery() {
         let start = Instant::now();
         let mut flow = FlowControl::default();
         flow.sent(0, 65000, start);
         flow.confirm(0, 65003, start + Duration::from_millis(3));
-        assert_eq!(flow.pending, 0);
-        // Another wave is queued while the first is held by the device. Its
-        // future playback, rather than ACK arrival time, anchors the pause.
-        flow.sent(
-            1,
-            65000u16.wrapping_add(8000),
-            start + Duration::from_secs(8),
-        );
-        flow.confirm(
-            1,
-            65000u16.wrapping_add(8003),
-            start + Duration::from_secs(8),
-        );
+        flow.sent(1, 0, start + Duration::from_secs(120));
+        flow.confirm(1, 0, start + Duration::from_millis(120003));
+        // An old protocol echo belongs to history, not the current stream.
         flow.confirm(
             0,
             65000u16.wrapping_add(9000),
-            start + Duration::from_secs(9),
-        );
-        assert!(flow.paired_confirms);
-        assert!(
-            !flow.can_send(start + Duration::from_secs(9)),
-            "actual playback feedback must stop queue growth"
-        );
-        let deadline = flow.hold_until.unwrap();
-        assert_eq!(deadline, start + Duration::from_millis(16700));
-        flow.confirm(
-            0,
-            65000u16.wrapping_add(9000),
-            start + Duration::from_secs(10),
-        );
-        assert_eq!(
-            flow.pending, 0,
-            "duplicates must not release another wave's credit"
-        );
-        assert_eq!(flow.hold_until, Some(deadline));
-        assert!(
-            flow.can_send(deadline),
-            "one fresh probe is allowed after the old queue drains"
-        );
-        flow.confirm(1, 65000u16.wrapping_add(8000 + 9000), deadline);
-        assert!(flow.can_send(deadline));
-    }
-
-    #[test]
-    fn paired_clients_stop_at_the_short_playback_frontier() {
-        let start = Instant::now();
-        let mut flow = FlowControl::default();
-        flow.sent(0, 1000, start);
-        flow.confirm(0, 1001, start + Duration::from_millis(1));
-        flow.confirm(0, 1020, start + Duration::from_millis(20));
-        assert!(flow.paired_confirms);
-        for sequence in 1..=16u16 {
-            let at = start + Duration::from_millis(u64::from(sequence) * 20);
-            assert!(flow.can_send(at));
-            flow.sent(sequence as u8, 1000 + sequence * 20, at);
-            flow.confirm(
-                sequence as u8,
-                1001 + sequence * 20,
-                at + Duration::from_millis(1),
-            );
-        }
-        let at = start + Duration::from_millis(340);
-        assert!(
-            !flow.can_send(at),
-            "receipt credit cannot grow a playback queue"
-        );
-        assert!(flow.check_pressure(at));
-        flow.confirm(16, 1350, at);
-        assert!(
-            flow.can_send(at),
-            "later rendering retires the whole consumed frontier"
+            start + Duration::from_secs(121),
         );
         assert_eq!(flow.pending, 0);
+        assert!(flow.can_send(start + Duration::from_secs(121)));
+        assert!(!flow.check_pressure(start + Duration::from_secs(121)));
+        assert!(flow.hold_until.is_none());
     }
 
     #[test]
-    fn missing_final_render_confirm_allows_one_fresh_probe_and_fifo_recovery() {
+    fn mixed_single_and_double_confirms_preserve_continuous_audio() {
         let start = Instant::now();
         let mut flow = FlowControl::default();
-        flow.sent(0, 0, start);
-        flow.confirm(0, 0, start + Duration::from_millis(3));
-        flow.confirm(0, 0, start + Duration::from_millis(30));
-        flow.sent(1, 0, start + Duration::from_millis(40));
-        flow.confirm(1, 0, start + Duration::from_millis(43));
-        // The final rendering ACK goes missing while the application pauses.
-        assert!(!flow.can_send(start + Duration::from_millis(350)));
-        assert!(!flow.can_send(start + Duration::from_millis(542)));
-        let probe_at = start + Duration::from_millis(550);
-        assert!(flow.can_send(probe_at));
-        flow.sent(2, 0, probe_at);
-        assert!(flow.recent.back().unwrap().probe);
-        assert_eq!(flow.pending, 1);
-        assert!(!flow.can_send(probe_at + Duration::from_millis(1)));
-        flow.confirm(2, 0, probe_at + Duration::from_millis(3));
-        assert_eq!(flow.pending, 0);
-        assert!(
-            !flow.can_send(probe_at + Duration::from_secs(1)),
-            "receipt credit alone cannot repeat a probe"
-        );
-        // Rendering the current probe proves both it and the missing tail
-        // were consumed, so ordinary current audio resumes immediately.
-        let rendered = probe_at + Duration::from_millis(30);
-        flow.confirm(2, 0, rendered);
-        assert!(flow.recent.iter().all(|wave| wave.playback_confirmed));
-        assert!(flow.can_send(rendered));
-        flow.sent(3, 0, rendered + Duration::from_millis(20));
-        assert!(!flow.recent.back().unwrap().probe);
-    }
-
-    #[test]
-    fn unanswered_render_probe_never_rebuilds_a_client_buffer() {
-        let start = Instant::now();
-        let mut flow = FlowControl::default();
-        flow.sent(0, 0, start);
-        flow.confirm(0, 0, start + Duration::from_millis(3));
-        flow.confirm(0, 0, start + Duration::from_millis(30));
-        flow.sent(1, 0, start + Duration::from_millis(40));
-        flow.confirm(1, 0, start + Duration::from_millis(43));
-        let probe_at = start + Duration::from_secs(1);
-        assert!(flow.can_send(probe_at));
-        flow.sent(2, 0, probe_at);
-        flow.confirm(2, 0, probe_at + Duration::from_millis(3));
-        for seconds in 2..=120 {
-            assert!(!flow.can_send(start + Duration::from_secs(seconds)));
-        }
-        assert_eq!(flow.recent.len(), 3);
-        assert_eq!(
-            flow.recent
-                .iter()
-                .filter(|wave| wave.probe && !wave.playback_confirmed)
-                .count(),
-            1
-        );
-        assert_eq!(flow.pending, 0);
-    }
-
-    #[test]
-    fn render_probe_waits_for_transport_and_explicit_playback_drain() {
-        let start = Instant::now();
-        let mut flow = FlowControl::default();
-        flow.sent(0, 0, start);
-        flow.confirm(0, 0, start + Duration::from_millis(3));
-        flow.confirm(0, 0, start + Duration::from_millis(30));
-        flow.sent(1, 0, start + Duration::from_millis(40));
-        flow.confirm(1, 0, start + Duration::from_millis(43));
-        flow.sent(2, 0, start + Duration::from_millis(60));
-        assert!(
-            !flow.can_send(start + Duration::from_secs(1)),
-            "a probe cannot overtake missing receipt credit"
-        );
-        flow.confirm(1, 5000, start + Duration::from_millis(1010));
-        flow.confirm(2, 0, start + Duration::from_millis(1013));
-        assert_eq!(flow.pending, 0);
-        assert!(
-            !flow.can_send(start + Duration::from_secs(2)),
-            "reported playback backlog must drain before probing"
-        );
-        let deadline = flow.hold_until.unwrap();
-        assert!(flow.can_send(deadline));
-        flow.sent(3, 0, deadline);
-        assert!(flow.recent.back().unwrap().probe);
-    }
-
-    #[test]
-    fn late_equal_render_echo_survives_block_reuse_and_half_timestamp_wrap() {
-        for delay_ms in [10_000, 35_000] {
-            let start = Instant::now();
-            let mut flow = FlowControl::default();
-            let waves = delay_ms / 20;
-            for sequence in 0..waves {
-                let at = start + Duration::from_millis(sequence * 20);
-                let timestamp = (1000 + sequence * 20) as u16;
-                assert!(flow.can_send(at));
-                flow.sent(sequence as u8, timestamp, at);
-                flow.confirm(sequence as u8, timestamp, at + Duration::from_millis(3));
-            }
-            let at = start + Duration::from_millis(delay_ms);
-            flow.confirm(0, 1000, at);
+        for sequence in 0..6500u64 {
+            let at = start + Duration::from_millis(sequence * 20);
             assert!(
-                flow.paired_confirms,
-                "a separated equal echo is rendering feedback"
+                flow.can_send(at),
+                "optional second confirms cannot gate audio"
             );
-            assert_eq!(
-                flow.recent[0].feedback_elapsed,
-                Duration::from_millis(delay_ms - 3)
-            );
-            assert!(!flow.can_send(at));
-            assert!(flow.check_pressure(at));
-            // Once the old tail finishes, a current stream can resume. No
-            // retained first-ACK generation or duplicate may release credit.
-            let tail = waves - 1;
-            let drained = start + Duration::from_millis(delay_ms * 2);
-            flow.confirm(tail as u8, (1000 + tail * 20) as u16, drained);
+            flow.sent(sequence as u8, 0, at);
+            flow.confirm(sequence as u8, 0, at + Duration::from_millis(3));
+            if sequence % 7 == 0 {
+                flow.confirm(sequence as u8, 0, at + Duration::from_millis(15));
+            }
             assert_eq!(flow.pending, 0);
-            assert!(flow.can_send(drained));
-            let deadline = flow.hold_until;
-            flow.confirm(0, 1000, drained + Duration::from_secs(1));
-            assert_eq!(flow.hold_until, deadline);
+            assert!(!flow.check_pressure(at + Duration::from_millis(16)));
         }
+        assert!(flow.can_send(start + Duration::from_secs(600)));
+        assert!(!flow.check_pressure(start + Duration::from_secs(600)));
     }
 
     #[test]
-    fn periodic_zero_render_echo_at_two_id_wraps_cannot_hide_ten_second_delay() {
-        use std::collections::BTreeMap;
-
-        let start = Instant::now();
-        let mut flow = FlowControl::default();
-        let mut confirms = BTreeMap::<u64, Vec<u8>>::new();
-        let mut sent = 0u64;
-        let mut discovered_at = None;
-        const RENDER_DELAY_MS: u64 = 10_240;
-        for elapsed_ms in 0..40_000 {
-            let at = start + Duration::from_millis(elapsed_ms);
-            // Only real sent waves receive confirmations. The client reports
-            // receipt after 3ms and an equal render echo after exactly two ID
-            // wraps, including collisions with a new generation's receipt.
-            if elapsed_ms % 20 == 0 && flow.can_send(at) {
-                let number = sent as u8;
-                flow.sent(number, 0, at);
-                confirms.entry(elapsed_ms + 3).or_default().push(number);
-                confirms
-                    .entry(elapsed_ms + 3 + RENDER_DELAY_MS)
-                    .or_default()
-                    .push(number);
-                sent += 1;
-            }
-            for number in confirms.remove(&elapsed_ms).unwrap_or_default() {
-                flow.confirm(number, 0, at);
-                if flow.paired_confirms && discovered_at.is_none() {
-                    discovered_at = Some(elapsed_ms);
-                }
-            }
-        }
-        assert_eq!(discovered_at, Some(RENDER_DELAY_MS + 3));
-        assert!(flow.last_render_delay >= Duration::from_millis(RENDER_DELAY_MS));
-        assert!(flow.check_pressure(start + Duration::from_millis(40_000)));
-        assert!(
-            sent < 600,
-            "a delayed render stream must not accept all 2000 current capture blocks"
-        );
-    }
-
-    #[test]
-    fn delayed_positive_render_feedback_cannot_hide_its_wall_clock_age() {
+    fn missing_final_render_confirm_resumes_consecutive_packets_after_idle() {
         let start = Instant::now();
         let mut flow = FlowControl::default();
         flow.sent(0, 0, start);
         flow.confirm(0, 0, start + Duration::from_millis(3));
-        flow.sent(1, 0, start + Duration::from_secs(9));
-        flow.confirm(1, 0, start + Duration::from_millis(9003));
-        flow.confirm(0, 141, start + Duration::from_secs(10));
-        assert!(flow.paired_confirms);
-        assert_eq!(flow.recent[0].feedback_ms, 141);
-        assert_eq!(flow.recent[0].feedback_elapsed, Duration::from_millis(9997));
-        assert_eq!(flow.hold_until, Some(start + Duration::from_millis(18_697)));
-        assert!(!flow.can_send(start + Duration::from_secs(10)));
-        assert!(flow.check_pressure(start + Duration::from_secs(10)));
-        flow.confirm(1, 141, start + Duration::from_secs(19));
-        assert!(flow.can_send(start + Duration::from_secs(19)));
-        let deadline = flow.hold_until;
-        flow.confirm(0, 141, start + Duration::from_secs(20));
+        flow.confirm(0, 0, start + Duration::from_millis(30));
+        flow.sent(1, 0, start + Duration::from_millis(40));
+        flow.confirm(1, 0, start + Duration::from_millis(43));
+        // Sound pauses without a second reply for its final packet.
+        for sequence in 2..200u64 {
+            let at = start + Duration::from_secs(120) + Duration::from_millis(sequence * 20);
+            assert!(
+                flow.can_send(at),
+                "resume must support more than one priming wave"
+            );
+            flow.sent(sequence as u8, 0, at);
+            flow.confirm(sequence as u8, 0, at + Duration::from_millis(3));
+            assert_eq!(flow.pending, 0);
+            assert!(!flow.check_pressure(at + Duration::from_millis(4)));
+        }
+    }
+
+    #[test]
+    fn missing_transport_confirms_still_bound_the_event_queue() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        for number in 0..MAX_PENDING as u8 {
+            assert!(flow.can_send(start));
+            flow.sent(number, 0, start);
+        }
+        assert_eq!(flow.pending, MAX_PENDING);
+        assert!(!flow.can_send(start));
+        assert!(!flow.can_send(start + Duration::from_secs(120)));
+        assert!(flow.check_pressure(start + Duration::from_secs(120)));
+        // A late receipt clears real transport credit even though its stale
+        // delay measurement cannot affect current playback.
+        flow.confirm(3, 0, start + Duration::from_secs(120));
+        assert_eq!(flow.pending, 0);
+        assert!(flow.can_send(start + Duration::from_secs(120)));
+        assert!(!flow.check_pressure(start + Duration::from_secs(120)));
+    }
+
+    #[test]
+    fn incomplete_transport_cannot_be_bypassed_by_stale_playback_feedback() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 0, start);
+        flow.confirm(0, 0, start + Duration::from_millis(3));
+        flow.confirm(0, 0, start + Duration::from_millis(30));
+        flow.sent(1, 0, start + Duration::from_millis(40));
+        let delayed = start + Duration::from_secs(120);
+        assert!(!flow.can_send(delayed));
+        flow.confirm(0, 5000, delayed);
         assert_eq!(
-            flow.hold_until, deadline,
-            "duplicate feedback must not repeat a pause"
+            flow.pending, 1,
+            "old playback replies cannot return newer credit"
         );
+        assert!(!flow.can_send(delayed));
+        flow.confirm(1, 0, delayed + Duration::from_millis(3));
+        assert_eq!(flow.pending, 0);
+        assert!(flow.can_send(delayed + Duration::from_millis(3)));
+    }
+
+    #[test]
+    fn old_equal_render_echoes_after_block_and_timestamp_wrap_do_not_mute_audio() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        for sequence in 0..3500u64 {
+            let at = start + Duration::from_millis(sequence * 20);
+            let timestamp = (65000 + sequence * 20) as u16;
+            assert!(flow.can_send(at));
+            flow.sent(sequence as u8, timestamp, at);
+            flow.confirm(sequence as u8, timestamp, at + Duration::from_millis(3));
+            if sequence == 500 || sequence == 1750 {
+                flow.confirm(0, 65000, at + Duration::from_millis(4));
+                assert!(flow.can_send(at + Duration::from_millis(4)));
+                assert!(!flow.check_pressure(at + Duration::from_millis(4)));
+            }
+        }
+        assert_eq!(flow.pending, 0);
+        assert!(flow.hold_until.is_none());
+    }
+
+    #[test]
+    fn delayed_recent_equal_echo_uses_wall_clock_delay_and_then_expires() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 0, start);
+        flow.confirm(0, 0, start + Duration::from_millis(3));
+        flow.sent(1, 0, start + Duration::from_millis(850));
+        flow.confirm(1, 0, start + Duration::from_millis(853));
+        flow.confirm(0, 0, start + Duration::from_millis(900));
+        assert_eq!(flow.last_render_delay, Duration::from_millis(897));
+        assert!(!flow.can_send(start + Duration::from_millis(900)));
+        let deadline = flow.hold_until.unwrap();
+        assert_eq!(deadline, start + Duration::from_millis(1447));
+        assert!(deadline <= start + Duration::from_millis(1900));
+        flow.confirm(0, 141, start + Duration::from_secs(10));
+        assert_eq!(flow.hold_until, Some(deadline));
+        assert!(flow.can_send(start + Duration::from_secs(10)));
+        assert!(!flow.check_pressure(start + Duration::from_secs(10)));
     }
 
     #[test]
@@ -1713,7 +1695,6 @@ mod tests {
                 flow.confirm(sequence as u8, 0, at);
             }
         }
-        assert!(flow.paired_confirms);
         assert_eq!(flow.pending, 0);
         assert!(flow.hold_until.is_none());
         assert!(!flow.check_pressure(start + Duration::from_secs(31)));
@@ -1731,10 +1712,6 @@ mod tests {
             assert_eq!(flow.pending, 0);
         }
         let at = start + Duration::from_secs(131);
-        assert!(
-            !flow.paired_confirms,
-            "one receipt per wave must not look like delayed rendering"
-        );
         assert!(flow.can_send(at));
         assert!(!flow.check_pressure(at));
         assert_eq!(flow.recent.len(), FlowControl::HISTORY);
@@ -1753,26 +1730,44 @@ mod tests {
             flow.confirm(sequence as u8, 0, confirmed);
             assert_eq!(flow.pending, 0);
         }
-        assert!(!flow.paired_confirms);
-        assert!(flow.recent.iter().all(|wave| wave.playback_confirmed));
         assert!(!flow.check_pressure(start + Duration::from_secs(131)));
     }
 
     #[test]
-    fn zero_timestamp_accepts_full_unsigned_render_delay() {
+    fn clock_like_feedback_cannot_mute_audio_or_reduce_healthy_video() {
         let start = Instant::now();
         let mut flow = FlowControl::default();
-        flow.sent(0, 0, start);
-        flow.confirm(0, 0, start + Duration::from_millis(3));
-        // The zero reference makes the complete u16 a client hold duration,
-        // including reports that exceed the old signed half-wrap cutoff.
-        flow.confirm(0, 40_000, start + Duration::from_millis(4));
-        assert!(flow.paired_confirms);
-        assert_eq!(flow.recent[0].feedback_elapsed, Duration::from_secs(40));
+        let mut rate = crate::performance::AdaptiveBitrate::new(12_000_000, start);
+        for number in 0..4 {
+            flow.sent(number, 0, start);
+            flow.confirm(number, 0, start + Duration::from_millis(3));
+        }
+        // Reproduce clock-like feedback near the 56301 ms delay seen in the
+        // journal, delivered immediately after sending a synthetic wave.
+        flow.confirm(0, 56301, start + Duration::from_millis(4));
+        assert!(flow.hold_until.is_none());
+        for sequence in 4..6500u64 {
+            let at = start + Duration::from_millis(sequence * 20);
+            assert!(flow.can_send(at));
+            flow.sent(sequence as u8, 0, at);
+            flow.confirm(sequence as u8, 0, at + Duration::from_millis(3));
+            if sequence % 256 == 0 {
+                flow.confirm(sequence as u8, 40000, at + Duration::from_millis(4));
+            }
+            if flow.check_pressure(at + Duration::from_millis(5)) {
+                rate.audio_congested(at + Duration::from_millis(5));
+            }
+            rate.sent(sequence as u32, at);
+            rate.acknowledged(sequence as u32, 0, at + Duration::from_millis(10));
+            assert_eq!(
+                rate.current(),
+                12_000_000,
+                "phantom audio delay must not degrade video"
+            );
+        }
         assert_eq!(flow.pending, 0);
-        assert!(!flow.can_send(start + Duration::from_secs(10)));
-        assert!(flow.check_pressure(start + Duration::from_secs(10)));
-        assert!(flow.can_send(start + Duration::from_secs(40)));
+        assert!(flow.can_send(start + Duration::from_secs(600)));
+        assert!(!flow.check_pressure(start + Duration::from_secs(600)));
     }
 
     #[test]
@@ -1782,7 +1777,6 @@ mod tests {
         flow.sent(0, 0, start);
         flow.confirm(0, 0, start + Duration::from_millis(1));
         flow.confirm(0, 0, start + Duration::from_millis(2));
-        assert!(!flow.paired_confirms);
         assert_eq!(flow.pending, 0);
         assert!(flow.can_send(start + Duration::from_secs(1)));
         assert!(!flow.check_pressure(start + Duration::from_secs(1)));
@@ -1813,9 +1807,7 @@ mod tests {
                 flow.confirm(sequence as u8, 0, at);
             }
         }
-        assert!(flow.paired_confirms);
         assert_eq!(flow.pending, 0);
-        assert!(flow.recent.iter().all(|wave| wave.playback_confirmed));
         assert!(!flow.check_pressure(start + Duration::from_secs(31)));
     }
 
@@ -1837,39 +1829,27 @@ mod tests {
     }
 
     #[test]
-    fn equal_and_missing_playback_confirms_retire_at_the_playback_frontier() {
+    fn later_receipts_retire_lost_credit_without_requiring_playback_echoes() {
         let now = Instant::now();
         let mut flow = FlowControl::default();
         flow.sent(0, 100, now);
         flow.confirm(0, 100, now);
         flow.confirm(0, 120, now);
-        assert!(flow.paired_confirms);
         flow.sent(1, 120, now);
         flow.confirm(1, 120, now);
-        flow.confirm(1, 120, now);
-        assert!(
-            flow.recent[1].playback_confirmed,
-            "zero-latency second confirm remains valid"
-        );
         flow.sent(2, 140, now);
-        // Both confirms for block two go missing, but block three finishes.
         flow.sent(3, 160, now);
         flow.confirm(3, 160, now);
-        flow.confirm(3, 190, now);
         assert_eq!(
             flow.pending, 0,
-            "later playback proves the earlier queued wave was consumed"
+            "later FIFO receipt retires a lost earlier ACK"
         );
-        assert!(flow.recent.iter().all(|wave| wave.playback_confirmed));
         for sequence in 4..=260u16 {
             flow.sent(sequence as u8, 100 + sequence * 20, now);
             flow.confirm(sequence as u8, 100 + sequence * 20, now);
-            flow.confirm(sequence as u8, 100 + sequence * 20, now);
-            assert!(
-                flow.can_send(now),
-                "one missing confirm must not mute at number reuse"
-            );
+            assert!(flow.can_send(now));
         }
+        assert!(!flow.check_pressure(now + Duration::from_secs(120)));
     }
 
     #[test]
@@ -1938,7 +1918,7 @@ mod tests {
     }
 
     #[test]
-    fn playback_backlog_drops_capture_and_resumes_with_fresh_sound() {
+    fn transport_backlog_drops_capture_and_resumes_with_fresh_pcm() {
         let audio = Audio::default();
         let (mut server, mut receiver) = negotiate(&audio, vec![pcm()]);
         let (mut source, capture) = UnixStream::pair().unwrap();
@@ -1947,53 +1927,63 @@ mod tests {
             .unwrap();
         audio.attach(Some(capture));
         source.read_exact(&mut [0]).unwrap();
-        source.write_all(&vec![0x11; BLOCK_BYTES]).unwrap();
-        thread::sleep(Duration::from_millis(30));
-        let ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp)) =
-            receiver.try_recv().unwrap()
-        else {
-            panic!("expected wave");
-        };
-        let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
-        let ServerAudioOutputPdu::Wave2(wave) =
-            decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
-        else {
-            panic!("expected wave2");
-        };
-        for held_ms in [3, 400] {
-            server
-                .process(
-                    &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                        block_no: wave.block_no,
-                        timestamp: wave.timestamp.wrapping_add(held_ms),
-                    }))
-                    .unwrap(),
-                )
-                .unwrap();
+        for _ in 0..MAX_PENDING {
+            source.write_all(&vec![0x11; BLOCK_BYTES]).unwrap();
+            thread::sleep(Duration::from_millis(25));
+        }
+        let mut tail = 0;
+        for _ in 0..MAX_PENDING {
+            let ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp)) =
+                receiver.try_recv().unwrap()
+            else {
+                panic!("expected PCM wave")
+            };
+            let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
+            let ServerAudioOutputPdu::Wave2(wave) =
+                decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
+            else {
+                panic!("expected Wave2")
+            };
+            tail = wave.block_no;
         }
         source.write_all(&vec![0x22; BLOCK_BYTES * 20]).unwrap();
         thread::sleep(Duration::from_millis(80));
         assert!(
             receiver.is_empty(),
-            "arrival credit cannot bypass playback recovery"
+            "transport credit must bound queued sound"
         );
-        thread::sleep(Duration::from_millis(250));
-        assert!(
-            receiver.is_empty(),
-            "recovery must not replay discarded samples"
-        );
+        server
+            .process(
+                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                    block_no: tail,
+                    timestamp: 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
         source.write_all(&vec![0x33; BLOCK_BYTES]).unwrap();
-        thread::sleep(Duration::from_millis(30));
-        let ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _)) = receiver.try_recv().unwrap()
-        else {
-            panic!("expected fresh wave");
-        };
-        assert_eq!(data, vec![0x33; BLOCK_BYTES]);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) = receiver.try_recv()
+            {
+                assert_eq!(
+                    data,
+                    vec![0x33; BLOCK_BYTES],
+                    "recovery must not replay stale capture"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected fresh PCM after receipt"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
         drop(server);
     }
 
     #[test]
-    fn delayed_zero_render_echo_blocks_capture_until_current_sound_can_resume() {
+    fn missing_render_tail_and_clock_like_echo_do_not_block_current_pcm() {
         let audio = Audio::default();
         let (mut server, mut receiver) = negotiate(&audio, vec![pcm()]);
         let (mut source, capture) = UnixStream::pair().unwrap();
@@ -2011,7 +2001,7 @@ mod tests {
                     assert_eq!(timestamp, 0);
                     return data;
                 }
-                assert!(Instant::now() < deadline, "expected current audio");
+                assert!(Instant::now() < deadline, "expected current PCM");
                 thread::sleep(Duration::from_millis(1));
             }
         };
@@ -2020,10 +2010,8 @@ mod tests {
             let ServerAudioOutputPdu::Wave2(wave) =
                 decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
             else {
-                panic!("expected Wave2");
+                panic!("expected Wave2")
             };
-            assert_eq!(wave.timestamp, 0);
-            assert_eq!(wave.audio_timestamp, 0);
             server
                 .process(
                     &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
@@ -2037,39 +2025,26 @@ mod tests {
         };
         source.write_all(&vec![0x11; BLOCK_BYTES]).unwrap();
         let first = dispatch(&mut server, take_wave(&mut receiver));
-        thread::sleep(Duration::from_millis(20));
         server
             .process(
                 &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
                     block_no: first,
-                    timestamp: 0,
+                    timestamp: 56301,
                 }))
                 .unwrap(),
             )
             .unwrap();
-        source.write_all(&vec![0x11; BLOCK_BYTES * 3]).unwrap();
-        let mut tail = first;
-        for _ in 0..3 {
-            tail = dispatch(&mut server, take_wave(&mut receiver));
+        source.write_all(&vec![0x22; BLOCK_BYTES]).unwrap();
+        dispatch(&mut server, take_wave(&mut receiver));
+        // No render echo arrives for the tail while the application pauses.
+        thread::sleep(Duration::from_millis(600));
+        for _ in 0..6 {
+            let fresh = vec![0x33; BLOCK_BYTES];
+            source.write_all(&fresh).unwrap();
+            let received = take_wave(&mut receiver);
+            assert_eq!(received, fresh);
+            dispatch(&mut server, received);
         }
-        thread::sleep(Duration::from_millis(350));
-        source.write_all(&vec![0x22; BLOCK_BYTES * 10]).unwrap();
-        thread::sleep(Duration::from_millis(40));
-        assert!(
-            receiver.is_empty(),
-            "receipt ACKs cannot bypass the stalled render frontier"
-        );
-        server
-            .process(
-                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                    block_no: tail,
-                    timestamp: 0,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
-        source.write_all(&vec![0x33; BLOCK_BYTES]).unwrap();
-        assert_eq!(take_wave(&mut receiver), vec![0x33; BLOCK_BYTES]);
         drop(server);
     }
 

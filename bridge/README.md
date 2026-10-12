@@ -245,15 +245,16 @@ additional audio configuration is required. A client must enable
 remote playback and accept one of these formats. No microphone redirection is provided. Audio starts after
 successful Linux authentication, including submission through the login form.
 Disconnect closes capture; authenticated reconnect opens a fresh monitor of the
-retained desktop. At most four waves await receipt confirmation. A separate
-bounded history retains playback feedback after receipt acknowledgements: when
-the client reports more than 300 ms of playback buffering, capture is discarded
-while that buffer drains. Actual elapsed time awaiting receipt and rendering is
-also tracked, including separated rendering confirmations with unchanged
-timestamps. Once paired confirmations are observed, further audio waits when
-the oldest unrendered sound exceeds that budget; block numbers are not reused
-ahead of playback. Later progress also retires missing earlier confirmations.
-A client sending only one confirmation remains usable. Audio congestion reduces
+retained desktop. At most four waves await receipt confirmation. Optional later
+confirmations provide playback delay measurements; they are never required to
+release a second credit. Only feedback for waves sent within the past second
+can affect playback, and timestamp delays must fit the elapsed time plus a
+300 ms device scheduling allowance. Valid feedback above 300 ms briefly discards
+capture while the queued tail drains. Recovery always expires within a second
+and resumes consecutive fresh packets, allowing AAC to progress beyond priming.
+Missing replies, mixed single/double confirmations and old idle waves cannot
+permanently mute sound or create an ever-growing delay. Later receipt progress
+also retires missing earlier confirmations. Actual audio congestion reduces
 the live H.264 target even when graphics acknowledgements are healthy or
 suspended; recovery waits for three seconds without audio pressure.
 The bridge paces blocks by their exact sample duration and retains a three-block

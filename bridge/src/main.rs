@@ -83,12 +83,16 @@ impl ConnectionHandler for Lifecycle {
     }
     fn on_disconnected(
         &mut self,
-        _: SocketAddr,
-        _: Duration,
+        peer: SocketAddr,
+        duration: Duration,
         error: Option<&ServerError>,
     ) -> PostConnectionAction {
         if let Some(error) = error {
-            eprintln!("RDP connection ended: {error}");
+            eprintln!(
+                "RDP connection {peer} ended after {:.2}s: {}",
+                duration.as_secs_f64(),
+                error.report()
+            );
         }
         if let Some(active) = &self.active
             && let Some(desktop) = active.lock().unwrap().take()

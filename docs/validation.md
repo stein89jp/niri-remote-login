@@ -1,5 +1,69 @@
 # Validation record
 
+## Muted AAC and unbounded playback recovery, 2026-10-12
+
+The user reported no sound after installing release 17 with Windows 10's native
+`mstsc.exe`, while `RDP audio delay` showed zero receipt delay and continuously
+increasing render delay. Read-only frontend logs confirm AAC negotiation and
+render warnings increasing from 56,547 ms to over 300 seconds. Those logs do not
+record individual Wave Confirm timestamps, so the originating reply pattern
+cannot be recovered from them.
+
+The regression was reproduced without a stalled audio device: an optional
+second confirmation established a required render frontier, and a missing tail
+reply left it unfinished indefinitely. A synthetic 56,301 ms timestamp on a
+fresh wave also created a minute-long hold. The single recovery probe then
+required another rendering reply before sending anything else. After an AAC
+reset, that first packet consists mostly of codec priming; a native tone fixture
+measured energy of 0.000002239 in packet one versus 0.055186301 in packet two.
+The gate prevented the audible packet, and unfinished history repeatedly lowered
+video bitrate even though all receipt credits had returned.
+
+Release 18 treats optional rendering echoes as recent measurements, following
+the recoverable feedback model in [GNOME Remote Desktop](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dvc-audio-playback.c).
+The [RDPSND confirmation rules](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpea/a4e42263-dc78-4748-9752-173e5bfa3dfb)
+require a confirmation for consumption, rather than a mandatory receipt/render
+pair for every wave. Feedback from waves older than one second cannot restart
+recovery. A timestamp delay must fit observed elapsed time plus a 300 ms device
+scheduling allowance. Recent valid delay can still briefly discard capture,
+but recovery expires within one second and resumes consecutive fresh packets.
+Missing second replies never create an ever-growing render age. Four transport
+credits, sample-duration pacing, bounded capture and codec reset after actual
+capture/transport stalls remain enforced.
+
+All 35 audio tests passed, including the real AAC worker resuming multiple
+packets after idle without final render feedback, transport-stall recovery with
+fresh codec state, valid finite playback holds, mixed single/double replies,
+and a 6,500-wave simulation preserving the 12 Mbit/s graphics target despite
+clock-like timestamps. Invalid timestamps also cannot mask a later valid delay
+report for the same wave. `make check` passed outside the socket-restricted sandbox:
+72 Python tests (two opt-in checks skipped), five PoC Rust tests, four startup
+checks, all 12 native broker groups, 106 bridge library tests and the frontend
+lifecycle test. The prepared FreeRDP client DSP AAC/PCM interoperability check
+also passed. Evidence is under `artifacts/audio-recovery-fix/`.
+
+The combined `0.1.0-18` package built with all package checks enabled, and its
+structure/preservation validation passed. Extracted release binaries passed
+private NVENC AVC420 application decode/input/reconnect, TLS login-screen
+rejection/authentication, JIS input, live resize, held-input release and
+compositor-crash cleanup. The integration report is
+`artifacts/audio-recovery-fix/package-integration.json`. Formatting and whitespace
+checks passed; Clippy reports only the five existing login/Wayland warnings.
+
+The user's additional finalize errors were each followed within about half a
+second by another connection reaching audio and NVENC graphics setup. Their
+precise cause is hidden by the old top-level log. Release 18 logs the nested
+IronRDP error chain, peer and connection duration. AAC's routine `Qavg: nan`
+statistics when closing an unused encoder now use verbose logging; codec errors
+remain visible. This diagnostic change does not establish a fix for an unknown
+handshake failure.
+
+No installed package, service or active desktop was changed. Windows listening,
+long-running lip-sync and any recurring login failure need the user's reinstall
+and [actual-client acceptance check](acceptance.md). The RDPGFX path has no shared
+audio presentation clock, so these checks cannot establish zero physical A/V
+offset on Windows from server-side tests alone.
+
 ## Growing mstsc audio backlog, AAC and video feedback, 2026-10-12
 
 The user confirmed release 16 restored intelligible PCM sound, but Firefox
