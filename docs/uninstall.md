@@ -16,6 +16,25 @@ remains. If broker cleanup failed, inspect the session's service, UID and leader
 before terminating **that specific niri-rdp session** with
 `sudo loginctl terminate-session SESSION_ID`. Do not terminate GNOME sessions.
 
+Older or manual installations can leave portal files behind, causing a
+`conflicting files` error when reinstalling. Pacman normally removes these files
+when uninstalling the package. If either remains, check its ownership:
+
+```sh
+pacman -Qo /usr/lib/niri-rdp/session-portals \
+  /usr/share/xdg-desktop-portal/niri-rdp-portals.conf
+```
+
+If no package owns the remaining files, remove them before reinstalling:
+
+```sh
+sudo rm -f -- /usr/lib/niri-rdp/session-portals \
+  /usr/share/xdg-desktop-portal/niri-rdp-portals.conf
+```
+
+If another package owns either file, resolve that package's ownership before
+removing the file.
+
 Pacman preserves changed configuration as `.pacsave`; inspect it before removal.
 TLS identity files in `/etc/niri-rdp/tls` are generated on first start (or provided manually) and are not
 package-owned. Remove those files and the remaining project configuration only
