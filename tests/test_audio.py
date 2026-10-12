@@ -20,11 +20,11 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 class AudioCodecTests(unittest.TestCase):
-    def test_ms_adpcm_roundtrip_and_independent_dropped_blocks(self):
+    def test_audio_codecs_roundtrip_and_dropped_blocks(self):
         if not shutil.which("cc") or not shutil.which("pkg-config"):
             self.skipTest("C compiler and FFmpeg development libraries required")
         flags = subprocess.run(
-            ["pkg-config", "--cflags", "--libs", "libavcodec", "libavutil"],
+            ["pkg-config", "--cflags", "--libs", "libavcodec", "libavutil", "libswresample"],
             capture_output=True, text=True,
         )
         if flags.returncode:
@@ -312,3 +312,42 @@ runpy.run_path(sys.argv[1], run_name="__main__")
                     if server.poll() is None:
                         os.killpg(server.pid, signal.SIGTERM)
                     server.wait(timeout=5)
+
+
+class AudioRdpInteropTests(unittest.TestCase):
+    def test_prepared_freerdp_client_decodes_raw_aac_and_accepts_pcm_fallback(self):
+        library = ROOT / "lab/sysroot/usr/lib"
+        if not (library / "pkgconfig/freerdp3.pc").is_file() or not (library / "libfreerdp3.so").is_file():
+            self.skipTest("prepared lab FreeRDP client development libraries required")
+        if not shutil.which("cc") or not shutil.which("pkg-config"):
+            self.skipTest("C compiler and pkg-config required")
+        environment = dict(os.environ)
+        environment["PKG_CONFIG_PATH"] = str(library / "pkgconfig") + (
+            os.pathsep + environment["PKG_CONFIG_PATH"] if environment.get("PKG_CONFIG_PATH") else "")
+        flags = subprocess.run(
+            ["pkg-config", "--cflags", "--libs", "freerdp3", "winpr3",
+             "libavcodec", "libavutil", "libswresample"],
+            env=environment, capture_output=True, text=True,
+        )
+        if flags.returncode:
+            self.skipTest("prepared lab FreeRDP and FFmpeg development libraries required")
+        with tempfile.TemporaryDirectory(prefix="niri-audio-rdpsnd-") as directory:
+            executable = str(Path(directory) / "audio-rdpsnd")
+            compiled = subprocess.run(
+                ["cc", "-std=c17", "-O2", "-Wall", "-Wextra", "-Werror",
+                 "-Wno-deprecated-declarations", str(ROOT / "tests/audio_rdpsnd.c"),
+                 str(ROOT / "bridge/src/audio.c"),
+                 "-o", executable, *shlex.split(flags.stdout), "-lm"],
+                env=environment, capture_output=True, text=True,
+            )
+            self.assertEqual(compiled.returncode, 0, compiled.stderr)
+            environment["LD_LIBRARY_PATH"] = str(library) + (
+                os.pathsep + environment["LD_LIBRARY_PATH"] if environment.get("LD_LIBRARY_PATH") else "")
+            environment["WLOG_LEVEL"] = "OFF"
+            result = subprocess.run([executable], env=environment, capture_output=True,
+                                    text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("FreeRDP client DSP version:", result.stdout)
+            self.assertIn("accepts exact AAC_MS and PCM formats; MS ADPCM is filtered", result.stdout)
+            self.assertIn("FreeRDP raw AAC decode: reconnect=0", result.stdout)
+            self.assertIn("FreeRDP raw AAC decode: reconnect=1", result.stdout)

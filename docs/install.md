@@ -353,15 +353,19 @@ second (default 60 for NVENC, 30 for bitmap). `NIRI_RDP_BITRATE_MBPS` accepts
 1–100 megabits per second (default 12) as the NVENC bitrate ceiling. Each
 connection starts at that ceiling and adapts down toward 1 Mbps when graphics
 acknowledgements slow relative to the connection's baseline, stall, or report a
-client decoding backlog. It recovers gradually when delivery stays healthy.
+client decoding backlog. Audio receipt or playback congestion also reduces the
+video target, including while graphics acknowledgements are suspended. It
+recovers gradually when delivery stays healthy and audio has had no congestion
+for three seconds.
 Changes apply to the live encoder without resetting the desktop. Reduce the
 frame rate or ceiling for limited networks; increasing the ceiling can improve
 AVC420 quality when the connection has enough bandwidth. Bitmap fallback does
 not use this bitrate controller.
 
-Audio automatically prefers MS ADPCM when the client supports it, reducing
-stereo playback traffic from about 1.54 Mbps to 0.39 Mbps before framing. Other
-clients receive PCM. Blocks are paced by their exact sample duration and keep
+Audio prefers GNOME Remote Login's stereo AAC-LC format at 96 kbit/s when the
+client accepts it; PCM is the fallback at about 1.54 Mbps before framing. PCM
+takes preference over the older MS ADPCM offer. Digital silence is suppressed
+after a short codec tail. Blocks are paced by their exact sample duration and keep
 recent capture samples when the source or network stalls. Playback feedback
 continues to be tracked after receipt confirmations, including long delays and
 block-number wrapping, so an excessive client buffer can drain before current
@@ -369,8 +373,8 @@ sound resumes. Recovery may skip sound during congestion. No manual delay or
 codec setting is needed. These controls limit accumulating delay; actual mstsc
 audio/video presentation still needs the playback check below.
 
-To inspect playback, the frontend journal reports `RDP audio MS ADPCM` or
-`RDP audio PCM`, plus `RDP audio client playback delay` during buffer recovery
+To inspect playback, the frontend journal reports `RDP audio AAC-LC` or
+`RDP audio PCM`, plus `RDP audio delay: receipt ... ms, render ... ms` during buffer recovery
 and `RDP graphics adaptive H.264 target` during video adaptation. Test a clip with visible
 claps or simultaneous flash/tone for several minutes, then repeat after a short
 network stall. Record whether the offset stays constant or keeps growing; see

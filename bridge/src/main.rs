@@ -125,7 +125,10 @@ async fn main() -> anyhow::Result<()> {
     let acceptor = identity.make_acceptor()?;
     let output = std::env::var("NIRI_RDP_OUTPUT").unwrap_or_else(|_| "HEADLESS-1".into());
     let video = Video::from_env()?;
-    let audio = niri_rdp_bridge::audio::Audio::default();
+    let mut audio = niri_rdp_bridge::audio::Audio::default();
+    if let Some(video) = &video {
+        audio = audio.with_video(video.clone());
+    }
     let mut server = if mode == "broker" {
         let broker = Arc::new(
             Broker::new(

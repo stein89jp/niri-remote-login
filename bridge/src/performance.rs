@@ -14,6 +14,7 @@ pub(crate) struct AdaptiveBitrate {
     last_change: Instant,
     healthy_since: Option<Instant>,
     baseline: Option<Duration>,
+    last_audio_congestion: Option<Instant>,
 }
 
 impl Default for AdaptiveBitrate {
@@ -36,6 +37,7 @@ impl AdaptiveBitrate {
             last_change: now,
             healthy_since: None,
             baseline: None,
+            last_audio_congestion: None,
         }
     }
     pub(crate) fn ceiling(&self) -> u32 {
@@ -48,6 +50,30 @@ impl AdaptiveBitrate {
         self.sent.clear();
         self.suspended = false;
         self.healthy_since = None;
+    }
+    pub(crate) fn audio_congested(&mut self, now: Instant) {
+        self.last_audio_congestion = Some(
+            self.last_audio_congestion
+                .map_or(now, |previous| previous.max(now)),
+        );
+        // Sound can be queued even when graphics ACKs are healthy or suspended.
+        // Use the same reduction cooldown, but keep recovery tied to both streams.
+        self.congested(now);
+    }
+    pub(crate) fn clear_audio_congestion(&mut self) {
+        self.last_audio_congestion = None;
+        self.healthy_since = None;
+    }
+    pub(crate) fn inherit_audio_congestion(&mut self, previous: &Self, now: Instant) {
+        if let Some(at) = previous.last_audio_congestion
+            && now.saturating_duration_since(at) < Self::RECOVER_INTERVAL
+        {
+            // Sound negotiation can precede creation of the graphics context.
+            // Preserve its pressure and target without carrying old frame IDs.
+            self.last_audio_congestion = Some(at);
+            self.current = self.current.min(previous.current);
+            self.last_change = previous.last_change.min(now);
+        }
     }
     fn delivery_budget(&self) -> Duration {
         // Transit time alone is not congestion. Detect delay above the fastest
@@ -112,6 +138,9 @@ impl AdaptiveBitrate {
         let healthy = *self.healthy_since.get_or_insert(now);
         if now.duration_since(healthy) >= Self::RECOVER_INTERVAL
             && now.duration_since(self.last_change) >= Self::RECOVER_INTERVAL
+            && self
+                .last_audio_congestion
+                .is_none_or(|at| now.saturating_duration_since(at) >= Self::RECOVER_INTERVAL)
         {
             self.current = self
                 .current
@@ -217,6 +246,92 @@ mod tests {
             9_000_000,
             "delay above baseline reduces bitrate"
         );
+    }
+
+    #[test]
+    fn audio_congestion_reduces_video_despite_healthy_graphics_and_recovers_afterward() {
+        let start = Instant::now();
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        rate.sent(0, start);
+        rate.acknowledged(0, 0, start + Duration::from_millis(20));
+        for id in 1..=10 {
+            let at = start + Duration::from_millis(u64::from(id) * 500);
+            rate.audio_congested(at);
+            let reduced = rate.current();
+            rate.sent(id, at);
+            rate.acknowledged(id, 0, at + Duration::from_millis(20));
+            assert_eq!(
+                rate.current(),
+                reduced,
+                "healthy graphics cannot undo sound pressure"
+            );
+        }
+        assert_eq!(rate.current(), 1_000_000);
+        let quiet = start + Duration::from_millis(5020);
+        for id in 11..=40 {
+            let at = quiet + Duration::from_millis(u64::from(id - 10) * 100);
+            rate.sent(id, at);
+            rate.acknowledged(id, 0, at + Duration::from_millis(20));
+        }
+        assert_eq!(
+            rate.current(),
+            1_250_000,
+            "recovery resumes after sound pressure ends"
+        );
+    }
+
+    #[test]
+    fn audio_pressure_applies_without_graphics_acks_and_shares_the_reduction_cooldown() {
+        let start = Instant::now();
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        rate.sent(0, start);
+        rate.acknowledged(0, u32::MAX, start + Duration::from_millis(20));
+        rate.audio_congested(start + Duration::from_millis(500));
+        assert_eq!(rate.current(), 9_000_000);
+        rate.audio_congested(start + Duration::from_millis(501));
+        rate.check_stall(start + Duration::from_millis(900));
+        assert_eq!(
+            rate.current(),
+            9_000_000,
+            "audio reports do not bypass the cooldown"
+        );
+        for half_second in 2..30 {
+            rate.audio_congested(start + Duration::from_millis(half_second * 500));
+        }
+        assert_eq!(rate.current(), 1_000_000);
+        assert!(
+            rate.sent.is_empty(),
+            "audio pressure needs no graphics frame sample"
+        );
+        rate.reset_frames();
+        assert!(
+            rate.last_audio_congestion.is_some(),
+            "graphics reactivation retains audio pressure"
+        );
+    }
+
+    #[test]
+    fn replacement_controllers_inherit_only_recent_audio_pressure() {
+        let start = Instant::now();
+        let mut previous = AdaptiveBitrate::new(12_000_000, start);
+        previous.sent(99, start);
+        previous.audio_congested(start + Duration::from_millis(500));
+        let now = start + Duration::from_millis(600);
+        let mut replacement = AdaptiveBitrate::new(12_000_000, now);
+        replacement.inherit_audio_congestion(&previous, now);
+        assert_eq!(replacement.current(), 9_000_000);
+        assert!(replacement.last_audio_congestion.is_some());
+        assert!(replacement.sent.is_empty());
+        assert!(replacement.baseline.is_none());
+        let stale = start + Duration::from_secs(4);
+        let mut replacement = AdaptiveBitrate::new(12_000_000, stale);
+        replacement.inherit_audio_congestion(&previous, stale);
+        assert_eq!(replacement.current(), 12_000_000);
+        assert!(replacement.last_audio_congestion.is_none());
+        previous.clear_audio_congestion();
+        let mut replacement = AdaptiveBitrate::new(12_000_000, now);
+        replacement.inherit_audio_congestion(&previous, now);
+        assert_eq!(replacement.current(), 12_000_000);
     }
 
     #[test]

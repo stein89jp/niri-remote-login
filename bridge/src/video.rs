@@ -171,10 +171,50 @@ struct Shared {
     generation: Arc<AtomicU64>,
     suppressed: Arc<AtomicBool>,
     rate: Arc<Mutex<crate::performance::AdaptiveBitrate>>,
+    audio_generation: u64,
 }
 #[derive(Clone, Default)]
 pub struct Video(Arc<Mutex<Shared>>);
+
+/// Sound feedback follows the active graphics context, including when sound
+/// negotiation happens first. Older connections cannot reduce a newer one's rate.
+#[derive(Clone)]
+pub struct AudioFeedback {
+    video: Video,
+    generation: u64,
+}
+impl std::fmt::Debug for AudioFeedback {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AudioFeedback")
+            .field("generation", &self.generation)
+            .finish_non_exhaustive()
+    }
+}
+impl AudioFeedback {
+    pub fn report_congestion(&self, now: Instant) {
+        let state = self.video.0.lock().unwrap();
+        if state.audio_generation == self.generation {
+            state.rate.lock().unwrap().audio_congested(now);
+        }
+    }
+    pub fn clear(&self) {
+        let state = self.video.0.lock().unwrap();
+        if state.audio_generation == self.generation {
+            state.rate.lock().unwrap().clear_audio_congestion();
+        }
+    }
+}
 impl Video {
+    /// Create once per sound backend, then clone into its capture worker.
+    pub fn audio_feedback(&self) -> AudioFeedback {
+        let mut state = self.0.lock().unwrap();
+        state.audio_generation = state.audio_generation.wrapping_add(1);
+        state.rate.lock().unwrap().clear_audio_congestion();
+        AudioFeedback {
+            video: self.clone(),
+            generation: state.audio_generation,
+        }
+    }
     pub fn from_env() -> anyhow::Result<Option<Self>> {
         // Reject invalid capture settings before accepting client connections.
         crate::performance::frame_rate()?;
@@ -293,11 +333,13 @@ impl GfxServerFactory for Video {
         // A new context per connection prevents surfaces/acks crossing authenticated sessions.
         let generation = Arc::new(AtomicU64::new(0));
         let mut state = self.0.lock().unwrap();
-        let ceiling = state.rate.lock().unwrap().ceiling();
-        let rate = Arc::new(Mutex::new(crate::performance::AdaptiveBitrate::new(
-            ceiling,
-            Instant::now(),
-        )));
+        let now = Instant::now();
+        let rate = {
+            let previous = state.rate.lock().unwrap();
+            let mut rate = crate::performance::AdaptiveBitrate::new(previous.ceiling(), now);
+            rate.inherit_audio_congestion(&previous, now);
+            Arc::new(Mutex::new(rate))
+        };
         let handle = Arc::new(Mutex::new(GraphicsPipelineServer::new(Box::new(Handler(
             generation.clone(),
             rate.clone(),
@@ -1211,6 +1253,61 @@ mod tests {
         let new_rate = video.0.lock().unwrap().rate.clone();
         assert!(!Arc::ptr_eq(&new_rate, &stream.rate));
         assert_eq!(new_rate.lock().unwrap().current(), 12_000_000);
+    }
+    #[test]
+    fn sound_pressure_survives_graphics_initialization_and_follows_the_active_context() {
+        let video = Video::default();
+        let now = Instant::now();
+        *video.0.lock().unwrap().rate.lock().unwrap() =
+            crate::performance::AdaptiveBitrate::new(12_000_000, now - Duration::from_secs(2));
+        let sound = video.audio_feedback();
+        sound.report_congestion(now);
+        let previous = video.0.lock().unwrap().rate.clone();
+        assert_eq!(previous.lock().unwrap().current(), 9_000_000);
+        video.build_server_with_handle().unwrap();
+        let current = video.0.lock().unwrap().rate.clone();
+        assert!(!Arc::ptr_eq(&previous, &current));
+        assert_eq!(current.lock().unwrap().current(), 9_000_000);
+        sound
+            .clone()
+            .report_congestion(now + Duration::from_millis(500));
+        assert_eq!(current.lock().unwrap().current(), 6_750_000);
+        assert_eq!(previous.lock().unwrap().current(), 9_000_000);
+    }
+    #[test]
+    fn old_sound_handles_cannot_report_or_clear_pressure_after_reconnect() {
+        let video = Video::default();
+        let now = Instant::now();
+        *video.0.lock().unwrap().rate.lock().unwrap() =
+            crate::performance::AdaptiveBitrate::new(12_000_000, now - Duration::from_secs(2));
+        let old = video.audio_feedback();
+        old.report_congestion(now);
+        assert_eq!(
+            video.0.lock().unwrap().rate.lock().unwrap().current(),
+            9_000_000
+        );
+        let current = video.audio_feedback();
+        video.build_server_with_handle().unwrap();
+        let rate = video.0.lock().unwrap().rate.clone();
+        assert_eq!(rate.lock().unwrap().current(), 12_000_000);
+        old.report_congestion(now + Duration::from_secs(1));
+        assert_eq!(rate.lock().unwrap().current(), 12_000_000);
+        current.report_congestion(now + Duration::from_secs(2));
+        assert_eq!(rate.lock().unwrap().current(), 9_000_000);
+        old.clear();
+        video.build_server_with_handle().unwrap();
+        assert_eq!(
+            video.0.lock().unwrap().rate.lock().unwrap().current(),
+            9_000_000,
+            "stale cleanup must leave current sound pressure intact"
+        );
+        current.clear();
+        current.clear();
+        video.build_server_with_handle().unwrap();
+        assert_eq!(
+            video.0.lock().unwrap().rate.lock().unwrap().current(),
+            12_000_000
+        );
     }
     #[test]
     fn rate_changes_keep_a_decodable_stream() {

@@ -4,7 +4,7 @@ fn main() {
     let mut build = cc::Build::new();
     build.file("src/audio.c");
     build.file("src/video.c").flag_if_supported("-std=c11");
-    for name in ["libavcodec", "libavutil", "libswscale"] {
+    for name in ["libavcodec", "libavutil", "libswscale", "libswresample"] {
         let library = pkg_config::Config::new()
             .probe(name)
             .unwrap_or_else(|e| panic!("FFmpeg development library {name} required: {e}"));

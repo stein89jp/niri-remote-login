@@ -27,7 +27,9 @@ const ADPCM_BLOCK_BYTES: usize = 1024;
 // so every queued wave receives a block number and can be acknowledged.
 const MAX_PENDING: usize = 4;
 const MAX_CAPTURE_BLOCKS: usize = 3; // At most 64 ms of capture batching/jitter
-const PLAYBACK_BUDGET: Duration = Duration::from_millis(120);
+const PLAYBACK_BUDGET: Duration = Duration::from_millis(300);
+const CAPTURE_BUDGET: Duration = Duration::from_millis(60);
+const SILENCE_TAIL_BLOCKS: usize = 5; // 100 ms flushes bounded AAC lookahead.
 
 unsafe extern "C" {
     fn niri_audio_new(error: *mut c_char, length: usize) -> *mut c_void;
@@ -41,6 +43,77 @@ unsafe extern "C" {
         error: *mut c_char,
         error_length: usize,
     ) -> i32;
+    fn niri_audio_aac_new(error: *mut c_char, length: usize) -> *mut c_void;
+    fn niri_audio_aac_free(encoder: *mut c_void);
+    fn niri_audio_aac_encode(
+        encoder: *mut c_void,
+        pcm: *const u8,
+        length: usize,
+        data: *mut *const u8,
+        error: *mut c_char,
+        error_length: usize,
+    ) -> i32;
+}
+
+struct Aac {
+    ptr: *mut c_void,
+}
+// Like ADPCM, the encoder and resampler have a single capture-worker owner.
+unsafe impl Send for Aac {}
+impl Drop for Aac {
+    fn drop(&mut self) {
+        unsafe { niri_audio_aac_free(self.ptr) };
+    }
+}
+impl Aac {
+    fn new() -> anyhow::Result<Self> {
+        let mut error = [0 as c_char; 256];
+        let ptr = unsafe { niri_audio_aac_new(error.as_mut_ptr(), error.len()) };
+        anyhow::ensure!(
+            !ptr.is_null(),
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        Ok(Self { ptr })
+    }
+    fn encode(&mut self, pcm: &[u8]) -> anyhow::Result<Option<Vec<u8>>> {
+        let mut error = [0 as c_char; 256];
+        let mut data = std::ptr::null();
+        let length = unsafe {
+            niri_audio_aac_encode(
+                self.ptr,
+                pcm.as_ptr(),
+                pcm.len(),
+                &mut data,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        anyhow::ensure!(
+            length >= 0 && (length == 0 || !data.is_null()),
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        if length == 0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            unsafe { std::slice::from_raw_parts(data, length as usize) }.to_vec(),
+        ))
+    }
+}
+
+fn aac_format() -> AudioFormat {
+    // GNOME's AAC_MS offer uses raw LC packets and no HEAACWAVEINFO blob.
+    AudioFormat {
+        format: WaveFormat::AAC_MS,
+        n_channels: 2,
+        n_samples_per_sec: 44100,
+        n_avg_bytes_per_sec: 12000,
+        n_block_align: 4,
+        bits_per_sample: 16,
+        data: None,
+    }
 }
 
 struct Adpcm {
@@ -105,6 +178,27 @@ impl Adpcm {
     }
 }
 
+enum Codec {
+    Pcm,
+    Aac(Aac),
+    Adpcm(Adpcm),
+}
+impl Codec {
+    fn encode(&mut self, pcm: Vec<u8>) -> anyhow::Result<Option<Vec<u8>>> {
+        match self {
+            Self::Pcm => Ok(Some(pcm)),
+            Self::Aac(encoder) => encoder.encode(&pcm),
+            Self::Adpcm(encoder) => encoder.encode(&pcm).map(Some),
+        }
+    }
+    fn reset(&mut self) -> anyhow::Result<()> {
+        if let Self::Aac(encoder) = self {
+            *encoder = Aac::new()?;
+        }
+        Ok(())
+    }
+}
+
 fn pcm_format() -> AudioFormat {
     AudioFormat {
         format: WaveFormat::PCM,
@@ -117,30 +211,22 @@ fn pcm_format() -> AudioFormat {
     }
 }
 
-fn monotonic_millis() -> std::io::Result<u32> {
-    let mut time = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    if unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut time) } != 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok((time.tv_sec as u64 * 1000 + time.tv_nsec as u64 / 1_000_000) as u32)
-}
-
 #[derive(Debug)]
 struct SentWave {
     number: u8,
     timestamp: u16,
+    sent_at: Instant,
     acknowledged: bool,
+    first_confirm_at: Option<Instant>,
     feedback_ms: u16,
+    feedback_elapsed: Duration,
     playback_confirmed: bool,
+    probe: bool,
 }
 
-/// Arrival confirms release transport credit, but do not mean the sound played.
-/// mstsc and FreeRDP also report the playback queue in a later confirm. Remember
-/// those waves after arrival so a growing client buffer can drain before we
-/// send current audio again. Clients sending one confirm continue to work.
+/// A receipt confirmation releases transport credit. Clients that separately
+/// confirm rendering must also advance a short playback frontier. Keep older
+/// generations so a delayed echo can reveal that behavior after block-ID wrap.
 #[derive(Default, Debug)]
 struct FlowControl {
     pending: usize,
@@ -149,63 +235,210 @@ struct FlowControl {
     last_warning: Option<Instant>,
     latest_sent: Option<Instant>,
     paired_confirms: bool,
+    receipt_baseline: Option<Duration>,
+    last_render_delay: Duration,
+    last_probe_at: Option<Instant>,
 }
 impl FlowControl {
+    const HISTORY: usize = 2048;
+    const INITIAL_RECEIPT_BUDGET: Duration = Duration::from_millis(500);
+    const DISTINCT_CONFIRM_INTERVAL: Duration = Duration::from_millis(10);
+    const PROBE_INTERVAL: Duration = Duration::from_millis(500);
+
+    fn receipt_budget(&self) -> Duration {
+        self.receipt_baseline
+            .map_or(Self::INITIAL_RECEIPT_BUDGET, |baseline| {
+                (baseline + Duration::from_millis(100)).max(Duration::from_millis(150))
+            })
+    }
+    fn receipt_age(&self, now: Instant) -> Duration {
+        self.recent
+            .iter()
+            .find(|wave| !wave.acknowledged)
+            .map_or(Duration::ZERO, |wave| {
+                now.saturating_duration_since(wave.sent_at)
+            })
+    }
+    fn render_age(&self, now: Instant) -> Duration {
+        if !self.paired_confirms {
+            return Duration::ZERO;
+        }
+        self.recent
+            .iter()
+            .find(|wave| !wave.playback_confirmed)
+            .map_or(Duration::ZERO, |wave| {
+                now.saturating_duration_since(wave.sent_at)
+                    .saturating_sub(self.receipt_baseline.unwrap_or(Duration::ZERO))
+            })
+    }
     fn can_send(&self, now: Instant) -> bool {
         self.pending < MAX_PENDING
             && self.hold_until.is_none_or(|until| now >= until)
-            // Block IDs wrap after about five seconds. Once the client has
-            // demonstrated separate receipt/playback confirms, do not reuse
-            // an ID still awaiting playback. A late render ACK otherwise
-            // looks like a confirmation of the newer wave with that ID.
+            && self.receipt_age(now) <= self.receipt_budget()
+            && (self.render_age(now) <= PLAYBACK_BUDGET || self.can_probe(now))
+            // A paired client cannot reuse an ID still awaiting rendering.
             && !(self.paired_confirms
-                && self.recent.len() == 256
-                && self.recent.front().is_some_and(|wave| !wave.playback_confirmed))
+                && self.recent.back().is_some_and(|last| {
+                    let next = last.number.wrapping_add(1);
+                    self.recent.iter().any(|wave| wave.number == next && !wave.playback_confirmed)
+                }))
+    }
+    fn can_probe(&self, now: Instant) -> bool {
+        // A missing final render ACK must not permanently mute a paused
+        // stream. One fresh wave can elicit later FIFO playback progress.
+        // Its receipt ACK alone never permits another probe, so a genuinely
+        // stalled playback device cannot accumulate repeated timer retries.
+        self.pending == 0
+            && self.render_age(now) >= Self::PROBE_INTERVAL
+            && self.hold_until.is_none_or(|until| now >= until)
+            && self
+                .last_probe_at
+                .is_none_or(|last| now.saturating_duration_since(last) >= Self::PROBE_INTERVAL)
+            && !self
+                .recent
+                .iter()
+                .any(|wave| wave.probe && !wave.playback_confirmed)
     }
     fn sent(&mut self, number: u8, timestamp: u16, now: Instant) {
-        if self.recent.len() == 256 {
-            // After 256 consecutively numbered waves, FIFO dispatch and the
-            // four-credit cap prove this old wave reached the wire. Retire a
-            // lost ACK at number reuse, without expiring still-queued events.
-            if let Some(old) = self.recent.pop_front()
-                && !old.acknowledged
-            {
-                self.pending -= 1;
-            }
+        let probe = self.render_age(now) > PLAYBACK_BUDGET && self.can_probe(now);
+        if probe {
+            self.last_probe_at = Some(now);
+        }
+        // Reaching number reuse with four transport credits proves FIFO
+        // dispatch reached this older wave. Retire a lost receipt credit, but
+        // retain its timestamp so a delayed render echo can still be matched.
+        if let Some(old) = self.recent.iter_mut().rfind(|wave| wave.number == number)
+            && !old.acknowledged
+        {
+            old.acknowledged = true;
+            self.pending -= 1;
+        }
+        if self.recent.len() == Self::HISTORY
+            && let Some(old) = self.recent.pop_front()
+            && !old.acknowledged
+        {
+            self.pending -= 1;
         }
         self.pending += 1;
         self.latest_sent = Some(now);
         self.recent.push_back(SentWave {
             number,
             timestamp,
+            sent_at: now,
             acknowledged: false,
+            first_confirm_at: None,
             feedback_ms: 0,
+            feedback_elapsed: Duration::ZERO,
             playback_confirmed: false,
+            probe,
         });
     }
+    fn warn_delay(&mut self, now: Instant, receipt: Duration, render: Duration) {
+        if self
+            .last_warning
+            .is_none_or(|last| now.saturating_duration_since(last) >= Duration::from_secs(5))
+        {
+            eprintln!(
+                "RDP audio delay: receipt {} ms, render {} ms; dropping stale capture and reducing video bandwidth",
+                receipt.as_millis(),
+                render.as_millis(),
+            );
+            self.last_warning = Some(now);
+        }
+    }
+    fn check_pressure(&mut self, now: Instant) -> bool {
+        let receipt = self.receipt_age(now);
+        let render = self.render_age(now);
+        let draining = self.hold_until.is_some_and(|until| now < until);
+        let congested = receipt > self.receipt_budget() || render > PLAYBACK_BUDGET || draining;
+        if congested {
+            self.warn_delay(
+                now,
+                receipt,
+                render.max(if draining {
+                    self.last_render_delay
+                } else {
+                    Duration::ZERO
+                }),
+            );
+        }
+        congested
+    }
     fn confirm(&mut self, number: u8, timestamp: u16, now: Instant) {
-        let Some(position) = self.recent.iter().rposition(|wave| wave.number == number) else {
+        // With an immediate-playback zero reference, block numbers alone
+        // identify the wave. Receipt belongs to the newest pending generation;
+        // a later confirm belongs to the oldest unfinished playback generation.
+        // Always choosing the newest would hide an equal render echo whenever
+        // its delay coincides with one or more 256-wave block-number wraps.
+        let zero_reference = self
+            .recent
+            .iter()
+            .filter(|wave| wave.number == number)
+            .all(|wave| wave.timestamp == 0);
+        // An exact echo identifies a generation even when its eventual render
+        // confirm arrives over 32 seconds later. A modular difference alone
+        // would instead discard it as stale or attribute it to a reused ID.
+        let position = if zero_reference {
+            self.recent
+                .iter()
+                .rposition(|wave| wave.number == number && !wave.acknowledged)
+                .or_else(|| {
+                    self.recent.iter().position(|wave| {
+                        wave.number == number && wave.acknowledged && !wave.playback_confirmed
+                    })
+                })
+                .or_else(|| self.recent.iter().rposition(|wave| wave.number == number))
+        } else {
+            self.recent
+                .iter()
+                .rposition(|wave| wave.number == number && wave.timestamp == timestamp)
+                .or_else(|| {
+                    self.recent.iter().rposition(|wave| {
+                        wave.number == number
+                            && (wave.timestamp == 0
+                                || timestamp.wrapping_sub(wave.timestamp) < 0x8000)
+                    })
+                })
+        };
+        let Some(position) = position else {
             return;
         };
-        let wave = &mut self.recent[position];
+        let wave = &self.recent[position];
         let held_ms = timestamp.wrapping_sub(wave.timestamp);
-        if held_ms >= 0x8000 {
+        let increased = held_ms > wave.feedback_ms;
+        if wave.playback_confirmed && !increased {
             return;
         }
-        let already_acknowledged = wave.acknowledged;
-        if !already_acknowledged {
-            wave.acknowledged = true;
-            self.pending -= 1;
-        }
-        let increased = held_ms > wave.feedback_ms;
-        let playback_confirmed = already_acknowledged && (increased || self.paired_confirms);
-        if already_acknowledged && increased {
+        let first_confirm_at = wave.first_confirm_at;
+        let elapsed = now.saturating_duration_since(wave.sent_at);
+        let distinct_second = first_confirm_at.is_some_and(|first| {
+            now.saturating_duration_since(first) >= Self::DISTINCT_CONFIRM_INTERVAL
+        });
+        if first_confirm_at.is_none() {
+            self.recent[position].first_confirm_at = Some(now);
+            // A delayed first sample must not establish a multi-second healthy
+            // baseline. Stable ordinary network RTT still receives its margin.
+            let receipt = elapsed.min(Self::INITIAL_RECEIPT_BUDGET);
+            self.receipt_baseline = Some(
+                self.receipt_baseline
+                    .map_or(receipt, |old| old.min(receipt)),
+            );
+            // Receipt of a later FIFO wave also proves earlier transport
+            // events reached the client, even if one receipt ACK went missing.
+            for old in self.recent.iter_mut().take(position + 1) {
+                if !old.acknowledged {
+                    old.acknowledged = true;
+                    self.pending -= 1;
+                }
+            }
+        } else if increased || distinct_second {
             self.paired_confirms = true;
         }
+        // Even an immediate equal second packet finishes this generation.
+        // It need not prove paired rendering behavior, but leaving it unfinished
+        // would make healthy two-ACK clients accumulate ambiguous old records.
+        let playback_confirmed = first_confirm_at.is_some();
         if playback_confirmed {
-            // Audio is consumed in stream order. Completion of a later wave
-            // also retires a missing earlier confirm, so one lost/equal ACK
-            // cannot permanently mute a paired client at block-number reuse.
             for old in self.recent.iter_mut().take(position + 1) {
                 old.playback_confirmed = true;
                 if !old.acknowledged {
@@ -214,47 +447,65 @@ impl FlowControl {
                 }
             }
         }
-        // Receipt itself can take a few milliseconds: a positive first
-        // confirmation does not prove playback finished. Keep accepting
-        // increased feedback for this wave, including the later render ACK.
-        // Duplicate or reordered smaller reports must not restart recovery.
-        if !increased {
+        // A delayed second echo is useful even when the client leaves its
+        // protocol timestamp unchanged. Subtract the fastest receipt round trip
+        // so a stable long network path is not mistaken for a playback queue.
+        let render = Duration::from_millis(u64::from(held_ms)).max(if playback_confirmed {
+            elapsed.saturating_sub(self.receipt_baseline.unwrap_or(Duration::ZERO))
+        } else {
+            Duration::ZERO
+        });
+        let wave = &mut self.recent[position];
+        wave.feedback_ms = wave.feedback_ms.max(held_ms);
+        if render <= wave.feedback_elapsed {
             return;
         }
-        self.recent[position].feedback_ms = held_ms;
-        let held = Duration::from_millis(u64::from(held_ms));
-        if held > PLAYBACK_BUDGET {
-            // Anchor to the queued tail, not the receipt of a delayed render
-            // ACK. A run of old confirmations must not repeatedly restart the
-            // pause after the client's old buffer has already drained.
-            let until = self.latest_sent.unwrap_or(now) + (held - PLAYBACK_BUDGET);
+        wave.feedback_elapsed = render;
+        if render > PLAYBACK_BUDGET {
+            // Anchor to the queued tail. Old confirmations cannot repeatedly
+            // restart a pause once their client buffer has already drained.
+            let until = self.latest_sent.unwrap_or(now) + (render - PLAYBACK_BUDGET);
             self.hold_until = Some(self.hold_until.map_or(until, |old| old.max(until)));
-            if self
-                .last_warning
-                .is_none_or(|last| now.duration_since(last) >= Duration::from_secs(5))
-            {
-                eprintln!(
-                    "RDP audio client playback delay {held_ms} ms; dropping capture while its buffer drains"
-                );
-                self.last_warning = Some(now);
-            }
+            self.last_render_delay = render;
+            self.warn_delay(now, self.receipt_age(now), render);
         }
     }
 }
 
-#[derive(Clone, Default, Debug)]
-pub struct Audio(Arc<Mutex<Option<UnixStream>>>);
+#[derive(Clone, Default)]
+pub struct Audio {
+    socket: Arc<Mutex<Option<UnixStream>>>,
+    video: Option<crate::video::Video>,
+}
+impl std::fmt::Debug for Audio {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("SessionAudio")
+    }
+}
 impl Audio {
+    pub fn with_video(mut self, video: crate::video::Video) -> Self {
+        self.video = Some(video);
+        self
+    }
     pub fn attach(&self, socket: Option<UnixStream>) {
-        *self.0.lock().unwrap() = socket;
+        *self.socket.lock().unwrap() = socket;
     }
     pub fn clear(&self) {
-        self.0.lock().unwrap().take();
+        self.socket.lock().unwrap().take();
     }
     pub fn factory(&self) -> Factory {
         Factory {
             audio: self.clone(),
             sender: None,
+        }
+    }
+}
+
+struct FeedbackGuard(Option<crate::video::AudioFeedback>);
+impl Drop for FeedbackGuard {
+    fn drop(&mut self) {
+        if let Some(feedback) = &self.0 {
+            feedback.clear();
         }
     }
 }
@@ -269,16 +520,25 @@ impl ServerEventSender for Factory {
 }
 impl SoundServerFactory for Factory {
     fn build_backend(&self) -> Box<dyn RdpsndServerHandler> {
+        let aac = Aac::new()
+            .map_err(|error| {
+                eprintln!("RDP audio AAC-LC unavailable; offering PCM: {error}");
+                error
+            })
+            .ok();
         let encoder = Adpcm::new()
             .map_err(|error| {
                 eprintln!("RDP audio MS ADPCM unavailable; offering PCM: {error}");
                 error
             })
             .ok();
-        // mstsc advertises this ADPCM layout but real playback can become
-        // static. Prefer PCM until compressed playback is validated there;
-        // flow control and bounded capture keep either format low-latency.
-        let mut formats = vec![pcm_format()];
+        // Use GNOME's low-bandwidth codec first. Keep clear PCM ahead of the
+        // ADPCM layout that mstsc advertised but rendered as static.
+        let mut formats = Vec::new();
+        if aac.is_some() {
+            formats.push(aac_format());
+        }
+        formats.push(pcm_format());
         if let Some(encoder) = &encoder {
             formats.push(encoder.format.clone());
         }
@@ -286,9 +546,15 @@ impl SoundServerFactory for Factory {
             audio: self.audio.clone(),
             sender: self.sender.clone().expect("sound factory sender"),
             formats,
+            aac,
             encoder,
             stopped: Arc::new(AtomicBool::new(false)),
             pending: Arc::new(Mutex::new(FlowControl::default())),
+            feedback: self
+                .audio
+                .video
+                .as_ref()
+                .map(crate::video::Video::audio_feedback),
             worker: None,
         })
     }
@@ -297,9 +563,11 @@ struct Backend {
     audio: Audio,
     sender: UnboundedSender<ServerEvent>,
     formats: Vec<AudioFormat>,
+    aac: Option<Aac>,
     encoder: Option<Adpcm>,
     stopped: Arc<AtomicBool>,
     pending: Arc<Mutex<FlowControl>>,
+    feedback: Option<crate::video::AudioFeedback>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl std::fmt::Debug for Backend {
@@ -318,27 +586,35 @@ impl RdpsndServerHandler for Backend {
         common.first()
     }
     fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
-        let mut encoder = if format.format().format == WaveFormat::ADPCM {
-            Some(self.encoder.take().ok_or_else(|| {
+        let mut encoder = if format.format().format == WaveFormat::AAC_MS {
+            Codec::Aac(self.aac.take().ok_or_else(|| {
+                Box::new(std::io::Error::other("AAC-LC encoder unavailable"))
+                    as Box<dyn RdpsndError>
+            })?)
+        } else if format.format().format == WaveFormat::ADPCM {
+            Codec::Adpcm(self.encoder.take().ok_or_else(|| {
                 Box::new(std::io::Error::other("MS ADPCM encoder unavailable"))
                     as Box<dyn RdpsndError>
             })?)
         } else {
-            self.encoder.take();
-            None
+            Codec::Pcm
         };
-        let block_bytes = if encoder.is_some() {
+        self.aac.take();
+        self.encoder.take();
+        let block_bytes = if matches!(encoder, Codec::Adpcm(_)) {
             ADPCM_SAMPLES * 4
         } else {
             BLOCK_BYTES
         };
         let block_duration = Duration::from_secs_f64(block_bytes as f64 / 192000.0);
-        let start_timestamp =
-            monotonic_millis().map_err(|e| Box::new(e) as Box<dyn RdpsndError>)?;
-        let clock_start = Instant::now();
         eprintln!(
-            "RDP audio {}: 48 kHz stereo, {} kbps, {:.2} ms blocks",
-            if encoder.is_some() { "MS ADPCM" } else { "PCM" },
+            "RDP audio {}: {} Hz stereo, {} kbps, {:.2} ms capture blocks",
+            match &encoder {
+                Codec::Aac(_) => "AAC-LC",
+                Codec::Adpcm(_) => "MS ADPCM",
+                Codec::Pcm => "PCM",
+            },
+            format.format().n_samples_per_sec,
             format.format().n_avg_bytes_per_sec * 8 / 1000,
             block_duration.as_secs_f64() * 1000.0,
         );
@@ -346,16 +622,18 @@ impl RdpsndServerHandler for Backend {
         let sender = self.sender.clone();
         let stopped = self.stopped.clone();
         let pending = self.pending.clone();
+        let feedback = self.feedback.clone();
         self.worker = Some(
             thread::Builder::new()
                 .name("rdp-audio".into())
                 .spawn(move || {
+                    let _feedback_guard = FeedbackGuard(feedback.clone());
                     // Negotiation may precede submission of credentials on the login form.
                     let mut socket = loop {
                         if stopped.load(Ordering::Acquire) {
                             return;
                         }
-                        if let Some(socket) = audio.0.lock().unwrap().take() {
+                        if let Some(socket) = audio.socket.lock().unwrap().take() {
                             break socket;
                         }
                         thread::sleep(Duration::from_millis(20));
@@ -369,6 +647,10 @@ impl RdpsndServerHandler for Backend {
                     let mut filled = 0;
                     let mut number = 0u8;
                     let mut next_send = start;
+                    let mut silent_blocks = 0usize;
+                    let mut quiet_capture_blocks = 0usize;
+                    let mut feedback_suspended = false;
+                    let mut reset_codec = false;
                     'capture: while !stopped.load(Ordering::Acquire) {
                         // Keep a small FIFO for normal PipeWire quantum batching
                         // and scheduling jitter. Drop only capture exceeding the
@@ -390,15 +672,16 @@ impl RdpsndServerHandler for Backend {
                                 Err(_) => break 'capture,
                             }
                             if filled == block_bytes {
+                                quiet_capture_blocks = if block.iter().all(|sample| *sample == 0) {
+                                    quiet_capture_blocks.saturating_add(1)
+                                } else {
+                                    0
+                                };
                                 if captured.len() == MAX_CAPTURE_BLOCKS {
                                     captured.pop_front();
+                                    reset_codec = true;
                                 }
-                                // Wave2 timestamps describe capture, and use
-                                // the boot-relative millisecond clock required
-                                // by MS-RDPEA, even when paced after a quantum.
-                                let timestamp = start_timestamp
-                                    .wrapping_add(clock_start.elapsed().as_millis() as u32);
-                                captured.push_back((block.clone(), timestamp));
+                                captured.push_back((block.clone(), Instant::now()));
                                 filled = 0;
                             }
                         }
@@ -407,39 +690,79 @@ impl RdpsndServerHandler for Backend {
                         }
                         let now = Instant::now();
                         let mut queue = pending.lock().unwrap();
+                        let pressure = queue.check_pressure(now);
+                        let transport_pressure = queue.receipt_age(now) > queue.receipt_budget();
+                        // A missing final render ACK must not lower healthy video
+                        // forever after sound becomes silent. Keep transport
+                        // congestion actionable, and preserve the render history
+                        // for a bounded recovery probe when sound resumes.
+                        if quiet_capture_blocks > SILENCE_TAIL_BLOCKS && !transport_pressure {
+                            if !feedback_suspended && let Some(feedback) = &feedback {
+                                feedback.clear();
+                            }
+                            feedback_suspended = true;
+                        } else {
+                            feedback_suspended = false;
+                            if pressure && let Some(feedback) = &feedback {
+                                feedback.report_congestion(now);
+                            }
+                        }
+                        while captured.front().is_some_and(|(_, at)| {
+                            now.saturating_duration_since(*at) > CAPTURE_BUDGET
+                        }) {
+                            captured.pop_front();
+                            reset_codec = true;
+                        }
                         if !queue.can_send(now) {
                             // Always consume capture while waiting for transport
                             // credit or playback recovery. Resume with fresh sound.
                             captured.clear();
+                            reset_codec = true;
                         } else if now >= next_send
-                            && let Some((data, timestamp)) = captured.pop_front()
+                            && let Some((data, _)) = captured.pop_front()
                         {
-                            let data = if let Some(encoder) = &mut encoder {
-                                match encoder.encode(&data) {
-                                    Ok(data) => data,
-                                    Err(error) => {
-                                        eprintln!("RDP audio encoding stopped: {error}");
-                                        break;
-                                    }
+                            if reset_codec {
+                                if let Err(error) = encoder.reset() {
+                                    eprintln!("RDP audio recovery stopped: {error}");
+                                    break;
                                 }
-                            } else {
-                                data
-                            };
-                            queue.sent(number, timestamp as u16, now);
-                            number = number.wrapping_add(1);
-                            if sender
-                                .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(
-                                    data, timestamp,
-                                )))
-                                .is_err()
-                            {
-                                break;
+                                reset_codec = false;
                             }
+                            silent_blocks = if data.iter().all(|sample| *sample == 0) {
+                                silent_blocks.saturating_add(1)
+                            } else {
+                                0
+                            };
                             next_send = if now.duration_since(next_send) >= block_duration {
                                 now + block_duration
                             } else {
                                 next_send + block_duration
                             };
+                            // Finish the codec tail, then avoid feeding a silent
+                            // Windows playback queue for the entire idle session.
+                            if silent_blocks > SILENCE_TAIL_BLOCKS {
+                                continue;
+                            }
+                            let data = match encoder.encode(data) {
+                                Ok(Some(data)) => data,
+                                Ok(None) => continue, // Bounded AAC frame assembly/lookahead.
+                                Err(error) => {
+                                    eprintln!("RDP audio encoding stopped: {error}");
+                                    break;
+                                }
+                            };
+                            // The graphics path has no RDPEVOR presentation
+                            // clock to pair with Wave2. Match GNOME Remote
+                            // Desktop's immediate playback timestamps rather
+                            // than giving mstsc an unrelated boot clock.
+                            queue.sent(number, 0, now);
+                            number = number.wrapping_add(1);
+                            if sender
+                                .send(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, 0)))
+                                .is_err()
+                            {
+                                break;
+                            }
                         }
                         drop(queue);
                         thread::sleep(Duration::from_millis(2));
@@ -461,6 +784,9 @@ impl RdpsndServerHandler for Backend {
             let _ = worker.join();
         }
         self.audio.clear();
+        if let Some(feedback) = &self.feedback {
+            feedback.clear();
+        }
     }
 }
 impl Drop for Backend {
@@ -528,6 +854,245 @@ mod tests {
     }
 
     #[test]
+    fn aac_preferred_over_pcm_uses_raw_packets_and_immediate_timestamps() {
+        for version in [Version::V6, Version::V8] {
+            let audio = Audio::default();
+            let adpcm = Adpcm::new().unwrap().format.clone();
+            let (mut server, mut receiver) =
+                negotiate_version(&audio, vec![adpcm, pcm(), aac_format()], version);
+            assert!(server.is_ready());
+            let (mut source, capture) = UnixStream::pair().unwrap();
+            source
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            audio.attach(Some(capture));
+            source.read_exact(&mut [0]).unwrap();
+            source.write_all(&vec![0x35; BLOCK_BYTES * 3]).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (data, timestamp) = loop {
+                if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                    receiver.try_recv()
+                {
+                    break (data, timestamp);
+                }
+                assert!(Instant::now() < deadline, "AAC startup must remain bounded");
+                thread::sleep(Duration::from_millis(1));
+            };
+            assert!(
+                data.len() < BLOCK_BYTES / 3,
+                "AAC must reserve audio bandwidth"
+            );
+            assert_eq!(timestamp, 0);
+            let messages: Vec<_> = server.wave(data.clone(), timestamp).unwrap().into();
+            match decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap() {
+                ServerAudioOutputPdu::Wave2(wave) => {
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(wave.format_no, 2);
+                    assert_eq!(wave.timestamp, 0);
+                    assert_eq!(wave.audio_timestamp, 0);
+                    assert_eq!(wave.data.as_ref(), data);
+                }
+                ServerAudioOutputPdu::Wave(info) => {
+                    assert_eq!(messages.len(), 2);
+                    assert_eq!(info.format_no, 2);
+                    assert_eq!(info.timestamp, 0);
+                    let payload = messages[1].encode_unframed_pdu().unwrap();
+                    let mut reconstructed = info.data_prefix.to_vec();
+                    reconstructed.extend_from_slice(&payload[4..]);
+                    assert_eq!(
+                        reconstructed, data,
+                        "raw AAC must not gain headers or padding"
+                    );
+                }
+                _ => panic!("expected an audio wave"),
+            }
+            drop(server);
+            assert_eq!(source.read(&mut [0]).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn digital_silence_stops_idle_traffic_and_resumes_current_pcm() {
+        let audio = Audio::default();
+        let (mut server, mut receiver) = negotiate(&audio, vec![pcm()]);
+        let (mut source, capture) = UnixStream::pair().unwrap();
+        source
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        audio.attach(Some(capture));
+        source.read_exact(&mut [0]).unwrap();
+        let mut sent = 0usize;
+        for _ in 0..SILENCE_TAIL_BLOCKS + 5 {
+            source.write_all(&vec![0; BLOCK_BYTES]).unwrap();
+            thread::sleep(Duration::from_millis(25));
+            while let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                receiver.try_recv()
+            {
+                assert_eq!(data, vec![0; BLOCK_BYTES]);
+                let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
+                let ServerAudioOutputPdu::Wave2(wave) =
+                    decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
+                else {
+                    panic!("expected wave2");
+                };
+                server
+                    .process(
+                        &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                            block_no: wave.block_no,
+                            timestamp: 0,
+                        }))
+                        .unwrap(),
+                    )
+                    .unwrap();
+                sent += 1;
+            }
+        }
+        assert_eq!(sent, SILENCE_TAIL_BLOCKS);
+        assert!(
+            receiver.is_empty(),
+            "idle silence must not fill client playback buffers"
+        );
+        source.write_all(&vec![0x33; BLOCK_BYTES]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) = receiver.try_recv()
+            {
+                assert_eq!(data, vec![0x33; BLOCK_BYTES]);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "current sound must resume after silence"
+            );
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(server);
+    }
+
+    #[test]
+    fn aac_recovery_discards_codec_lookahead_before_fresh_sound() {
+        let audio = Audio::default();
+        let (mut server, mut receiver) = negotiate(&audio, vec![aac_format()]);
+        let (mut source, capture) = UnixStream::pair().unwrap();
+        source
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        audio.attach(Some(capture));
+        source.read_exact(&mut [0]).unwrap();
+        source.write_all(&vec![0x11; BLOCK_BYTES * 3]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (data, timestamp) = loop {
+            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                receiver.try_recv()
+            {
+                break (data, timestamp);
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        };
+        let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
+        let ServerAudioOutputPdu::Wave2(wave) =
+            decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
+        else {
+            panic!("expected wave2");
+        };
+        for timestamp in [0, 400] {
+            server
+                .process(
+                    &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                        block_no: wave.block_no,
+                        timestamp,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+        }
+        source.write_all(&vec![0x22; BLOCK_BYTES * 20]).unwrap();
+        thread::sleep(Duration::from_millis(330));
+        assert!(receiver.is_empty());
+        let fresh = vec![0x33; BLOCK_BYTES];
+        let mut encoder = Aac::new().unwrap();
+        let expected = (0..3)
+            .find_map(|_| encoder.encode(&fresh).unwrap())
+            .unwrap();
+        source.write_all(&fresh.repeat(3)).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) = receiver.try_recv()
+            {
+                assert_eq!(
+                    data, expected,
+                    "post-hold packet must contain only fresh codec state"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(server);
+    }
+
+    #[test]
+    fn aac_capture_overflow_discards_pre_gap_codec_state() {
+        let audio = Audio::default();
+        let (mut server, mut receiver) = negotiate(&audio, vec![aac_format()]);
+        let (mut source, capture) = UnixStream::pair().unwrap();
+        source
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        audio.attach(Some(capture));
+        source.read_exact(&mut [0]).unwrap();
+        source.write_all(&vec![0x11; BLOCK_BYTES * 3]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let (data, timestamp) = loop {
+            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                receiver.try_recv()
+            {
+                break (data, timestamp);
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        };
+        let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
+        let ServerAudioOutputPdu::Wave2(wave) =
+            decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
+        else {
+            panic!("expected wave2");
+        };
+        server
+            .process(
+                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                    block_no: wave.block_no,
+                    timestamp: 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        let fresh = vec![0x33; BLOCK_BYTES];
+        let mut encoder = Aac::new().unwrap();
+        let expected = (0..3)
+            .find_map(|_| encoder.encode(&fresh).unwrap())
+            .unwrap();
+        source
+            .write_all(&fresh.repeat(MAX_CAPTURE_BLOCKS + 5))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) = receiver.try_recv()
+            {
+                assert_eq!(
+                    data, expected,
+                    "dropping capture must also drop earlier codec lookahead"
+                );
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(server);
+    }
+
+    #[test]
     fn pcm_preferred_over_adpcm_preserves_signed_stereo_on_both_wave_versions() {
         for version in [Version::V6, Version::V8] {
             let audio = Audio::default();
@@ -572,6 +1137,8 @@ mod tests {
             match decode(&bytes).unwrap() {
                 ServerAudioOutputPdu::Wave2(wave) => {
                     assert_eq!(messages.len(), 1);
+                    assert_eq!(wave.timestamp, 0);
+                    assert_eq!(wave.audio_timestamp, 0);
                     assert_eq!(wave.format_no, 2);
                     assert_eq!(wave.data.as_ref(), expected);
                 }
@@ -625,7 +1192,10 @@ mod tests {
             data.len() * 3 < ADPCM_SAMPLES * 4,
             "compact audio must reduce transport traffic"
         );
-        assert!(monotonic_millis().unwrap().wrapping_sub(timestamp) < 2000);
+        assert_eq!(
+            timestamp, 0,
+            "ordinary graphics uses immediate audio playback"
+        );
         let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
         let ServerAudioOutputPdu::Wave2(wave) =
             decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
@@ -694,7 +1264,7 @@ mod tests {
             );
         }
         assert!(flow.paired_confirms);
-        assert_eq!(flow.recent.len(), 256);
+        assert_eq!(flow.recent.len(), FlowControl::HISTORY);
         drop(server);
     }
 
@@ -808,7 +1378,6 @@ mod tests {
             start + Duration::from_secs(3),
         );
         assert!(!flow.can_send(start + Duration::from_secs(2)));
-        let deadline = flow.hold_until;
         // Other queued waves finish later. They must not add another three
         // seconds of muting to a buffer that is already finishing playback.
         flow.confirm(
@@ -816,7 +1385,17 @@ mod tests {
             65501u16.wrapping_add(3000),
             start + Duration::from_secs(4),
         );
-        assert_eq!(flow.hold_until, deadline);
+        let deadline = flow.hold_until;
+        assert!(deadline.is_some_and(|until| until <= start + Duration::from_secs(4)));
+        assert!(
+            flow.can_send(start + Duration::from_secs(4)),
+            "one fresh probe can recover missing tail feedback"
+        );
+        flow.confirm(
+            3,
+            65503u16.wrapping_add(3000),
+            start + Duration::from_secs(4),
+        );
         assert!(flow.can_send(start + Duration::from_secs(4)));
         flow.confirm(
             1,
@@ -865,7 +1444,7 @@ mod tests {
             "actual playback feedback must stop queue growth"
         );
         let deadline = flow.hold_until.unwrap();
-        assert_eq!(deadline, start + Duration::from_millis(16880));
+        assert_eq!(deadline, start + Duration::from_millis(16700));
         flow.confirm(
             0,
             65000u16.wrapping_add(9000),
@@ -876,39 +1455,385 @@ mod tests {
             "duplicates must not release another wave's credit"
         );
         assert_eq!(flow.hold_until, Some(deadline));
+        assert!(
+            flow.can_send(deadline),
+            "one fresh probe is allowed after the old queue drains"
+        );
+        flow.confirm(1, 65000u16.wrapping_add(8000 + 9000), deadline);
         assert!(flow.can_send(deadline));
     }
 
     #[test]
-    fn paired_clients_do_not_reuse_ids_still_awaiting_playback_feedback() {
+    fn paired_clients_stop_at_the_short_playback_frontier() {
         let start = Instant::now();
         let mut flow = FlowControl::default();
         flow.sent(0, 1000, start);
-        flow.confirm(0, 1001, start);
-        flow.confirm(0, 1020, start);
-        for sequence in 1..=256u16 {
-            let timestamp = 1000 + sequence * 20;
-            assert!(flow.can_send(start + Duration::from_millis(u64::from(sequence) * 20)));
-            flow.sent(
+        flow.confirm(0, 1001, start + Duration::from_millis(1));
+        flow.confirm(0, 1020, start + Duration::from_millis(20));
+        assert!(flow.paired_confirms);
+        for sequence in 1..=16u16 {
+            let at = start + Duration::from_millis(u64::from(sequence) * 20);
+            assert!(flow.can_send(at));
+            flow.sent(sequence as u8, 1000 + sequence * 20, at);
+            flow.confirm(
                 sequence as u8,
-                timestamp,
-                start + Duration::from_millis(u64::from(sequence) * 20),
+                1001 + sequence * 20,
+                at + Duration::from_millis(1),
             );
-            flow.confirm(sequence as u8, timestamp + 1, start);
         }
+        let at = start + Duration::from_millis(340);
         assert!(
-            !flow.can_send(start + Duration::from_secs(6)),
-            "block one must not be reused ahead of its playback ACK"
+            !flow.can_send(at),
+            "receipt credit cannot grow a playback queue"
         );
-        flow.confirm(1, 1020 + 9000, start + Duration::from_secs(9));
-        assert_eq!(flow.recent.front().unwrap().number, 1);
+        assert!(flow.check_pressure(at));
+        flow.confirm(16, 1350, at);
+        assert!(
+            flow.can_send(at),
+            "later rendering retires the whole consumed frontier"
+        );
+        assert_eq!(flow.pending, 0);
+    }
+
+    #[test]
+    fn missing_final_render_confirm_allows_one_fresh_probe_and_fifo_recovery() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 0, start);
+        flow.confirm(0, 0, start + Duration::from_millis(3));
+        flow.confirm(0, 0, start + Duration::from_millis(30));
+        flow.sent(1, 0, start + Duration::from_millis(40));
+        flow.confirm(1, 0, start + Duration::from_millis(43));
+        // The final rendering ACK goes missing while the application pauses.
+        assert!(!flow.can_send(start + Duration::from_millis(350)));
+        assert!(!flow.can_send(start + Duration::from_millis(542)));
+        let probe_at = start + Duration::from_millis(550);
+        assert!(flow.can_send(probe_at));
+        flow.sent(2, 0, probe_at);
+        assert!(flow.recent.back().unwrap().probe);
+        assert_eq!(flow.pending, 1);
+        assert!(!flow.can_send(probe_at + Duration::from_millis(1)));
+        flow.confirm(2, 0, probe_at + Duration::from_millis(3));
+        assert_eq!(flow.pending, 0);
+        assert!(
+            !flow.can_send(probe_at + Duration::from_secs(1)),
+            "receipt credit alone cannot repeat a probe"
+        );
+        // Rendering the current probe proves both it and the missing tail
+        // were consumed, so ordinary current audio resumes immediately.
+        let rendered = probe_at + Duration::from_millis(30);
+        flow.confirm(2, 0, rendered);
+        assert!(flow.recent.iter().all(|wave| wave.playback_confirmed));
+        assert!(flow.can_send(rendered));
+        flow.sent(3, 0, rendered + Duration::from_millis(20));
+        assert!(!flow.recent.back().unwrap().probe);
+    }
+
+    #[test]
+    fn unanswered_render_probe_never_rebuilds_a_client_buffer() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 0, start);
+        flow.confirm(0, 0, start + Duration::from_millis(3));
+        flow.confirm(0, 0, start + Duration::from_millis(30));
+        flow.sent(1, 0, start + Duration::from_millis(40));
+        flow.confirm(1, 0, start + Duration::from_millis(43));
+        let probe_at = start + Duration::from_secs(1);
+        assert!(flow.can_send(probe_at));
+        flow.sent(2, 0, probe_at);
+        flow.confirm(2, 0, probe_at + Duration::from_millis(3));
+        for seconds in 2..=120 {
+            assert!(!flow.can_send(start + Duration::from_secs(seconds)));
+        }
+        assert_eq!(flow.recent.len(), 3);
         assert_eq!(
-            flow.recent.front().unwrap().feedback_ms,
-            9000,
-            "late playback feedback must still match the original wave"
+            flow.recent
+                .iter()
+                .filter(|wave| wave.probe && !wave.playback_confirmed)
+                .count(),
+            1
         );
-        assert!(!flow.can_send(start + Duration::from_secs(9)));
-        assert!(flow.can_send(start + Duration::from_secs(14)));
+        assert_eq!(flow.pending, 0);
+    }
+
+    #[test]
+    fn render_probe_waits_for_transport_and_explicit_playback_drain() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 0, start);
+        flow.confirm(0, 0, start + Duration::from_millis(3));
+        flow.confirm(0, 0, start + Duration::from_millis(30));
+        flow.sent(1, 0, start + Duration::from_millis(40));
+        flow.confirm(1, 0, start + Duration::from_millis(43));
+        flow.sent(2, 0, start + Duration::from_millis(60));
+        assert!(
+            !flow.can_send(start + Duration::from_secs(1)),
+            "a probe cannot overtake missing receipt credit"
+        );
+        flow.confirm(1, 5000, start + Duration::from_millis(1010));
+        flow.confirm(2, 0, start + Duration::from_millis(1013));
+        assert_eq!(flow.pending, 0);
+        assert!(
+            !flow.can_send(start + Duration::from_secs(2)),
+            "reported playback backlog must drain before probing"
+        );
+        let deadline = flow.hold_until.unwrap();
+        assert!(flow.can_send(deadline));
+        flow.sent(3, 0, deadline);
+        assert!(flow.recent.back().unwrap().probe);
+    }
+
+    #[test]
+    fn late_equal_render_echo_survives_block_reuse_and_half_timestamp_wrap() {
+        for delay_ms in [10_000, 35_000] {
+            let start = Instant::now();
+            let mut flow = FlowControl::default();
+            let waves = delay_ms / 20;
+            for sequence in 0..waves {
+                let at = start + Duration::from_millis(sequence * 20);
+                let timestamp = (1000 + sequence * 20) as u16;
+                assert!(flow.can_send(at));
+                flow.sent(sequence as u8, timestamp, at);
+                flow.confirm(sequence as u8, timestamp, at + Duration::from_millis(3));
+            }
+            let at = start + Duration::from_millis(delay_ms);
+            flow.confirm(0, 1000, at);
+            assert!(
+                flow.paired_confirms,
+                "a separated equal echo is rendering feedback"
+            );
+            assert_eq!(
+                flow.recent[0].feedback_elapsed,
+                Duration::from_millis(delay_ms - 3)
+            );
+            assert!(!flow.can_send(at));
+            assert!(flow.check_pressure(at));
+            // Once the old tail finishes, a current stream can resume. No
+            // retained first-ACK generation or duplicate may release credit.
+            let tail = waves - 1;
+            let drained = start + Duration::from_millis(delay_ms * 2);
+            flow.confirm(tail as u8, (1000 + tail * 20) as u16, drained);
+            assert_eq!(flow.pending, 0);
+            assert!(flow.can_send(drained));
+            let deadline = flow.hold_until;
+            flow.confirm(0, 1000, drained + Duration::from_secs(1));
+            assert_eq!(flow.hold_until, deadline);
+        }
+    }
+
+    #[test]
+    fn periodic_zero_render_echo_at_two_id_wraps_cannot_hide_ten_second_delay() {
+        use std::collections::BTreeMap;
+
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        let mut confirms = BTreeMap::<u64, Vec<u8>>::new();
+        let mut sent = 0u64;
+        let mut discovered_at = None;
+        const RENDER_DELAY_MS: u64 = 10_240;
+        for elapsed_ms in 0..40_000 {
+            let at = start + Duration::from_millis(elapsed_ms);
+            // Only real sent waves receive confirmations. The client reports
+            // receipt after 3ms and an equal render echo after exactly two ID
+            // wraps, including collisions with a new generation's receipt.
+            if elapsed_ms % 20 == 0 && flow.can_send(at) {
+                let number = sent as u8;
+                flow.sent(number, 0, at);
+                confirms.entry(elapsed_ms + 3).or_default().push(number);
+                confirms
+                    .entry(elapsed_ms + 3 + RENDER_DELAY_MS)
+                    .or_default()
+                    .push(number);
+                sent += 1;
+            }
+            for number in confirms.remove(&elapsed_ms).unwrap_or_default() {
+                flow.confirm(number, 0, at);
+                if flow.paired_confirms && discovered_at.is_none() {
+                    discovered_at = Some(elapsed_ms);
+                }
+            }
+        }
+        assert_eq!(discovered_at, Some(RENDER_DELAY_MS + 3));
+        assert!(flow.last_render_delay >= Duration::from_millis(RENDER_DELAY_MS));
+        assert!(flow.check_pressure(start + Duration::from_millis(40_000)));
+        assert!(
+            sent < 600,
+            "a delayed render stream must not accept all 2000 current capture blocks"
+        );
+    }
+
+    #[test]
+    fn delayed_positive_render_feedback_cannot_hide_its_wall_clock_age() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 0, start);
+        flow.confirm(0, 0, start + Duration::from_millis(3));
+        flow.sent(1, 0, start + Duration::from_secs(9));
+        flow.confirm(1, 0, start + Duration::from_millis(9003));
+        flow.confirm(0, 141, start + Duration::from_secs(10));
+        assert!(flow.paired_confirms);
+        assert_eq!(flow.recent[0].feedback_ms, 141);
+        assert_eq!(flow.recent[0].feedback_elapsed, Duration::from_millis(9997));
+        assert_eq!(flow.hold_until, Some(start + Duration::from_millis(18_697)));
+        assert!(!flow.can_send(start + Duration::from_secs(10)));
+        assert!(flow.check_pressure(start + Duration::from_secs(10)));
+        flow.confirm(1, 141, start + Duration::from_secs(19));
+        assert!(flow.can_send(start + Duration::from_secs(19)));
+        let deadline = flow.hold_until;
+        flow.confirm(0, 141, start + Duration::from_secs(20));
+        assert_eq!(
+            flow.hold_until, deadline,
+            "duplicate feedback must not repeat a pause"
+        );
+    }
+
+    #[test]
+    fn healthy_mstsc_render_latency_below_three_hundred_ms_preserves_cadence() {
+        let start = Instant::now();
+        let mut events = Vec::new();
+        for sequence in 0..1500u64 {
+            let render_ms = if sequence % 2 == 0 { 125 } else { 187 };
+            events.extend([
+                (sequence * 20, sequence, 0),
+                (sequence * 20 + 3, sequence, 1),
+                (sequence * 20 + 3 + render_ms, sequence, 2),
+            ]);
+        }
+        events.sort_unstable();
+        let mut flow = FlowControl::default();
+        for (elapsed, sequence, kind) in events {
+            let at = start + Duration::from_millis(elapsed);
+            if kind == 0 {
+                assert!(
+                    flow.can_send(at),
+                    "ordinary Windows rendering latency must not drop audio"
+                );
+                flow.sent(sequence as u8, 0, at);
+            } else {
+                flow.confirm(sequence as u8, 0, at);
+            }
+        }
+        assert!(flow.paired_confirms);
+        assert_eq!(flow.pending, 0);
+        assert!(flow.hold_until.is_none());
+        assert!(!flow.check_pressure(start + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn single_zero_confirm_clients_remain_continuous_for_over_two_minutes() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        for sequence in 0..6500u64 {
+            let at = start + Duration::from_millis(sequence * 20);
+            assert!(flow.can_send(at));
+            flow.sent(sequence as u8, 0, at);
+            flow.confirm(sequence as u8, 0, at + Duration::from_millis(3));
+            assert_eq!(flow.pending, 0);
+        }
+        let at = start + Duration::from_secs(131);
+        assert!(
+            !flow.paired_confirms,
+            "one receipt per wave must not look like delayed rendering"
+        );
+        assert!(flow.can_send(at));
+        assert!(!flow.check_pressure(at));
+        assert_eq!(flow.recent.len(), FlowControl::HISTORY);
+    }
+
+    #[test]
+    fn immediate_two_zero_confirms_retire_each_generation_without_false_pairing() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        for sequence in 0..6500u64 {
+            let at = start + Duration::from_millis(sequence * 20);
+            assert!(flow.can_send(at));
+            flow.sent(sequence as u8, 0, at);
+            let confirmed = at + Duration::from_millis(3);
+            flow.confirm(sequence as u8, 0, confirmed);
+            flow.confirm(sequence as u8, 0, confirmed);
+            assert_eq!(flow.pending, 0);
+        }
+        assert!(!flow.paired_confirms);
+        assert!(flow.recent.iter().all(|wave| wave.playback_confirmed));
+        assert!(!flow.check_pressure(start + Duration::from_secs(131)));
+    }
+
+    #[test]
+    fn zero_timestamp_accepts_full_unsigned_render_delay() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 0, start);
+        flow.confirm(0, 0, start + Duration::from_millis(3));
+        // The zero reference makes the complete u16 a client hold duration,
+        // including reports that exceed the old signed half-wrap cutoff.
+        flow.confirm(0, 40_000, start + Duration::from_millis(4));
+        assert!(flow.paired_confirms);
+        assert_eq!(flow.recent[0].feedback_elapsed, Duration::from_secs(40));
+        assert_eq!(flow.pending, 0);
+        assert!(!flow.can_send(start + Duration::from_secs(10)));
+        assert!(flow.check_pressure(start + Duration::from_secs(10)));
+        assert!(flow.can_send(start + Duration::from_secs(40)));
+    }
+
+    #[test]
+    fn immediate_duplicate_echo_does_not_establish_rendering_behavior() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 0, start);
+        flow.confirm(0, 0, start + Duration::from_millis(1));
+        flow.confirm(0, 0, start + Duration::from_millis(2));
+        assert!(!flow.paired_confirms);
+        assert_eq!(flow.pending, 0);
+        assert!(flow.can_send(start + Duration::from_secs(1)));
+        assert!(!flow.check_pressure(start + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn healthy_zero_timestamp_rendering_remains_continuous_across_id_wraps() {
+        let start = Instant::now();
+        let mut events = Vec::new();
+        for sequence in 0..1500u64 {
+            events.extend([
+                (sequence * 20, sequence, 0),
+                (sequence * 20 + 3, sequence, 1),
+                (sequence * 20 + 30, sequence, 2),
+            ]);
+        }
+        events.sort_unstable();
+        let mut flow = FlowControl::default();
+        for (elapsed, sequence, kind) in events {
+            let at = start + Duration::from_millis(elapsed);
+            if kind == 0 {
+                assert!(
+                    flow.can_send(at),
+                    "healthy audio must preserve its sample cadence"
+                );
+                flow.sent(sequence as u8, 0, at);
+            } else {
+                flow.confirm(sequence as u8, 0, at);
+            }
+        }
+        assert!(flow.paired_confirms);
+        assert_eq!(flow.pending, 0);
+        assert!(flow.recent.iter().all(|wave| wave.playback_confirmed));
+        assert!(!flow.check_pressure(start + Duration::from_secs(31)));
+    }
+
+    #[test]
+    fn transport_pressure_uses_ack_age_with_a_stable_rtt_margin() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        flow.sent(0, 1000, start);
+        flow.confirm(0, 1000, start + Duration::from_millis(250));
+        flow.sent(1, 1020, start + Duration::from_millis(500));
+        assert!(!flow.check_pressure(start + Duration::from_millis(750)));
+        assert!(flow.can_send(start + Duration::from_millis(750)));
+        assert!(flow.check_pressure(start + Duration::from_millis(851)));
+        assert!(!flow.can_send(start + Duration::from_millis(851)));
+        flow.confirm(1, 1020, start + Duration::from_millis(901));
+        assert_eq!(flow.receipt_baseline, Some(Duration::from_millis(250)));
+        assert_eq!(flow.pending, 0);
+        assert!(flow.can_send(start + Duration::from_millis(901)));
     }
 
     #[test]
@@ -962,9 +1887,9 @@ mod tests {
         }
         assert_eq!(
             flow.pending, 0,
-            "lost ACK retires only at natural number reuse"
+            "later FIFO receipt retires a lost earlier ACK"
         );
-        assert_eq!(flow.recent.len(), 256);
+        assert_eq!(flow.recent.len(), 301);
     }
 
     #[test]
@@ -1068,6 +1993,87 @@ mod tests {
     }
 
     #[test]
+    fn delayed_zero_render_echo_blocks_capture_until_current_sound_can_resume() {
+        let audio = Audio::default();
+        let (mut server, mut receiver) = negotiate(&audio, vec![pcm()]);
+        let (mut source, capture) = UnixStream::pair().unwrap();
+        source
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        audio.attach(Some(capture));
+        source.read_exact(&mut [0]).unwrap();
+        let take_wave = |receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                    receiver.try_recv()
+                {
+                    assert_eq!(timestamp, 0);
+                    return data;
+                }
+                assert!(Instant::now() < deadline, "expected current audio");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let dispatch = |server: &mut RdpsndServer, data: Vec<u8>| {
+            let messages: Vec<_> = server.wave(data, 0).unwrap().into();
+            let ServerAudioOutputPdu::Wave2(wave) =
+                decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
+            else {
+                panic!("expected Wave2");
+            };
+            assert_eq!(wave.timestamp, 0);
+            assert_eq!(wave.audio_timestamp, 0);
+            server
+                .process(
+                    &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                        block_no: wave.block_no,
+                        timestamp: 0,
+                    }))
+                    .unwrap(),
+                )
+                .unwrap();
+            wave.block_no
+        };
+        source.write_all(&vec![0x11; BLOCK_BYTES]).unwrap();
+        let first = dispatch(&mut server, take_wave(&mut receiver));
+        thread::sleep(Duration::from_millis(20));
+        server
+            .process(
+                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                    block_no: first,
+                    timestamp: 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        source.write_all(&vec![0x11; BLOCK_BYTES * 3]).unwrap();
+        let mut tail = first;
+        for _ in 0..3 {
+            tail = dispatch(&mut server, take_wave(&mut receiver));
+        }
+        thread::sleep(Duration::from_millis(350));
+        source.write_all(&vec![0x22; BLOCK_BYTES * 10]).unwrap();
+        thread::sleep(Duration::from_millis(40));
+        assert!(
+            receiver.is_empty(),
+            "receipt ACKs cannot bypass the stalled render frontier"
+        );
+        server
+            .process(
+                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                    block_no: tail,
+                    timestamp: 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        source.write_all(&vec![0x33; BLOCK_BYTES]).unwrap();
+        assert_eq!(take_wave(&mut receiver), vec![0x33; BLOCK_BYTES]);
+        drop(server);
+    }
+
+    #[test]
     fn healthy_pipewire_quantum_batching_preserves_every_sample() {
         healthy_capture_batching(pcm(), BLOCK_BYTES, None);
     }
@@ -1075,13 +2081,26 @@ mod tests {
     #[test]
     fn healthy_adpcm_quantum_batching_preserves_every_complete_frame() {
         let encoder = Adpcm::new().unwrap();
-        healthy_capture_batching(encoder.format.clone(), ADPCM_SAMPLES * 4, Some(encoder));
+        healthy_capture_batching(
+            encoder.format.clone(),
+            ADPCM_SAMPLES * 4,
+            Some(Codec::Adpcm(encoder)),
+        );
+    }
+
+    #[test]
+    fn healthy_aac_quantum_batching_preserves_every_complete_encoded_frame() {
+        healthy_capture_batching(
+            aac_format(),
+            BLOCK_BYTES,
+            Some(Codec::Aac(Aac::new().unwrap())),
+        );
     }
 
     fn healthy_capture_batching(
         format: AudioFormat,
         block_bytes: usize,
-        mut encoder: Option<Adpcm>,
+        mut encoder: Option<Codec>,
     ) {
         let audio = Audio::default();
         let (mut server, mut receiver) = negotiate(&audio, vec![format]);
@@ -1099,7 +2118,8 @@ mod tests {
         let expected = if let Some(encoder) = &mut encoder {
             complete
                 .chunks(block_bytes)
-                .flat_map(|pcm| encoder.encode(pcm).unwrap())
+                .filter_map(|pcm| encoder.encode(pcm.to_vec()).unwrap())
+                .flatten()
                 .collect()
         } else {
             complete.to_vec()

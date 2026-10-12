@@ -4,7 +4,7 @@
 # Export a portable source bundle with makepkg --allsource.
 pkgname=niri-remote-login
 pkgver=0.1.0
-pkgrel=16
+pkgrel=17
 pkgdesc='Niri remote desktop host with a PAM/logind broker and dedicated headless compositor'
 arch=('x86_64')
 # Niri is GPL-3.0-or-later; the bridge links Arch's GPL-licensed FFmpeg.
@@ -38,7 +38,7 @@ if [[ -f "$_checkout/bridge/Cargo.lock" && -f "$_checkout/LICENSE" ]]; then
                 packaging/niri-rdp.sysusers packaging/niri-rdp-setup.py
                 packaging/prepare-tls.py scripts/collect-licenses.py
                 tests/__init__.py tests/test_host_setup.py tests/test_session_environment.py
-                tests/test_native_video.py tests/video_guard.c tests/video_rate.c tests/test_audio.py tests/audio_codec.c
+                tests/test_native_video.py tests/video_guard.c tests/video_rate.c tests/test_audio.py tests/audio_codec.c tests/audio_rdpsnd.c
                 compositor/patches/0001-remote-headless-bounds-and-startup.patch)
   while IFS= read -r -d '' _file; do
     _local_files+=("${_file#"$_checkout/"}")

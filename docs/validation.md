@@ -1,5 +1,84 @@
 # Validation record
 
+## Growing mstsc audio backlog, AAC and video feedback, 2026-10-12
+
+The user confirmed release 16 restored intelligible PCM sound, but Firefox
+YouTube playback fell progressively behind video: first about ten seconds,
+then thirty seconds, and finally audio continued for over two minutes after
+pausing. A read-only sample of the active connection showed roughly 29 ms TCP
+RTT and a 14 KB send queue; private Pulse stream metadata reported no buffer
+latency. Those observations do not measure the client's output device or
+exclude an earlier transport stall. No user audio was recorded.
+
+Release 17 follows GNOME Remote Login's
+[AAC offer and RDPSND timestamp behavior](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dvc-audio-playback.c).
+It prefers raw stereo AAC-LC at 44.1 kHz and 96 kbit/s (`AAC_MS`, no WAVE
+extension or ADTS header), with clear 48 kHz PCM fallback ahead of MS ADPCM.
+The existing 48 kHz capture is resampled through a fixed 2048-frame FIFO;
+AAC lookahead remains bounded and startup produces a packet within three
+20 ms input blocks. Capture older than 60 ms expires, dropped capture resets
+AAC state, and a 100 ms digital-silence tail is followed by suppression of idle
+traffic. This avoids carrying codec state from before a transport or playback
+hold into fresh sound.
+
+Both RDPSND timestamps are zero, matching GNOME for this desktop graphics
+path. RDPGFX does not implement RDPEVOR's shared presentation clock. Queue age
+and receipt/render completion use internal monotonic time instead. Confirmed
+render delay is the greater of reported latency and actual elapsed completion
+time after the receipt baseline. The playback limit is 300 ms, matching GNOME's
+guard and permitting the 125–187 ms feedback seen in the earlier live journal.
+Audio pressure also lowers the active H.264 target, independent of graphics
+ACK suspension, with the existing reduction cooldown and slow recovery.
+Feedback follows graphics-context replacement and rejects old sound generations;
+render-only pressure is suspended after digital silence, while transport
+pressure remains actionable.
+
+Review reproduced a delayed-confirmation alias in the first candidate: with
+zero timestamps, a render echo delayed exactly 512 PCM blocks (10.24 seconds)
+was mistaken for a newer generation's receipt. Matching new receipts separately
+from the oldest unfinished rendering generation fixes it. Independent simulations
+in both ACK orders detected the delay at 10,243–10,263 ms and accepted only
+531–532 waves over 40 seconds, compared with 2000 in the faulty candidate.
+Single-ACK and immediate double-ACK streams remain usable across 130 seconds
+of block reuse. A missing final rendering reply permits one bounded fresh
+probe after 500 ms; if its rendering reply also never arrives, further probes
+remain blocked so the client cannot accumulate repeated retries.
+
+`make check BRIDGE_CARGO_HOME="$PWD/poc/.cargo-cache"` passed outside the
+sandbox: 72 Python tests (two opt-in checks skipped), five PoC Rust tests,
+four startup checks, all 12 native broker groups, 105 bridge library tests and
+the frontend lifecycle test. The 34 audio tests cover raw AAC and exact PCM
+Wave/Wave2 delivery, zero timestamps, 10/35/40-second feedback, delayed equal
+and underreported positive confirmations, healthy mstsc timing, missing ACKs,
+silence, codec reset after capture overflow/holds, and reconnect cleanup.
+Rust formatting and whitespace checks passed. Clippy reports only five existing
+login/Wayland warnings. Native codec ASan/UBSan and leak checks passed.
+
+The prepared FreeRDP 3.32.1 client DSP accepts the exact AAC_MS and PCM offers
+and decodes raw AAC without supplied decoder extradata. The clean run decoded
+205 packets into 209,920 stereo frames at 44.1 kHz, averaging about 96 kbit/s.
+Reconnect and twelve dropped packets preserved correct frame counts and stereo
+440/997 Hz tone quality; signal recovered within two packets after a drop.
+The same build filters the older MS ADPCM offer. Evidence is under
+`artifacts/audio-sync-fix/`, including `freerdp-dsp-interop.log`,
+`check-final.log`, `audio-rust.log` and `clippy-final.log`.
+
+Windows clarity, pause/stop delay and long-running lip-sync still require the
+user's manual reinstall and the [actual-client acceptance check](acceptance.md).
+No installed package, service or active session was changed during this work.
+
+The combined release 17 archive built with all required package checks: three
+headless and five protocol regressions, 105 bridge library tests, the frontend
+lifecycle test, all 12 broker groups and 64 Python tests (the hardware and
+prepared-lab interoperability opt-ins were skipped in the package source tree).
+Structure/preservation validation passed. Its extracted frontend/compositor
+passed the private NVENC AVC420 application decode/input/reconnect test, TLS
+login rejection/authentication, JIS input, live resizing, held-input release and
+compositor-crash cleanup. Report: `artifacts/audio-sync-fix/package-integration.json`.
+The ready archive is
+`packaging/arch/niri-rdp/niri-remote-login-0.1.0-17-x86_64.pkg.tar.zst`;
+installation remains with the user as requested.
+
 ## mstsc static and PCM preference, 2026-10-12
 
 The user reported unintelligible static in a live Windows 10 `mstsc.exe`

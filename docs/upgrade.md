@@ -93,6 +93,15 @@ desktop does not run the new portal startup helper. The installed Niri chooser
 is preserved, with GTK as a fallback; Firefox download preferences are unchanged.
 See [configuration and troubleshooting](install.md#configuration-and-troubleshooting).
 
+Package release 17 adds GNOME-compatible AAC-LC audio at 96 kbit/s with PCM
+fallback, zero RDPSND timestamps for the RDPGFX desktop path, silence suppression,
+fresh capture limits and elapsed-time receipt/render confirmation tracking.
+Audio congestion now lowers the live video bitrate. Build and install the new
+combined package through the normal manual procedure below. Restart the
+frontend after installation and reconnect; verify `RDP audio AAC-LC` (or PCM
+fallback) in its journal, then check speech, pause/stop delay and lip-sync for a
+long-running video. See the [audio acceptance procedures](acceptance.md).
+
 Package release 16 prefers PCM audio when both PCM and MS ADPCM are accepted.
 This addresses reported static on Windows 10 mstsc with release 15's automatic
 ADPCM preference. The existing pacing and playback-backlog controls still apply.
