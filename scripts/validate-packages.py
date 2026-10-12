@@ -20,6 +20,7 @@ EXPECTED = {
         "usr/lib/niri-rdp/session-input-method",
         "etc/niri-rdp/waybar.json", "etc/niri-rdp/frontend.conf", "etc/niri-rdp/renderer.conf", "usr/lib/systemd/system/niri-rdp-broker.service",
         "usr/lib/systemd/system/niri-rdp-frontend.service", "usr/lib/sysusers.d/niri-rdp.conf",
+        "usr/lib/systemd/system/niri-rdp-nvidia-devices.service",
         "usr/share/doc/niri-remote-login/install.md", "usr/share/doc/niri-remote-login/uninstall.md",
         "usr/share/doc/niri-remote-login/upgrade.md", "usr/share/doc/niri-remote-login/acceptance.md",
         "usr/share/doc/niri-remote-login/nvidia-frontend.conf",

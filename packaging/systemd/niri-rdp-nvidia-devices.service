@@ -1,0 +1,17 @@
+[Unit]
+Description=Prepare NVIDIA device nodes for Niri RDP
+Before=niri-rdp-frontend.service
+ConditionPathExists=/usr/bin/nvidia-modprobe
+ConditionPathExistsGlob=/proc/driver/nvidia/gpus/*/information
+
+[Service]
+Type=oneshot
+# Run as root before the hardened frontend: NoNewPrivileges prevents that
+# service from using nvidia-modprobe's setuid fallback to create missing nodes.
+# -u prepares UVM nodes instead of the base nodes, so both commands are needed.
+ExecStart=/usr/bin/nvidia-modprobe -c 0
+ExecStart=/usr/bin/nvidia-modprobe -u
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes

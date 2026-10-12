@@ -43,6 +43,11 @@ If you enabled NVIDIA encoding, its copied drop-in
 `/etc/systemd/system/niri-rdp-frontend.service.d/nvidia.conf` is also not
 package-owned. Remove that file when discarding the experiment, then run
 `sudo systemctl daemon-reload` again.
+Release 13's NVIDIA device-preparation helper is package-owned and is removed
+by pacman. If you installed the earlier manual workaround, also remove its
+local `/etc/systemd/system/niri-rdp-nvidia-devices.service` and
+`/etc/systemd/system/niri-rdp-frontend.service.d/nvidia-devices.conf`; pacman
+does not own those local files.
 The service user and `niri-rdp-users` group also remain; remove them only if they
 are unused. The dedicated human test account/home remains your choice; package
 removal never deletes user data or accounts.

@@ -1,5 +1,6 @@
 """Exercise first-start TLS provisioning without changing the host."""
 import importlib.util
+import configparser
 from importlib.machinery import SourceFileLoader
 import os
 import json
@@ -36,6 +37,33 @@ autostart_loader.exec_module(autostart)
 
 
 class HostSetupTests(unittest.TestCase):
+    def test_frontend_orders_nvidia_preparation_without_blocking_bitmap_hosts(self):
+        frontend = configparser.ConfigParser(interpolation=None, strict=False)
+        frontend.read(ROOT / "packaging/systemd/niri-rdp-frontend.service")
+        helper = "niri-rdp-nvidia-devices.service"
+        self.assertIn(helper, frontend["Unit"]["Wants"].split())
+        self.assertIn(helper, frontend["Unit"]["After"].split())
+        self.assertNotIn(helper, frontend["Unit"]["Requires"].split())
+        self.assertEqual(frontend["Service"]["User"], "niri-rdp")
+        self.assertEqual(frontend["Service"]["NoNewPrivileges"], "yes")
+        self.assertEqual(frontend["Service"]["PrivateDevices"], "yes")
+
+    def test_nvidia_preparation_handles_base_and_uvm_nodes_on_every_start(self):
+        path = ROOT / "packaging/systemd/niri-rdp-nvidia-devices.service"
+        helper = configparser.ConfigParser(interpolation=None, strict=False)
+        helper.read(path)
+        self.assertEqual(helper["Unit"]["ConditionPathExists"], "/usr/bin/nvidia-modprobe")
+        self.assertEqual(helper["Unit"]["ConditionPathExistsGlob"],
+                         "/proc/driver/nvidia/gpus/*/information")
+        self.assertIn("niri-rdp-frontend.service", helper["Unit"]["Before"].split())
+        self.assertEqual(helper["Service"].get("User", "root"), "root")
+        self.assertEqual(helper["Service"]["Type"], "oneshot")
+        self.assertNotEqual(helper["Service"].get("RemainAfterExit", "no"), "yes")
+        self.assertEqual([line.split("=", 1)[1] for line in path.read_text().splitlines()
+                          if line.startswith("ExecStart=")],
+                         ["/usr/bin/nvidia-modprobe -c 0", "/usr/bin/nvidia-modprobe -u"])
+        self.assertNotIn("Install", helper, "frontend starts the helper without manual enablement")
+
     def test_input_framework_requires_explicit_configuration_and_handles_toolkit_fallbacks(self):
         helper = autostart.input_method
         self.assertIsNone(helper.configured_framework({}))

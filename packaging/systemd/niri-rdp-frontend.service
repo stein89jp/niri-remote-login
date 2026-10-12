@@ -1,7 +1,10 @@
 [Unit]
 Description=Niri RDP login frontend
 Requires=niri-rdp-broker.service
-After=niri-rdp-broker.service
+# Prepare headless NVIDIA hosts on every start, including with older /etc
+# encoder overrides. Bitmap hosts can still start if NVIDIA preparation fails.
+Wants=niri-rdp-nvidia-devices.service
+After=niri-rdp-broker.service niri-rdp-nvidia-devices.service
 
 [Service]
 Type=simple

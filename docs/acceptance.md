@@ -13,6 +13,7 @@ are in `scripts/headless-integration.py`; they do not substitute for this matrix
 | RDP login screen | Connect without a ClientInfo password; see the login screen without a compositor/session, reject a bad password, accept the Linux account, verify masked pixels, input, and disconnect detachment | Automated login tests; installed PAM and Windows checks pending |
 | Authentication policy | Wrong password, unknown user, root, nonmember, locked/expired user, additional PAM prompt, account with local graphical session; confirm no app/session/private directory remains | Pending real PAM tests; native failure tests cover contracts |
 | Cold boot | Enable system frontend, reboot test machine, do not log in locally, connect directly using Windows Remote Desktop; record `loginctl` identity and terminal `id` output | Pending |
+| NVIDIA cold boot | Install release 13 or newer and the NVIDIA encoder override; reboot without a local graphical login or running `nvidia-smi`/FFmpeg first; require successful device preparation followed by `NVENC H.264 preflight passed` and an active frontend; repeat after another reboot | Packaged units and startup contracts checked; installed reboot pending |
 | Windows | mstsc displays dedicated Niri terminal and sends keyboard, pointer, wheel and modifiers; test ordinary TLS negotiation, missing-password login screen, optional TLS-only profile, and certificate verification | Pending |
 | Dynamic resolution | Connect at a non-default size; resize the client window in portrait and landscape, verify application reflow, sharp text and accurate pointer clicks without reconnecting | Namespace FreeRDP validation recorded in validation.md; Windows and installed-service behavior pending |
 | NVIDIA encoding | Rebuild the current frontend, enable its NVIDIA drop-in, verify NVENC initialization and AVC420 graphics negotiation; decode changing frames, exercise input/reconnect, and record GPU encoder activity, bitrate and latency against bitmap mode | Release NVENC/FreeRDP namespace app/input/reconnect test passed; Windows, systemd permissions and complete-path performance pending |
@@ -34,7 +35,7 @@ Useful read-only observations on the test installation:
 loginctl list-sessions
 loginctl show-session SESSION_ID -p User -p Name -p Leader -p Service -p Type -p Class -p Remote -p Seat
 systemctl status niri-rdp-broker.service niri-rdp-frontend.service
-journalctl -b -u niri-rdp-broker.service -u niri-rdp-frontend.service --no-pager
+journalctl -b -u niri-rdp-nvidia-devices.service -u niri-rdp-broker.service -u niri-rdp-frontend.service --no-pager
 nvidia-smi dmon -s u
 ss -ltn 'sport = :33991'
 pgrep -a -u niri-remote-test
@@ -53,6 +54,8 @@ an orphan project session. Broker socket and listener remain while services run.
 The `nvidia-smi` observation applies only when testing NVIDIA encoding; encoder
 activity during changing desktop content is useful hardware evidence, while an
 encoder listed by FFmpeg alone proves only that the software was built with it.
+Record the NVIDIA cold-boot service results before running either tool: NVIDIA
+client utilities can create missing device nodes and mask a startup regression.
 Inspect service/UID before terminating any session. Monitor-off is not suspend;
 keep the test machine awake without modifying the working host's power policy.
 

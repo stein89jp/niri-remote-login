@@ -43,6 +43,17 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+Package release 13 prepares NVIDIA device nodes automatically before every
+frontend start. This fixes headless NVENC startup after reboot when the driver
+is loaded but `/dev/nvidia0` and `/dev/nvidiactl` have not been created.
+Existing NVIDIA encoder drop-ins continue to work. Install the rebuilt package,
+reload systemd and restart the frontend; no separate helper enablement is needed.
+If you applied the earlier manual workaround, its
+`/etc/systemd/system/niri-rdp-nvidia-devices.service` and
+`/etc/systemd/system/niri-rdp-frontend.service.d/nvidia-devices.conf` are now
+redundant. Remove those two local files to use the package-owned helper, keeping
+the `nvidia.conf` encoder override, then reload systemd.
+
 Package release 12 fixes keyboard inheritance when the usual Niri `xkb` section
 is empty. The headless build now receives the saved system XKB settings before
 startup. The frontend also uses those settings with XKB translation in its login

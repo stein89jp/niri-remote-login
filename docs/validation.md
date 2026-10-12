@@ -439,3 +439,35 @@ one daemon on repeated startup and preserved the source profile through teardown
 Windows 10 mstsc and a physical Japanese keyboard require a fresh login on the
 updated installed host for final confirmation. The automated checks do not
 claim that device test has passed.
+
+## NVIDIA device preparation after reboot (2026-10-12)
+
+The installed headless host repeatedly failed the NVENC preflight with
+`CUDA_ERROR_NO_DEVICE` after reboot, despite a loaded NVIDIA driver and the
+correct GPU-access drop-in. Running `nvidia-smi` created `/dev/nvidia0` and
+`/dev/nvidiactl` after the failed starts. A one-frame FFmpeg NVENC test then
+passed with `setpriv --no-new-privs`, consistent with missing device nodes being
+the startup blocker. This observation does not prove the repaired boot path.
+
+Release 13 packages `niri-rdp-nvidia-devices.service` and makes the frontend
+wait for it through `Wants` and `After`. The root helper prepares base nodes and
+UVM nodes in separate commands, skips machines without a loaded NVIDIA GPU,
+and finishes without remaining active so it can run on later frontend starts.
+The frontend retains its unprivileged account and hardening. Existing NVIDIA
+drop-ins do not need a new dependency or a separately enabled helper.
+
+Validation passed: 62 Python regressions (two optional tests skipped), including
+startup-order and device-preparation regressions; the combined release 13
+`makepkg` build and checks; package structure/preservation validation; and
+`systemd-analyze verify` on the packaged helper, frontend and broker units.
+The package checks include 67 bridge tests, the headless compositor tests,
+native broker checks and 54 Python tests (one optional hardware test skipped).
+The release source bundle also includes the helper. Logs and extracted package
+evidence are under `artifacts/nvidia-boot-fix/`.
+
+Sandbox socket restrictions initially blocked private D-Bus/audio and Rust IPC
+tests; rerunning the checks outside the sandbox passed. No package installation,
+service restart or reboot was performed during this packaging change.
+Installed NVIDIA cold-boot validation remains pending in
+[acceptance.md](acceptance.md), and must precede any `nvidia-smi` invocation that
+could create the missing nodes itself.

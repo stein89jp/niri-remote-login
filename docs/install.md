@@ -40,6 +40,11 @@ budget and gives the frontend service GPU access. Your remote Linux account also
 needs GPU device access for hardware compositor rendering; see
 [Optional NVIDIA encoding](#optional-nvidia-encoding) for permissions and checks.
 
+Package release 13 automatically prepares NVIDIA device nodes before every
+frontend start, including after a reboot. No separate device-preparation unit,
+udev rule, or manual `nvidia-smi` invocation is needed. The preparation helper
+skips hosts without a loaded NVIDIA GPU and does not need to be enabled separately.
+
 If the frontend was already running when you added the NVIDIA drop-in, restart
 it to apply the change; `enable --now` does not restart an active service:
 
@@ -399,6 +404,19 @@ incompatible GPU/driver. Client codec fallback does not mask that host startup
 failure. Actual NVIDIA encoding and Windows graphics negotiation require the
 [acceptance checks](acceptance.md); the existing software-rendered bitmap
 integration result does not establish their performance.
+
+The frontend automatically starts `niri-rdp-nvidia-devices.service` first.
+It runs `nvidia-modprobe -c 0` and `nvidia-modprobe -u` as root to prepare both
+the base NVIDIA and UVM device nodes. A headless boot can otherwise have the
+driver loaded but lack `/dev/nvidia0` or `/dev/nvidiactl`, causing
+`CUDA_ERROR_NO_DEVICE`. The frontend keeps `NoNewPrivileges=yes`, so it cannot
+use NVIDIA's setuid fallback to create those nodes itself. The helper also runs
+with existing NVIDIA drop-ins from older package releases. Inspect its journal
+if device preparation fails:
+
+```sh
+sudo journalctl -b -u niri-rdp-nvidia-devices.service --no-pager
+```
 
 Test the encoder independently using the same service account, supplementary
 groups and GPU visibility. This probe opens no RDP listener and uses synthetic
