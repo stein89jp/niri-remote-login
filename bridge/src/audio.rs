@@ -507,13 +507,13 @@ impl SoundServerFactory for Factory {
                 error
             })
             .ok();
-        // Use GNOME's low-bandwidth codec first. Keep clear PCM ahead of the
-        // ADPCM layout that mstsc advertised but rendered as static.
-        let mut formats = Vec::new();
+        // mstsc advertises compressed formats that have rendered as static in
+        // actual Windows playback. Prefer the PCM path verified by listening;
+        // keep compressed codecs for clients that do not accept PCM.
+        let mut formats = vec![pcm_format()];
         if aac.is_some() {
             formats.push(aac_format());
         }
-        formats.push(pcm_format());
         if let Some(encoder) = &encoder {
             formats.push(encoder.format.clone());
         }
@@ -688,10 +688,13 @@ impl RdpsndServerHandler for Backend {
                             reset_codec = true;
                         }
                         if !queue.can_send(now) {
-                            // Always consume capture while waiting for transport
-                            // credit or playback recovery. Resume with fresh sound.
-                            captured.clear();
-                            reset_codec = true;
+                            // A full credit window can be an ordinary ACK wait.
+                            // Keep its bounded recent capture and codec overlap;
+                            // only discard samples during actual delay recovery.
+                            if pressure && !captured.is_empty() {
+                                captured.clear();
+                                reset_codec = true;
+                            }
                         } else if now >= next_send
                             && let Some((data, _)) = captured.pop_front()
                         {
@@ -828,12 +831,12 @@ mod tests {
     }
 
     #[test]
-    fn aac_preferred_over_pcm_uses_raw_packets_and_immediate_timestamps() {
+    fn aac_fallback_uses_raw_packets_and_immediate_timestamps() {
         for version in [Version::V6, Version::V8] {
             let audio = Audio::default();
             let adpcm = Adpcm::new().unwrap().format.clone();
             let (mut server, mut receiver) =
-                negotiate_version(&audio, vec![adpcm, pcm(), aac_format()], version);
+                negotiate_version(&audio, vec![adpcm, aac_format()], version);
             assert!(server.is_ready());
             let (mut source, capture) = UnixStream::pair().unwrap();
             source
@@ -861,14 +864,14 @@ mod tests {
             match decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap() {
                 ServerAudioOutputPdu::Wave2(wave) => {
                     assert_eq!(messages.len(), 1);
-                    assert_eq!(wave.format_no, 2);
+                    assert_eq!(wave.format_no, 1);
                     assert_eq!(wave.timestamp, 0);
                     assert_eq!(wave.audio_timestamp, 0);
                     assert_eq!(wave.data.as_ref(), data);
                 }
                 ServerAudioOutputPdu::Wave(info) => {
                     assert_eq!(messages.len(), 2);
-                    assert_eq!(info.format_no, 2);
+                    assert_eq!(info.format_no, 1);
                     assert_eq!(info.timestamp, 0);
                     let payload = messages[1].encode_unframed_pdu().unwrap();
                     let mut reconstructed = info.data_prefix.to_vec();
@@ -1019,6 +1022,104 @@ mod tests {
                 "AAC must recover with fresh packets"
             );
             thread::sleep(Duration::from_millis(1));
+        }
+        drop(server);
+    }
+
+    #[test]
+    fn aac_transport_credit_wait_without_capture_preserves_codec_state() {
+        aac_transport_credit_wait_preserves_codec_state(false);
+    }
+
+    #[test]
+    fn aac_short_transport_credit_wait_preserves_queued_capture() {
+        aac_transport_credit_wait_preserves_codec_state(true);
+    }
+
+    fn aac_transport_credit_wait_preserves_codec_state(queued_capture: bool) {
+        let audio = Audio::default();
+        let (mut server, mut receiver) = negotiate(&audio, vec![aac_format()]);
+        let (mut source, capture) = UnixStream::pair().unwrap();
+        source
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        audio.attach(Some(capture));
+        source.read_exact(&mut [0]).unwrap();
+        let take_wave = |receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>| {
+            let deadline = Instant::now() + Duration::from_secs(2);
+            loop {
+                if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                    receiver.try_recv()
+                {
+                    assert_eq!(timestamp, 0);
+                    return data;
+                }
+                assert!(Instant::now() < deadline, "expected consecutive AAC audio");
+                thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let initial = vec![0x11; BLOCK_BYTES];
+        let mut reference = Aac::new().unwrap();
+        let mut sent = 0;
+        let mut tail = 0;
+        // Fill transport credit with paced capture so no sample was dropped.
+        while sent < MAX_PENDING {
+            let expected = reference.encode(&initial).unwrap();
+            source.write_all(&initial).unwrap();
+            if let Some(expected) = expected {
+                let data = take_wave(&mut receiver);
+                assert_eq!(data, expected);
+                let messages: Vec<_> = server.wave(data, 0).unwrap().into();
+                let ServerAudioOutputPdu::Wave2(wave) =
+                    decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
+                else {
+                    panic!("expected Wave2");
+                };
+                tail = wave.block_no;
+                sent += 1;
+            }
+            thread::sleep(Duration::from_millis(25));
+        }
+        // Capture stays empty while the fourth receipt is pending. Waiting
+        // for credit alone must not discard AAC's buffered samples/lookahead.
+        thread::sleep(Duration::from_millis(30));
+        assert!(receiver.is_empty());
+        let fresh = vec![0x33; BLOCK_BYTES];
+        let mut expected = VecDeque::new();
+        if queued_capture {
+            // One fresh block waits within the 60 ms capture budget. Four
+            // occupied credits alone do not make these samples stale.
+            let queued = vec![0x22; BLOCK_BYTES];
+            if let Some(packet) = reference.encode(&queued).unwrap() {
+                expected.push_back(packet);
+            }
+            source.write_all(&queued).unwrap();
+            thread::sleep(Duration::from_millis(15));
+            assert!(receiver.is_empty());
+        }
+        server
+            .process(
+                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                    block_no: tail,
+                    timestamp: 0,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+        for _ in 0..3 {
+            if let Some(packet) = reference.encode(&fresh).unwrap() {
+                expected.push_back(packet);
+            }
+            source.write_all(&fresh).unwrap();
+            thread::sleep(Duration::from_millis(25));
+        }
+        assert!(!expected.is_empty());
+        for expected in expected {
+            let data = take_wave(&mut receiver);
+            assert!(
+                data == expected,
+                "short credit waiting must preserve queued samples and consecutive AAC packets without codec priming"
+            );
         }
         drop(server);
     }
@@ -1211,14 +1312,17 @@ mod tests {
     }
 
     #[test]
-    fn pcm_preferred_over_adpcm_preserves_signed_stereo_on_both_wave_versions() {
+    fn pcm_preferred_over_aac_and_adpcm_preserves_signed_stereo_on_both_wave_versions() {
         for version in [Version::V6, Version::V8] {
             let audio = Audio::default();
             let adpcm = Adpcm::new().unwrap().format.clone();
             let mut unsupported = pcm();
             unsupported.n_samples_per_sec = 44100;
-            let (mut server, mut receiver) =
-                negotiate_version(&audio, vec![adpcm, unsupported, pcm()], version);
+            let (mut server, mut receiver) = negotiate_version(
+                &audio,
+                vec![adpcm, unsupported, pcm(), aac_format()],
+                version,
+            );
             assert!(server.is_ready());
             let (mut source, capture) = UnixStream::pair().unwrap();
             source
@@ -1248,7 +1352,7 @@ mod tests {
             };
             assert_eq!(
                 data, expected,
-                "PCM must be selected even when ADPCM comes first in the client's list"
+                "PCM must be selected when the client also accepts AAC and ADPCM"
             );
             let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
             let bytes = messages[0].encode_unframed_pdu().unwrap();

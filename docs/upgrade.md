@@ -43,6 +43,19 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+Package release 19 restores PCM preference over AAC and MS ADPCM after Windows
+10 mstsc playback with release 18 produced continuous crackling. It preserves
+release 18's immediate timestamps, capture limits and bounded playback recovery.
+AAC remains a fallback for clients without PCM; waiting for transport credit
+without dropping capture now preserves its encoder state. PCM needs about
+1.54 Mbit/s before framing. Build the package while connected, then install and
+restart only `niri-rdp-frontend.service` from a local terminal or independent SSH
+session. The restart disconnects RDP; reconnect within the broker's 45-second
+retention window and verify `RDP audio PCM` in the frontend journal. This change
+does not require restarting the broker or ending the retained desktop. Check
+speech and music clarity, pause/stop delay and long-running lip-sync using the
+[audio acceptance procedures](acceptance.md).
+
 Package release 18 fixes the release 17 audio recovery regression: missing
 optional playback confirmations could permanently mute AAC and repeatedly lower
 video quality. Playback feedback now expires, implausible timestamp delays are

@@ -28,6 +28,18 @@ Follow adjacent code: four-space indentation for Rust, Python, and C; tabs for M
 
 Use Python `unittest`, Rust unit tests, and `broker/tests.c` assertions. Add regressions for behavioral fixes, including failure/cleanup paths. Python suites use `tests/test_*.py`. No numeric coverage threshold is configured. Record integration evidence in `docs/validation.md`; installed PAM/logind and Windows acceptance remain separate checks in `docs/acceptance.md`.
 
+## Preserve the Working Audio Combination
+
+On 2026-10-12, the user confirmed that release 19 fixed continuous crackling and delivered minimal audio latency from this Arch/Niri host to Windows 10's native `mstsc.exe`. Treat this combination as the accepted baseline:
+
+- Prefer **48 kHz stereo S16LE PCM**, paced in **20 ms blocks**, ahead of AAC and MS ADPCM. Compressed formats remain fallbacks for clients without PCM. PCM needs about 1.54 Mbit/s before framing; this bandwidth cost is intentional.
+- Keep **both RDPSND timestamps zero** for the current RDPGFX desktop path, which has no shared RDPEVOR presentation clock. Use internal monotonic time for pacing and delay measurements.
+- Preserve bounded capture and transport: four pending waves, three capture blocks, 60 ms capture expiry, silence suppression, and recent validated playback feedback with finite recovery. Optional second confirmations must never become required credits or indefinite playback gates.
+- Ordinary transport-credit waits must preserve recent queued capture and AAC state. Reset AAC after actual sample loss, not merely because the credit window fills.
+- Do not promote AAC/ADPCM or undo the latency controls as a routine optimization or upstream-alignment change. Earlier ADPCM playback produced static; AAC decoded successfully in FFmpeg, FreeRDP and FDK fixtures but still produced continuous crackling in actual mstsc playback. PCM alone with the older controls also accumulated minutes of delay: preserve the codec choice and current controls together.
+
+Any deliberate change to this baseline needs an explicit user request or approval and actual Windows 10 mstsc clarity/latency validation; automated decoder success alone is insufficient. Keep the PCM preference/wire-byte and credit-wait continuity regressions. See [the validation record](docs/validation.md#continuous-mstsc-crackling-and-pcm-playback-2026-10-12) and [acceptance checks](docs/acceptance.md). The user confirmed the immediate result; long-running lip-sync, constrained-bandwidth and repeated-reconnect listening checks remain separate acceptance work.
+
 ## Commit & Pull Request Guidelines
 
 History uses brief descriptions such as “Added remote audio support.” and “Fixed Firefox issues.” Keep commits focused. PRs should explain behavior changes, link relevant issues, list validation and limitations, and include screenshots for login/UI changes.

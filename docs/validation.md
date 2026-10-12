@@ -1,5 +1,85 @@
 # Validation record
 
+## Continuous mstsc crackling and PCM playback, 2026-10-12
+
+The user reported that release 18 eliminated the huge sound delay but produced
+constant, unintelligible crackling from start to finish in Windows 10's native
+`mstsc.exe`. Read-only inspection confirmed `niri-remote-login 0.1.0-18` and an
+active `RDP audio AAC-LC: 44100 Hz stereo, 96 kbps` connection. The frontend
+journal contained occasional 150 ms receipt-delay warnings with zero render
+delay, followed by video bitrate recovery. No user audio was recorded, and no
+installed service or active desktop was changed.
+
+Release 19 prefers the 48 kHz stereo S16LE PCM format that the user previously
+confirmed was intelligible with release 16. It retains release 18's zero
+timestamps, bounded capture and transport queues, silence suppression, validated
+playback feedback and finite recovery. AAC and then MS ADPCM remain fallbacks
+for clients without PCM. PCM needs about 1.54 Mbit/s before framing. The exact
+Windows compressed-playback failure remains unisolated; valid AAC decoding by
+other implementations does not establish compatibility with this mstsc session.
+
+The PCM preference regression failed with the previous ordering and passed
+with the change. It verifies exact signed stereo bytes and the client's format
+index when AAC and ADPCM are also accepted, on both version 6 WaveInfo/Wave and
+version 8 Wave2. The AAC fallback still produces raw packets with immediate
+timestamps in both versions.
+
+An independent capture/confirmation experiment also reproduced a continuity
+bug: a full four-wave credit window discarded healthy capture and reset AAC,
+even without a delay warning. At 75 ms consumption confirmations, the original
+worker emitted only 98 of 136 expected packets in 3.2 seconds, including 25
+priming-like packets and 23 gaps over 45 ms. At 29 ms it emitted all 136 packets
+without divergence, so this does not establish the cause of continuous static.
+The fixed worker keeps its bounded recent capture through ordinary credit
+waits, and resets only after samples are actually dropped. At both 29 and 75 ms,
+all 136 packets now match uninterrupted encoding byte-for-byte, with only the
+initial priming packet and no gaps over 45 ms. Longer confirmation waits can
+still cause bounded drops when four credits cannot sustain the sample rate.
+Two regressions cover empty capture and a fresh queued block during a short
+credit wait; the empty-capture regression also failed before the change.
+
+The installed Fraunhofer FDK-AAC decoder independently decoded 205 raw packets
+from the native FFmpeg encoder using the offered AAC-LC/44.1 kHz/stereo layout.
+All packets had the expected frame shape; 201 post-priming packets retained
+over 90% tone energy, with minima of 0.98361 and 0.95098 for the stereo tones.
+This rules out basic malformed packets in that fixture, without testing Windows
+playback. GNOME deliberately uses
+[raw AAC](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dsp.c)
+and [zero playback timestamps](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dvc-audio-playback.c).
+No speculative codec-tool or format-header change was made.
+
+`make check BRIDGE_CARGO_HOME="$PWD/poc/.cargo-cache"` passed outside the
+socket-restricted sandbox: 72 Python tests (two opt-ins skipped), five PoC Rust
+tests, four startup checks, all 12 native broker groups, 108 bridge library tests
+and the frontend lifecycle test. The 37 audio regressions include PCM/AAC wire
+delivery, the new continuity cases and the existing capture overflow, transport
+stall, valid finite rendering hold, idle/resume and reconnect checks. Formatting
+and whitespace checks passed. Clippy reports only the five existing
+login/Wayland warnings. Evidence is under `artifacts/audio-clarity-fix/`, including
+the independent FDK fixture and before/after cadence experiment.
+
+The combined `0.1.0-19` package built with all required checks enabled: three
+headless and five protocol regressions, 108 bridge library tests, the frontend
+lifecycle test, all 12 native broker groups and 64 Python tests (two opt-ins
+skipped in the package source tree). Structure/preservation validation passed.
+Extracted release binaries passed private NVENC AVC420 application
+decode/input/reconnect, TLS login rejection/authentication, JIS input, live
+resize, held-input release and compositor-crash cleanup. Reports are
+`artifacts/audio-clarity-fix/package-validation.json` and
+`artifacts/audio-clarity-fix/package-integration.json`. The ready archive is
+`packaging/arch/niri-rdp/niri-remote-login-0.1.0-19-x86_64.pkg.tar.zst`.
+
+After applying the release 19 change on 2026-10-12, the user confirmed that
+playback worked and now had minimal latency in the same Windows 10 native
+`mstsc.exe` session. This establishes user-confirmed clarity and low delay for
+the PCM preference plus current latency controls together. Preserve this
+combination; successful decoding in FFmpeg, FreeRDP or FDK is not sufficient
+evidence to restore compressed-format preference. The baseline and change
+requirements are recorded in [AGENTS.md](../AGENTS.md#preserve-the-working-audio-combination).
+No precise latency measurement or 30-minute, constrained-bandwidth or repeated
+reconnect listening result was supplied; those remain separate
+[actual-client acceptance checks](acceptance.md).
+
 ## Muted AAC and unbounded playback recovery, 2026-10-12
 
 The user reported no sound after installing release 17 with Windows 10's native

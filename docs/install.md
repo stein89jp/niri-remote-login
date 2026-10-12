@@ -362,9 +362,10 @@ frame rate or ceiling for limited networks; increasing the ceiling can improve
 AVC420 quality when the connection has enough bandwidth. Bitmap fallback does
 not use this bitrate controller.
 
-Audio prefers GNOME Remote Login's stereo AAC-LC format at 96 kbit/s when the
-client accepts it; PCM is the fallback at about 1.54 Mbps before framing. PCM
-takes preference over the older MS ADPCM offer. Digital silence is suppressed
+Audio prefers stereo 48 kHz PCM at about 1.54 Mbps before framing. This restores
+the format that was intelligible on Windows 10 mstsc after continuous static
+was reported with AAC. Clients that do not accept PCM can use stereo AAC-LC at
+96 kbit/s, followed by MS ADPCM. Digital silence is suppressed
 after a short codec tail. Blocks are paced by their exact sample duration and keep
 recent capture samples when the source or network stalls. Recent, validated
 playback feedback can briefly discard capture to let a client buffer drain.
@@ -375,8 +376,9 @@ during congestion. No manual delay or
 codec setting is needed. These controls limit accumulating delay; actual mstsc
 audio/video presentation still needs the playback check below.
 
-To inspect playback, the frontend journal reports `RDP audio AAC-LC` or
-`RDP audio PCM`, plus `RDP audio delay: receipt ... ms, render ... ms` during buffer recovery
+To inspect playback, the frontend journal normally reports `RDP audio PCM`
+(`RDP audio AAC-LC` for clients without PCM), plus
+`RDP audio delay: receipt ... ms, render ... ms` during buffer recovery
 and `RDP graphics adaptive H.264 target` during video adaptation. Test a clip with visible
 claps or simultaneous flash/tone for several minutes, then repeat after a short
 network stall. Record whether the offset stays constant or keeps growing; see

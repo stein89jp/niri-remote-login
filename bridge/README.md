@@ -235,12 +235,13 @@ This follows GNOME Remote Login's session-playback model: capture an audio sink
 and send it through RDP ([GNOME implementation](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dvc-audio-playback.c)).
 
 Capture is stereo 48 kHz, signed 16-bit little-endian PCM. The frontend prefers
-GNOME Remote Login's AAC-LC format: `AAC_MS`, stereo 44.1 kHz at 96 kbit/s,
+this uncompressed format, using 20 ms blocks and about 1.54 Mbit/s before framing.
+Windows 10 mstsc playback was intelligible with PCM, but both compressed offers
+have produced static in actual listening checks. Clients that do not accept PCM
+can use GNOME Remote Login's AAC-LC format: `AAC_MS`, stereo 44.1 kHz at 96 kbit/s,
 1024 sample frames per raw packet, with no ADTS header or WAVE extra data.
 FFmpeg resamples capture with bounded buffers; encoder lookahead remains below
-two AAC frames. A client accepting only PCM receives the existing 48 kHz stereo
-format, using 20 ms blocks and about 1.54 Mbit/s before framing. PCM is preferred
-over MS ADPCM, whose actual mstsc playback previously produced static. No
+two AAC frames. MS ADPCM is the last fallback. No
 additional audio configuration is required. A client must enable
 remote playback and accept one of these formats. No microphone redirection is provided. Audio starts after
 successful Linux authentication, including submission through the login form.
@@ -261,8 +262,9 @@ The bridge paces blocks by their exact sample duration and retains a three-block
 capture FIFO to absorb ordinary PipeWire batching. Excess backlog drops the
 oldest complete blocks while preserving partial-sample alignment. Capture also
 expires after 60 ms of frontend buffering. Continuous digital silence is
-suppressed after a short codec tail, and AAC state resets after a transport or
-playback hold so old lookahead is discarded. The session monitor also drains
+suppressed after a short codec tail, and AAC state resets when a transport or
+playback hold discards capture so old lookahead is discarded. Waiting for credit
+without dropping capture preserves codec state. The session monitor also drains
 capture continuously through socket stalls with bounded buffers.
 Like GNOME, RDPSND timestamps are zero: this desktop uses RDPGFX, without the
 RDPEVOR shared presentation clock that the Wave2 audio timestamp accompanies.
