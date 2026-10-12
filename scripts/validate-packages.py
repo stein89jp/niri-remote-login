@@ -16,6 +16,7 @@ EXPECTED = {
         "usr/lib/niri-rdp/encoder-probe",
         "usr/lib/niri-rdp/session-worker", "usr/lib/niri-rdp/session-desktop", "etc/pam.d/niri-rdp", "etc/niri-rdp/headless.kdl",
         "usr/lib/niri-rdp/session-portals", "usr/share/xdg-desktop-portal/niri-rdp-portals.conf",
+        "usr/lib/niri-rdp/session-environment", "usr/lib/niri-rdp/session-autostart",
         "etc/niri-rdp/waybar.json", "etc/niri-rdp/frontend.conf", "etc/niri-rdp/renderer.conf", "usr/lib/systemd/system/niri-rdp-broker.service",
         "usr/lib/systemd/system/niri-rdp-frontend.service", "usr/lib/sysusers.d/niri-rdp.conf",
         "usr/share/doc/niri-remote-login/install.md", "usr/share/doc/niri-remote-login/uninstall.md",

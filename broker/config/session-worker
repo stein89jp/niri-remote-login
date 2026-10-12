@@ -2,6 +2,9 @@
 # Only the root broker launches this fixed executable after switching UID.
 set -eu
 : "${NIRI_RDP_RUNTIME_DIR:?broker private session directory missing}"
+if [ "${1:-}" != "--environment-ready" ]; then
+    exec /usr/lib/niri-rdp/session-environment /usr/lib/niri-rdp/session-worker --environment-ready
+fi
 # logind retains its genuine /run/user/UID registration. The compositor and
 # applications use a private runtime so no local Wayland or desktop bus is reused.
 export XDG_RUNTIME_DIR="$NIRI_RDP_RUNTIME_DIR"
@@ -61,6 +64,7 @@ if sys.argv[3] == "1":
     wrapper += ('output "HEADLESS-1" { scale 1; transform "normal"; }\n'
                 'spawn-at-startup "/usr/lib/niri-rdp/session-desktop"\n')
 wrapper += 'spawn-at-startup "/usr/lib/niri-rdp/session-portals"\n'
+wrapper += 'spawn-at-startup "/usr/lib/niri-rdp/session-autostart"\n'
 pathlib.Path(sys.argv[2]).write_text(wrapper)
 PY
 exec /usr/lib/niri-rdp/niri-headless --config "$NIRI_RDP_RUNTIME_DIR/config.kdl"

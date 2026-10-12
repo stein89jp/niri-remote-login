@@ -1,0 +1,108 @@
+#!/usr/bin/python3
+"""Run the account's ordinary XDG desktop autostart on the private display."""
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+
+def activation_environment(environment):
+    variables = ("XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DISPLAY", "NIRI_SOCKET",
+                 "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
+                 "PIPEWIRE_RUNTIME_DIR", "PIPEWIRE_REMOTE", "PULSE_SERVER")
+    settings = ("XMODIFIERS", "GTK_IM_MODULE", "QT_IM_MODULE", "QT_IM_MODULES",
+                "SDL_IM_MODULE", "CLUTTER_IM_MODULE", "GLFW_IM_MODULE", "INPUT_METHOD",
+                "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_DATA_HOME", "XDG_DATA_DIRS",
+                "XDG_CACHE_HOME", "LANG", "LANGUAGE")
+    values = {key: environment.get(key, "") for key in variables}
+    values.update({key: value for key, value in environment.items()
+                   if key in settings or key.startswith("LC_") or key.startswith("XKB_")})
+    # Keep host-first portal routing. This updates only our private bus.
+    values["XDG_CURRENT_DESKTOP"] = "niri:niri-rdp"
+    subprocess.run(["/usr/bin/dbus-update-activation-environment",
+                    *(key + "=" + value for key, value in values.items())],
+                   env=environment, check=True, timeout=5)
+
+
+def autostart_entries(environment):
+    default_home = Path(environment["HOME"]) / ".config"
+    config_home = Path(environment.get("XDG_CONFIG_HOME") or str(default_home))
+    if not config_home.is_absolute():
+        config_home = default_home
+    directories = [config_home, *(Path(item) for item in
+                   (environment.get("XDG_CONFIG_DIRS") or "/etc/xdg").split(":")
+                   if item and Path(item).is_absolute())]
+    entries = {}
+    # First file wins even if Hidden=true: user overrides disable system entries.
+    for directory in directories:
+        for entry in sorted((directory / "autostart").glob("*.desktop")):
+            entries.setdefault(entry.name, entry)
+    return entries.values()
+
+
+def launch_entries(environment):
+    # GIO implements Desktop Entry Exec quoting, field codes, working directory,
+    # terminal handling, and TryExec; never interpret Exec as shell code.
+    import gi
+    gi.require_version("GioUnix", "2.0")
+    from gi.repository import Gio, GioUnix, GLib
+
+    context = Gio.AppLaunchContext()
+    for key, value in environment.items():
+        context.setenv(key, value)
+    for entry in autostart_entries(environment):
+        try:
+            try:
+                application = GioUnix.DesktopAppInfo.new_from_filename(str(entry))
+            except TypeError:
+                # PyGObject reports GIO's NULL for invalid entries or a missing
+                # TryExec as a constructor exception rather than returning None.
+                continue
+            if application is None or application.get_is_hidden() or not application.get_show_in(None):
+                continue
+            if application.get_boolean("X-systemd-skip"):
+                continue
+            if (application.has_key("X-GNOME-Autostart-enabled") and
+                    not application.get_boolean("X-GNOME-Autostart-enabled")):
+                continue
+            skip = False
+            for key, executable in (("AutostartCondition", "gnome-systemd-autostart-condition"),
+                                    ("X-KDE-autostart-condition", "kde-systemd-start-condition")):
+                condition = application.get_string(key)
+                if condition:
+                    tool = shutil.which(executable)
+                    if tool is None or subprocess.run([tool, "--condition", condition], env=environment,
+                                                       timeout=5).returncode != 0:
+                        skip = True
+                        break
+            if skip:
+                continue
+            application.launch([], context)
+        except (GLib.Error, OSError, subprocess.TimeoutExpired) as error:
+            print("remote autostart failed for " + entry.name + ": " + str(error), file=sys.stderr)
+
+
+def main():
+    runtime = os.environ["NIRI_RDP_RUNTIME_DIR"]
+    if os.environ.get("XDG_RUNTIME_DIR") != runtime:
+        raise RuntimeError("autostart requires the private runtime")
+    if not os.environ.get("WAYLAND_DISPLAY") or not os.environ.get("DBUS_SESSION_BUS_ADDRESS"):
+        raise RuntimeError("autostart requires Niri's display and private bus")
+    environment = dict(os.environ)
+    activation_environment(environment)
+    if sys.argv[1:] == ["--prepare"]:
+        return
+    if sys.argv[1:]:
+        raise RuntimeError("unknown autostart arguments")
+    marker = Path(runtime) / "xdg-autostart-started"
+    try:
+        descriptor = os.open(marker, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    except FileExistsError:
+        return
+    os.close(descriptor)
+    launch_entries(environment)
+
+
+if __name__ == "__main__":
+    main()

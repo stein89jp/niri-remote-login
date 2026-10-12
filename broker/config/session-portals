@@ -53,7 +53,9 @@ def main():
                  "XDG_CURRENT_DESKTOP", "XDG_SESSION_TYPE", "XDG_SESSION_DESKTOP",
                  "PIPEWIRE_RUNTIME_DIR", "PIPEWIRE_REMOTE", "PULSE_SERVER")
     subprocess.run(["/usr/bin/dbus-update-activation-environment",
-                    *(key + "=" + environment.get(key, "") for key in variables)],
+                    *(key + "=" + environment.get(key, "") for key in variables),
+                    *(key + "=" + environment[key] for key in
+                      ("XMODIFIERS", "QT_IM_MODULE", "GTK_IM_MODULE") if key in environment)],
                    env=environment, check=True)
     replace_stale_backends(environment)
     # Replace a frontend activated before the display was exported. Later

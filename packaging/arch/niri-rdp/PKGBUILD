@@ -4,7 +4,7 @@
 # Export a portable source bundle with makepkg --allsource.
 pkgname=niri-remote-login
 pkgver=0.1.0
-pkgrel=10
+pkgrel=11
 pkgdesc='Niri remote desktop host with a PAM/logind broker and dedicated headless compositor'
 arch=('x86_64')
 # Niri is GPL-3.0-or-later; the bridge links Arch's GPL-licensed FFmpeg.
@@ -13,10 +13,10 @@ options=('!debug' '!lto')
 depends=('pam' 'systemd' 'systemd-libs' 'dbus' 'wayland' 'libxkbcommon'
          'xkeyboard-config' 'foot' 'fuzzel' 'waybar' 'ttf-dejavu' 'ffmpeg' 'seatd' 'libinput'
          'libdisplay-info' 'mesa' 'libglvnd' 'pango' 'cairo' 'pixman'
-         'openssl' 'python' 'pipewire' 'pipewire-pulse' 'wireplumber' 'libpulse'
+         'openssl' 'python' 'python-gobject' 'glib2' 'pipewire' 'pipewire-pulse' 'wireplumber' 'libpulse'
          'xdg-desktop-portal' 'xdg-desktop-portal-gtk')
 makedepends=('rust>=1.94' 'cargo' 'git' 'gcc' 'pkgconf')
-provides=('niri-rdp-headless=26.04.remote1-4')
+provides=('niri-rdp-headless=26.04.remote1-5')
 conflicts=('niri-rdp-headless')
 backup=('etc/niri-rdp/frontend.conf' 'etc/niri-rdp/headless.kdl' 'etc/niri-rdp/waybar.json' 'etc/niri-rdp/renderer.conf' 'etc/pam.d/niri-rdp')
 _revision=0be60b742762905b7bee1ea67bb5a2fb00859bf0
@@ -37,7 +37,7 @@ if [[ -f "$_checkout/bridge/Cargo.lock" && -f "$_checkout/LICENSE" ]]; then
                 packaging/frontend.conf packaging/nvidia-frontend.conf
                 packaging/niri-rdp.sysusers packaging/niri-rdp-setup.py
                 packaging/prepare-tls.py scripts/collect-licenses.py
-                tests/__init__.py tests/test_host_setup.py
+                tests/__init__.py tests/test_host_setup.py tests/test_session_environment.py
                 tests/test_native_video.py tests/video_guard.c tests/video_rate.c tests/test_audio.py
                 compositor/patches/0001-remote-headless-bounds-and-startup.patch)
   while IFS= read -r -d '' _file; do
@@ -122,7 +122,7 @@ check() {
   cd "$srcdir/niri-remote-login-$pkgver"
   env -u CFLAGS -u CXXFLAGS cargo test --locked --offline --manifest-path bridge/Cargo.toml
   make -C broker check
-  python -m unittest tests.test_host_setup tests.test_native_video tests.test_audio -v
+  python -m unittest tests.test_host_setup tests.test_session_environment tests.test_native_video tests.test_audio -v
 }
 
 package() {

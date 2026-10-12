@@ -8,7 +8,7 @@ use ironrdp_server::{
 use std::{
     collections::BTreeSet,
     fs::File,
-    io::Write,
+    io::{Read, Seek, SeekFrom, Write},
     os::{
         fd::{AsFd, AsRawFd},
         unix::net::UnixStream,
@@ -22,7 +22,7 @@ use std::{
 };
 use wayland_client::{
     Connection, Dispatch, Proxy, QueueHandle, WEnum, delegate_noop,
-    protocol::{wl_buffer, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool},
+    protocol::{wl_buffer, wl_keyboard, wl_output, wl_registry, wl_seat, wl_shm, wl_shm_pool},
 };
 use wayland_protocols_misc::zwp_virtual_keyboard_v1::client::{
     zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1,
@@ -271,6 +271,9 @@ struct State {
     capture: Option<ZwlrScreencopyManagerV1>,
     pointer_manager: Option<ZwlrVirtualPointerManagerV1>,
     keyboard_manager: Option<ZwpVirtualKeyboardManagerV1>,
+    seat_keyboard: Option<wl_keyboard::WlKeyboard>,
+    seat_keymap: Option<String>,
+    keymap_error: Option<String>,
     synced: bool,
     outputs: Vec<(u32, wl_output::WlOutput, String, i32, bool, (u32, u32))>,
     selected_output: Option<u32>,
@@ -414,6 +417,34 @@ delegate_noop!(State: ignore ZwpVirtualKeyboardManagerV1);
 delegate_noop!(State: ignore ZwpVirtualKeyboardV1);
 delegate_noop!(State: ignore ZwlrOutputModeV1);
 delegate_noop!(State: ignore ZwlrOutputConfigurationHeadV1);
+
+impl Dispatch<wl_keyboard::WlKeyboard, ()> for State {
+    fn event(
+        s: &mut Self,
+        _: &wl_keyboard::WlKeyboard,
+        event: wl_keyboard::Event,
+        _: &(),
+        _: &Connection,
+        _: &QueueHandle<Self>,
+    ) {
+        if let wl_keyboard::Event::Keymap { format, fd, size } = event {
+            let result = (|| -> anyhow::Result<String> {
+                anyhow::ensure!(
+                    format == WEnum::Value(wl_keyboard::KeymapFormat::XkbV1),
+                    "unsupported compositor keyboard map format"
+                );
+                read_keymap(File::from(fd), size)
+            })();
+            match result {
+                // Unicode injection temporarily changes Niri's seat map. Never
+                // adopt that synthetic map as the user's physical layout.
+                Ok(text) if text.contains("xkb_keycodes \"niri_rdp_unicode\"") => {}
+                Ok(text) => s.seat_keymap = Some(text),
+                Err(error) => s.keymap_error = Some(error.to_string()),
+            }
+        }
+    }
+}
 
 impl Dispatch<ZwlrOutputManagerV1, ()> for State {
     fn event(
@@ -575,6 +606,15 @@ fn pump(
     q: &mut wayland_client::EventQueue<State>,
     s: &mut State,
 ) -> anyhow::Result<()> {
+    pump_with_timeout(c, q, s, 50)
+}
+
+fn pump_with_timeout(
+    c: &Connection,
+    q: &mut wayland_client::EventQueue<State>,
+    s: &mut State,
+    timeout_ms: i32,
+) -> anyhow::Result<()> {
     q.dispatch_pending(s)?;
     c.flush()?;
     if let Some(guard) = q.prepare_read() {
@@ -584,7 +624,7 @@ fn pump(
             revents: 0,
         };
         // SAFETY: a single initialized pollfd is valid for this synchronous call.
-        let n = unsafe { libc::poll(&mut fd, 1, 50) };
+        let n = unsafe { libc::poll(&mut fd, 1, timeout_ms) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() != std::io::ErrorKind::Interrupted {
@@ -617,7 +657,7 @@ fn unicode_keymap(character: char) -> String {
     // The caller restores the physical keymap and modifiers after the tap.
     format!(
         r#"xkb_keymap {{
-        xkb_keycodes {{ minimum = 8; maximum = 255; <TEXT> = 255; }};
+        xkb_keycodes "niri_rdp_unicode" {{ minimum = 8; maximum = 255; <TEXT> = 255; }};
         xkb_types {{ type "ONE_LEVEL" {{ modifiers = None; level_name[Level1] = "Any"; }}; }};
         xkb_compatibility {{ }};
         xkb_symbols {{ key <TEXT> {{ type = "ONE_LEVEL", [ {symbol} ] }}; }};
@@ -625,14 +665,56 @@ fn unicode_keymap(character: char) -> String {
     )
 }
 
+fn read_keymap(mut file: File, size: u32) -> anyhow::Result<String> {
+    anyhow::ensure!(
+        (1..=1024 * 1024).contains(&size),
+        "invalid compositor keyboard map size"
+    );
+    file.seek(SeekFrom::Start(0))?;
+    let mut bytes = Vec::new();
+    file.take(u64::from(size)).read_to_end(&mut bytes)?;
+    anyhow::ensure!(
+        bytes.len() == size as usize && bytes.pop() == Some(0),
+        "invalid compositor keyboard map data"
+    );
+    Ok(String::from_utf8(bytes)?)
+}
+
+struct PhysicalKeymap {
+    file: File,
+    size: u32,
+    text: String,
+    state: xkb::State,
+}
+
+impl PhysicalKeymap {
+    fn new(text: String) -> anyhow::Result<Self> {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        let map = xkb::Keymap::new_from_string(
+            &context,
+            text.clone(),
+            xkb::KEYMAP_FORMAT_TEXT_V1,
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .ok_or_else(|| anyhow::anyhow!("invalid compositor XKB keymap"))?;
+        let mut file = tempfile::tempfile()?;
+        file.write_all(text.as_bytes())?;
+        file.write_all(&[0])?;
+        Ok(Self {
+            file,
+            size: text.len() as u32 + 1,
+            text,
+            state: xkb::State::new(&map),
+        })
+    }
+}
+
 struct Input {
     keyboard: ZwpVirtualKeyboardV1,
     text_keyboard: ZwpVirtualKeyboardV1,
-    physical_keymap: std::fs::File,
-    physical_keymap_size: u32,
+    physical_keymap: PhysicalKeymap,
     unicode: UnicodeInput,
     pointer: ZwlrVirtualPointerV1,
-    xkb: xkb::State,
     keys: BTreeSet<u32>,
     buttons: BTreeSet<u32>,
     point: (u32, u32),
@@ -641,15 +723,61 @@ struct Input {
     started: Instant,
 }
 impl Input {
+    fn update_keymap(&mut self, s: &mut State) -> anyhow::Result<()> {
+        if let Some(error) = s.keymap_error.take() {
+            anyhow::bail!(error);
+        }
+        if let Some(text) = s.seat_keymap.take() {
+            if text != self.physical_keymap.text {
+                let mut next = PhysicalKeymap::new(text)?;
+                // Reapply held keys when the user reloads the desktop layout.
+                for key in &self.keys {
+                    next.state
+                        .update_key((key + 8).into(), xkb::KeyDirection::Down);
+                }
+                let old = &self.physical_keymap.state;
+                let old_map = old.get_keymap();
+                let next_map = next.state.get_keymap();
+                let old_locked = old.serialize_mods(xkb::STATE_MODS_LOCKED);
+                let mut locked = 0;
+                for index in 0..old_map.num_mods().min(32) {
+                    if old_locked & (1 << index) != 0 {
+                        let next_index = next_map.mod_get_index(old_map.mod_get_name(index));
+                        if next_index < 32 {
+                            locked |= 1 << next_index;
+                        }
+                    }
+                }
+                next.state.update_mask(
+                    next.state.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+                    0,
+                    locked,
+                    0,
+                    0,
+                    0,
+                );
+                self.physical_keymap = next;
+            }
+        }
+        Ok(())
+    }
     fn time(&self) -> u32 {
         self.started.elapsed().as_millis() as u32
     }
     fn modifiers(&self) {
         self.keyboard.modifiers(
-            self.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED),
-            self.xkb.serialize_mods(xkb::STATE_MODS_LATCHED),
-            self.xkb.serialize_mods(xkb::STATE_MODS_LOCKED),
-            self.xkb.serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
+            self.physical_keymap
+                .state
+                .serialize_mods(xkb::STATE_MODS_DEPRESSED),
+            self.physical_keymap
+                .state
+                .serialize_mods(xkb::STATE_MODS_LATCHED),
+            self.physical_keymap
+                .state
+                .serialize_mods(xkb::STATE_MODS_LOCKED),
+            self.physical_keymap
+                .state
+                .serialize_layout(xkb::STATE_LAYOUT_EFFECTIVE),
         );
     }
     fn key(&mut self, key: u32, pressed: bool) {
@@ -660,7 +788,7 @@ impl Input {
         };
         if changed {
             self.keyboard.key(self.time(), key, u32::from(pressed));
-            self.xkb.update_key(
+            self.physical_keymap.state.update_key(
                 (key + 8).into(),
                 if pressed {
                     xkb::KeyDirection::Down
@@ -685,7 +813,7 @@ impl Input {
                 }
             }
             KeyboardEvent::Synchronize(flags) => {
-                let km = self.xkb.get_keymap();
+                let km = self.physical_keymap.state.get_keymap();
                 let mut locked = 0;
                 // RDP synchronize bits: Scroll=1, Num=2, Caps=4, Kana=8.
                 for (bit, name) in [(1, "ScrollLock"), (2, "NumLock"), (4, "Lock")] {
@@ -694,8 +822,10 @@ impl Input {
                         locked |= 1 << i;
                     }
                 }
-                self.xkb.update_mask(
-                    self.xkb.serialize_mods(xkb::STATE_MODS_DEPRESSED),
+                self.physical_keymap.state.update_mask(
+                    self.physical_keymap
+                        .state
+                        .serialize_mods(xkb::STATE_MODS_DEPRESSED),
                     0,
                     locked,
                     0,
@@ -736,8 +866,11 @@ impl Input {
         self.text_keyboard.key(self.time(), 247, 0);
         // Niri's protocol adapter uses one seat keymap for virtual devices.
         // Restore it in protocol order before any subsequent hardware event.
-        self.keyboard
-            .keymap(1, self.physical_keymap.as_fd(), self.physical_keymap_size);
+        self.text_keyboard.keymap(
+            1,
+            self.physical_keymap.file.as_fd(),
+            self.physical_keymap.size,
+        );
         self.modifiers();
         Ok(())
     }
@@ -954,17 +1087,33 @@ fn run(
     let seat = s
         .seat
         .as_ref()
-        .ok_or_else(|| anyhow::anyhow!("missing Wayland seat"))?;
+        .ok_or_else(|| anyhow::anyhow!("missing Wayland seat"))?
+        .clone();
+    s.seat_keyboard = Some(seat.get_keyboard(&h, ()));
+    let keymap_deadline = Instant::now();
+    while s.seat_keymap.is_none() {
+        pump(&c, &mut q, &mut s)?;
+        anyhow::ensure!(
+            s.keymap_error.is_none(),
+            "{}",
+            s.keymap_error.as_deref().unwrap_or("")
+        );
+        anyhow::ensure!(
+            keymap_deadline.elapsed() < Duration::from_secs(5),
+            "compositor keyboard map timed out"
+        );
+    }
+    let physical_keymap = PhysicalKeymap::new(s.seat_keymap.take().unwrap())?;
     let keyboard = s
         .keyboard_manager
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("missing virtual keyboard protocol"))?
-        .create_virtual_keyboard(seat, &h, ());
+        .create_virtual_keyboard(&seat, &h, ());
     let text_keyboard = s
         .keyboard_manager
         .as_ref()
         .unwrap()
-        .create_virtual_keyboard(seat, &h, ());
+        .create_virtual_keyboard(&seat, &h, ());
     let pm = s
         .pointer_manager
         .as_ref()
@@ -973,31 +1122,14 @@ fn run(
         pm.version() >= 2,
         "virtual pointer output mapping requires version 2"
     );
-    let pointer = pm.create_virtual_pointer_with_output(Some(seat), Some(&output), &h, ());
-    let ctx = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    let km = xkb::Keymap::new_from_names(
-        &ctx,
-        "evdev",
-        "jp106",
-        "jp",
-        "",
-        None,
-        xkb::KEYMAP_COMPILE_NO_FLAGS,
-    )
-    .ok_or_else(|| anyhow::anyhow!("XKB Japanese jp106 keymap unavailable"))?;
-    let mut keymap = tempfile::tempfile()?;
-    let mut text = km.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1);
-    text.push('\0');
-    keymap.write_all(text.as_bytes())?;
-    keyboard.keymap(1, keymap.as_fd(), text.len() as u32);
+    let pointer = pm.create_virtual_pointer_with_output(Some(&seat), Some(&output), &h, ());
+    keyboard.keymap(1, physical_keymap.file.as_fd(), physical_keymap.size);
     let mut input = Input {
         keyboard,
         text_keyboard,
-        physical_keymap: keymap,
-        physical_keymap_size: text.len() as u32,
+        physical_keymap,
         unicode: UnicodeInput::default(),
         pointer,
-        xkb: xkb::State::new(&km),
         keys: BTreeSet::new(),
         buttons: BTreeSet::new(),
         point: (0, 0),
@@ -1020,6 +1152,8 @@ fn run(
             if !alive.load(Ordering::Acquire) {
                 return Ok(());
             }
+            pump_with_timeout(&c, &mut q, &mut s, 0)?;
+            input.update_keymap(&mut s)?;
             // Apply resize only between captures, preserving the coordinate
             // contract for every queued input event and in-flight SHM buffer.
             for _ in 0..256 {
@@ -1169,7 +1303,8 @@ mod lifecycle_tests {
             xkb::KEYMAP_COMPILE_NO_FLAGS,
         )
         .unwrap();
-        let mut state = xkb::State::new(&km);
+        let inherited = PhysicalKeymap::new(km.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)).unwrap();
+        let mut state = inherited.state;
         for (evdev, character) in [
             (26u32, "@"),
             (27, "["),
@@ -1184,6 +1319,61 @@ mod lifecycle_tests {
         state.update_key(50u32.into(), xkb::KeyDirection::Down);
         for (evdev, character) in [(3u32, "\""), (89, "_"), (124, "|")] {
             assert_eq!(state.key_get_utf8((evdev + 8).into()), character);
+        }
+    }
+    #[test]
+    fn inherited_compositor_keymaps_preserve_swedish_us_and_multiple_groups() {
+        let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+        for (layout, expected) in [
+            ("se", [(26u32, "å"), (39, "ö"), (40, "ä")]),
+            ("us", [(26u32, "["), (39, ";"), (40, "'")]),
+        ] {
+            let map = xkb::Keymap::new_from_names(
+                &context,
+                "evdev",
+                "pc105",
+                layout,
+                "",
+                None,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )
+            .unwrap();
+            let inherited =
+                PhysicalKeymap::new(map.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)).unwrap();
+            let text = read_keymap(inherited.file.try_clone().unwrap(), inherited.size).unwrap();
+            let restored = PhysicalKeymap::new(text).unwrap();
+            for (key, character) in expected {
+                assert_eq!(restored.state.key_get_utf8((key + 8).into()), character);
+            }
+        }
+        let map = xkb::Keymap::new_from_names(
+            &context,
+            "evdev",
+            "pc105",
+            "us,se",
+            "",
+            Some("grp:alt_shift_toggle".into()),
+            xkb::KEYMAP_COMPILE_NO_FLAGS,
+        )
+        .unwrap();
+        let mut inherited =
+            PhysicalKeymap::new(map.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)).unwrap();
+        assert_eq!(inherited.state.get_keymap().num_layouts(), 2);
+        inherited.state.update_mask(0, 0, 0, 0, 0, 1);
+        assert_eq!(inherited.state.key_get_utf8(34u32.into()), "å");
+        inherited.state.update_mask(0, 0, 0, 0, 0, 0);
+        assert_eq!(inherited.state.key_get_utf8(34u32.into()), "[");
+    }
+    #[test]
+    fn compositor_keymap_reader_rejects_truncated_and_unbounded_data() {
+        for (bytes, size) in [
+            (b"abc".as_slice(), 4),
+            (b"abc".as_slice(), 3),
+            (b"abc\0".as_slice(), 1024 * 1024 + 1),
+        ] {
+            let mut file = tempfile::tempfile().unwrap();
+            file.write_all(bytes).unwrap();
+            assert!(read_keymap(file, size).is_err());
         }
     }
     #[test]
@@ -1212,6 +1402,10 @@ mod lifecycle_tests {
                 xkb::KEYMAP_COMPILE_NO_FLAGS,
             )
             .unwrap();
+            assert!(
+                km.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
+                    .contains("xkb_keycodes \"niri_rdp_unicode\"")
+            );
             let state = xkb::State::new(&km);
             assert_eq!(state.key_get_utf8(255u32.into()), character.to_string());
             assert_eq!(state.serialize_mods(xkb::STATE_MODS_EFFECTIVE), 0);

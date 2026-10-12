@@ -72,6 +72,13 @@ use `niri --session`, import environment into the user manager, or start
 `graphical-session.target`. The per-UID runtime and user manager still exist as
 required by logind; this is not a separate Unix security boundary.
 
+Before the compositor starts, a UID-owned helper reads the account's configured
+input-method, locale, keyboard, and XDG configuration settings. After the private
+display exists, Niri synchronously exports its application environment to the
+private bus before any startup applications launch. An XDG autostart helper then
+runs the usual configured desktop entries. It does not select an input framework
+or import the remote display into the shared user manager.
+
 ## Wire contract v1
 
 Use an AF_UNIX SOCK_STREAM socket. Send exactly:

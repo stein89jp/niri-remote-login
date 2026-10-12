@@ -83,3 +83,9 @@ logout and fresh login to run new startup commands. A disconnect now retains
 the existing desktop, so reconnecting does not rerun startup commands. The remote compositor
 has its own Wayland runtime and D-Bus bus; shared systemd desktop services are
 not started or given its environment.
+
+Remote startup now inherits configured input-method and locale settings and runs
+ordinary XDG autostart on the private display and bus. It does not force an input
+framework. The bridge inherits Niri's keyboard map instead of supplying a fixed
+Japanese layout. Existing language profiles and startup configuration are reused.
+Log out and start a fresh remote login to receive the new startup environment.

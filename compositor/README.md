@@ -57,8 +57,14 @@ The patched virtual keyboard implementation routes remote key events through
 Niri's normal XKB, focus, grab and keybinding handling. The old pinned Smithay
 implementation sent events directly to `wl_keyboard` and maintained a separate
 client keymap; it bypassed compositor shortcuts such as Mod+D. The compositor
-now uses the advertised virtual keymap as its authoritative map, applies modifier
-synchronization only when necessary, and releases held keys and restores the
-configured map on disconnect. The isolated integration fixture decodes the actual
+now uses Niri's configured keymap, preserves the selected layout group during
+remote modifier synchronization, and releases held keys on disconnect. Temporary
+Unicode maps restore the previous map and modifiers without undoing a later
+configuration reload. The isolated integration fixture decodes the actual
 Wayland XKB map and requires consecutive `abc123ABc`, Return and a Mod+D compositor
 binding, in addition to capture, resize and disconnect checks.
+
+Private remote startup publishes the compositor's application environment to its
+private D-Bus bus synchronously before startup applications can activate services.
+This hook runs only in a headless broker session and uses the fixed packaged
+autostart helper.

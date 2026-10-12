@@ -20,6 +20,8 @@ install: niri-rdp-broker
 	install -Dm755 config/session-audio "$(DESTDIR)/usr/lib/niri-rdp/session-audio"
 	install -Dm755 config/session-desktop "$(DESTDIR)/usr/lib/niri-rdp/session-desktop"
 	install -Dm755 config/session-portals "$(DESTDIR)/usr/lib/niri-rdp/session-portals"
+	install -Dm755 config/session-environment "$(DESTDIR)/usr/lib/niri-rdp/session-environment"
+	install -Dm755 config/session-autostart "$(DESTDIR)/usr/lib/niri-rdp/session-autostart"
 	install -Dm644 config/niri-rdp-portals.conf "$(DESTDIR)/usr/share/xdg-desktop-portal/niri-rdp-portals.conf"
 	install -Dm644 config/niri-rdp.pam "$(DESTDIR)/etc/pam.d/niri-rdp"
 	install -Dm644 config/headless.kdl "$(DESTDIR)/etc/niri-rdp/headless.kdl"

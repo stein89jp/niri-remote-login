@@ -1,7 +1,7 @@
-# Uninstall from the separate test machine
+# Uninstall the Arch remote desktop host
 
-Disconnect the test RDP client first. These commands affect the test installation
-only; no uninstaller runs automatically on the working host.
+Save your remote desktop work, then run these commands from a local terminal or
+an independent SSH session. Stopping the services ends the remote desktop.
 
 ```sh
 sudo systemctl disable --now niri-rdp-frontend.service
@@ -13,7 +13,7 @@ sudo systemctl daemon-reload
 
 Verify no `niri-rdp` logind session, compositor, frontend or port 33991 listener
 remains. If broker cleanup failed, inspect the session's service, UID and leader
-before terminating **that specific niri-rdp test session** with
+before terminating **that specific niri-rdp session** with
 `sudo loginctl terminate-session SESSION_ID`. Do not terminate GNOME sessions.
 
 Pacman preserves changed configuration as `.pacsave`; inspect it before removal.
@@ -34,3 +34,5 @@ For the legacy split installation, also remove `niri-rdp-headless` after removin
 Stock Niri, GNOME Remote Login, GDM, their PAM files and system settings are
 untouched by these packages. No replacement of stock Niri is required for either
 installation or removal.
+Your Niri configuration, input-method profiles, `environment.d`, and XDG autostart
+entries are preserved and reused when you reinstall.

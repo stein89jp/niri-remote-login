@@ -65,7 +65,10 @@ starts its private audio services. See the [audio contract](../bridge/README.md#
 
 The compositor installs at `/usr/lib/niri-rdp/niri-headless`, alongside stock
 `/usr/bin/niri`. It launches a separate remote desktop. It does not share your
-existing local desktop or import its Niri configuration.
+existing local desktop. It reuses the account's usual Niri configuration,
+configured input-method environment, and XDG autostart entries on a private
+display and bus. An optional `~/.config/niri-rdp/config.kdl` overrides the usual
+Niri configuration.
 
 **An account cannot have an existing local X11/Wayland session when it logs in
 remotely.** If you authorize your current user, log out of that user's local
@@ -186,7 +189,8 @@ monitor tests are tracked in [acceptance](acceptance.md).
 Configuration priority is `~/.config/niri-rdp/config.kdl`, then your usual
 `~/.config/niri/config.kdl`, then `/etc/niri-rdp/headless.kdl`. `XDG_CONFIG_HOME`
 is honored when set. Each selected configuration is included by a temporary
-wrapper that starts the private desktop portal after Niri creates its display.
+wrapper that starts the private desktop portal and ordinary XDG autostart after
+Niri creates its display.
 For your usual configuration, the wrapper also keeps `HEADLESS-1` at scale 1 with
 normal orientation and supplies a private bar startup helper. Physical output
 settings do not apply to this virtual output.
@@ -210,6 +214,30 @@ was available, without starting unused backends. It does not change application
 configuration directories or Firefox's download preferences.
 Upgrading fixes newly created remote sessions; reconnecting to
 a preserved session retains its old startup environment until that session logs out.
+
+### Input methods and keyboard layouts
+
+The worker carries the account's configured input-method, keyboard, and locale
+settings from its user environment and `environment.d` into the remote desktop.
+The selected Niri configuration can override them as usual. No input framework
+or module is selected automatically.
+
+The remote desktop runs the same XDG autostart entries under `~/.config/autostart/`
+and the system XDG configuration directories, honoring user overrides and disabled
+entries. Input frameworks such as Fcitx5 and IBus start through that normal path
+or your existing Niri startup commands, using their usual profiles. D-Bus
+activation receives the remote display before startup applications launch.
+The private bus and display remain session-specific; shared user systemd services
+are not restarted or given the remote display.
+
+The RDP bridge takes its physical keyboard map from Niri, including your configured
+layouts, variants, and options. It preserves layout switching and updates when
+Niri's keyboard configuration changes. On a fresh installation, keep your usual
+Niri, input-method, environment, and autostart configuration. No Niri-RDP-specific
+language configuration is required.
+
+Log out and start a fresh remote login after upgrading startup settings; a
+reconnect preserves the running desktop and its environment.
 
 Review `/etc/niri-rdp/frontend.conf`, `/etc/niri-rdp/headless.kdl`,
 `/etc/niri-rdp/waybar.json`, `/etc/niri-rdp/renderer.conf`, and

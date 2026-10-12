@@ -7,6 +7,7 @@ from pathlib import Path
 import subprocess
 import shutil
 import tempfile
+import time
 import unittest
 from unittest.mock import patch
 
@@ -29,9 +30,100 @@ desktop_loader.exec_module(desktop)
 portals_loader = SourceFileLoader("session_portals", str(ROOT / "broker/config/session-portals"))
 portals = importlib.util.module_from_spec(importlib.util.spec_from_loader(portals_loader.name, portals_loader))
 portals_loader.exec_module(portals)
+autostart_loader = SourceFileLoader("session_autostart", str(ROOT / "broker/config/session-autostart"))
+autostart = importlib.util.module_from_spec(importlib.util.spec_from_loader(autostart_loader.name, autostart_loader))
+autostart_loader.exec_module(autostart)
 
 
 class HostSetupTests(unittest.TestCase):
+    def test_generic_activation_preserves_configured_input_method_and_private_transport(self):
+        for module in ("fcitx", "ibus"):
+            environment = {"XDG_RUNTIME_DIR": "/private/remote", "WAYLAND_DISPLAY": "wayland-1",
+                           "DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus", "QT_IM_MODULE": module,
+                           "GTK_IM_MODULE": module, "XMODIFIERS": "@im=" + module}
+            with patch.object(autostart.subprocess, "run") as update:
+                autostart.activation_environment(environment)
+                arguments = update.call_args.args[0]
+                self.assertNotIn("--systemd", arguments)
+                self.assertIn("QT_IM_MODULE=" + module, arguments)
+                self.assertIn("GTK_IM_MODULE=" + module, arguments)
+                self.assertIn("WAYLAND_DISPLAY=wayland-1", arguments)
+                self.assertEqual(update.call_args.kwargs["env"], environment)
+
+    def test_generic_autostart_honors_overrides_and_launches_on_private_environment(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            user = directory / "user/autostart"
+            system = directory / "system/autostart"
+            user.mkdir(parents=True)
+            system.mkdir(parents=True)
+            probe = directory / "probe with spaces.py"
+            probe.write_text("import json, os, sys\nfrom pathlib import Path\n"
+                             "Path(sys.argv[1]).write_text(json.dumps({key: os.environ.get(key) for key in "
+                             "('QT_IM_MODULE', 'XDG_RUNTIME_DIR', 'WAYLAND_DISPLAY', 'DBUS_SESSION_BUS_ADDRESS')}))\n")
+            def entry(name, extra="", location=system):
+                output = directory / (name + ".json")
+                (location / (name + ".desktop")).write_text(
+                    '[Desktop Entry]\nType=Application\nName=Probe\nExec=/usr/bin/python3 "' +
+                    str(probe) + '" "' + str(output) + '"\n' + extra)
+                return output
+            allowed = entry("configured-framework", "NoDisplay=true\nOnlyShowIn=niri;\n")
+            suppressed = [entry("overridden"), entry("other-desktop", "OnlyShowIn=GNOME;\n"),
+                          entry("disabled", "X-GNOME-Autostart-enabled=false\n"),
+                          entry("systemd-skip", "X-systemd-skip=true\n"),
+                          entry("missing-program", "TryExec=/missing/input-method\n")]
+            entry("overridden", "Hidden=true\n", location=user)
+            environment = dict(os.environ, HOME=str(directory), XDG_CONFIG_HOME=str(user.parent),
+                               XDG_CONFIG_DIRS=str(system.parent), XDG_CURRENT_DESKTOP="niri",
+                               QT_IM_MODULE="ibus", XDG_RUNTIME_DIR="/private/remote",
+                               WAYLAND_DISPLAY="wayland-1", DBUS_SESSION_BUS_ADDRESS="unix:path=/private/bus")
+            with patch.dict(os.environ, environment, clear=True):
+                autostart.launch_entries(environment)
+            deadline = time.monotonic() + 3
+            while not allowed.exists() and time.monotonic() < deadline:
+                time.sleep(0.02)
+            self.assertTrue(allowed.exists())
+            self.assertEqual(json.loads(allowed.read_text()), {key: environment[key] for key in
+                             ("QT_IM_MODULE", "XDG_RUNTIME_DIR", "WAYLAND_DISPLAY", "DBUS_SESSION_BUS_ADDRESS")})
+            self.assertFalse(any(output.exists() for output in suppressed))
+
+    def test_generic_autostart_preparation_and_single_launch_require_private_session(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            environment = {"NIRI_RDP_RUNTIME_DIR": temporary, "XDG_RUNTIME_DIR": temporary,
+                           "WAYLAND_DISPLAY": "wayland-1", "DBUS_SESSION_BUS_ADDRESS": "unix:path=/private/bus"}
+            with patch.dict(os.environ, environment, clear=True), \
+                    patch.object(autostart, "activation_environment") as update, \
+                    patch.object(autostart, "launch_entries") as launch, \
+                    patch.object(autostart.sys, "argv", ["session-autostart", "--prepare"]):
+                autostart.main()
+                update.assert_called_once_with(environment)
+                launch.assert_not_called()
+            with patch.dict(os.environ, environment, clear=True), \
+                    patch.object(autostart, "activation_environment"), \
+                    patch.object(autostart, "launch_entries") as launch, \
+                    patch.object(autostart.sys, "argv", ["session-autostart"]):
+                autostart.main()
+                autostart.main()
+                launch.assert_called_once_with(environment)
+            for changes in ({"XDG_RUNTIME_DIR": "/run/user/1000"}, {"WAYLAND_DISPLAY": ""},
+                            {"DBUS_SESSION_BUS_ADDRESS": ""}):
+                with patch.dict(os.environ, dict(environment, **changes), clear=True), \
+                        patch.object(autostart, "activation_environment") as update:
+                    with self.assertRaises(RuntimeError):
+                        autostart.main()
+                    update.assert_not_called()
+
+    def test_autostart_empty_or_relative_config_home_uses_account_default(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary) / ".config/autostart"
+            directory.mkdir(parents=True)
+            entry = directory / "configured.desktop"
+            entry.touch()
+            for value in ("", "relative/path"):
+                entries = list(autostart.autostart_entries({"HOME": temporary, "XDG_CONFIG_HOME": value,
+                                                          "XDG_CONFIG_DIRS": "relative/system"}))
+                self.assertEqual(entries, [entry])
+
     def test_portal_startup_exports_only_private_activation_environment(self):
         environment = {"NIRI_RDP_RUNTIME_DIR": "/private/remote",
                        "XDG_RUNTIME_DIR": "/private/remote", "WAYLAND_DISPLAY": "wayland-1",
@@ -190,7 +282,8 @@ class HostSetupTests(unittest.TestCase):
             self.assertEqual(sleep.call_count, 20)
             execute.assert_called_once_with("dms", ["dms", "run"])
 
-    def run_worker(self, policy, remote_config=False, custom_config_home=False, desktop_config=False):
+    def run_worker(self, policy, remote_config=False, custom_config_home=False, desktop_config=False,
+                   input_environment=None):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)
             config = directory / "renderer.conf"
@@ -202,6 +295,7 @@ class HostSetupTests(unittest.TestCase):
                                  'export NIRI_TEST_WRAPPER="$(cat "$2")"\nfi\nexec /usr/bin/env\n')
             executable.chmod(0o755)
             worker = (ROOT / "broker/config/session-worker").read_text()
+            worker = "set -- --environment-ready\n" + worker
             worker = worker.replace("/etc/niri-rdp/renderer.conf", str(config))
             worker = worker.replace("/usr/lib/niri-rdp/session-audio &", "true &")
             worker = worker.replace('while [ ! -S "$NIRI_RDP_RUNTIME_DIR/audio-0" ]; do', 'while false; do')
@@ -211,6 +305,9 @@ class HostSetupTests(unittest.TestCase):
                                DISPLAY=":0", WAYLAND_DISPLAY="local-wayland",
                                LIBGL_ALWAYS_SOFTWARE="1", GALLIUM_DRIVER="llvmpipe")
             environment.pop("XDG_CONFIG_HOME", None)
+            for key in ("XMODIFIERS", "QT_IM_MODULE", "GTK_IM_MODULE"):
+                environment.pop(key, None)
+            environment.update(input_environment or {})
             config_home = directory / ("custom config" if custom_config_home else ".config")
             if custom_config_home:
                 environment["XDG_CONFIG_HOME"] = str(config_home)
@@ -230,6 +327,22 @@ class HostSetupTests(unittest.TestCase):
             if desktop_config:
                 self.assertEqual(desktop.read_text(), 'binds { Mod+D { spawn "fuzzel"; } }\n')
             return result
+
+    def test_worker_wires_generic_autostart_for_every_config_without_framework_defaults(self):
+        for configs in ({}, {"desktop_config": True}, {"remote_config": True}):
+            with self.subTest(configs=configs):
+                result = self.run_worker("auto", **configs)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn('spawn-at-startup "/usr/lib/niri-rdp/session-autostart"', result.stdout)
+                environment = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+                self.assertNotIn("QT_IM_MODULE", environment)
+                self.assertNotIn("XMODIFIERS", environment)
+        for module in ("fcitx", "ibus"):
+            settings = {"QT_IM_MODULE": module, "XMODIFIERS": "@im=" + module}
+            result = self.run_worker("auto", input_environment=settings)
+            environment = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+            for key, value in settings.items():
+                self.assertEqual(environment[key], value)
 
     def test_worker_selects_explicit_remote_config_without_importing_local_config(self):
         for custom in (False, True):

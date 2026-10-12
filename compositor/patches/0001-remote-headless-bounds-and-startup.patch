@@ -547,6 +547,36 @@ index 65a9ca61..e3140db4 100644
                  let modified = keysym.modified_sym();
                  let raw = keysym.raw_latin_sym_or_raw_current_sym();
                  let modifiers = modifiers_from_state(*mods);
+diff --git a/src/main.rs b/src/main.rs
+index 30f13c79..c9bd5c2a 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -221,6 +221,25 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+         env::remove_var("DISPLAY");
+     }
+
++    // Private remote sessions must publish their activation environment before
++    // startup applications can activate an input method or desktop service.
++    if headless && env::var_os("NIRI_RDP_RUNTIME_DIR").is_some() {
++        let mut setup = std::process::Command::new("/usr/lib/niri-rdp/session-autostart");
++        setup.arg("--prepare");
++        for variable in &CHILD_ENV.read().unwrap().0 {
++            if let Some(value) = &variable.value {
++                setup.env(&variable.name, value);
++            } else {
++                setup.env_remove(&variable.name);
++            }
++        }
++        match setup.status() {
++            Ok(status) if status.success() => {}
++            Ok(status) => warn!("private desktop activation preparation failed: {status}"),
++            Err(error) => warn!("could not prepare private desktop activation: {error}"),
++        }
++    }
++
+     if cli.session {
+         // We're starting as a session. Import our variables.
+         import_environment();
 diff --git a/src/niri.rs b/src/niri.rs
 index a65e36cb..01a7cd0f 100644
 --- a/src/niri.rs
@@ -619,7 +649,7 @@ diff --git a/src/protocols/virtual_keyboard.rs b/src/protocols/virtual_keyboard.
 new file mode 100644
 --- /dev/null
 +++ b/src/protocols/virtual_keyboard.rs
-@@ -0,0 +1,227 @@
+@@ -0,0 +1,278 @@
 +//! Route virtual keyboard events through Niri's normal input handling.
 +//!
 +//! The pinned Smithay implementation writes directly to wl_keyboard, bypassing
@@ -655,7 +685,8 @@ new file mode 100644
 +#[derive(Default)]
 +pub struct KeyboardData {
 +    initialized: Mutex<bool>,
-+    original_keymap: Mutex<Option<String>>,
++    original_keymap: Mutex<Option<(String, ModifiersState)>>,
++    installed_keymap: Mutex<Option<String>>,
 +    pressed: Mutex<BTreeSet<u32>>,
 +}
 +
@@ -754,11 +785,44 @@ new file mode 100644
 +                    // SAFETY: only an owned String leaves the locked XKB context.
 +                    unsafe { current.keymap() }.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
 +                });
++                // The bridge inherits this seat's map. An identical initial
++                // map must not reset its selected layout or lock state.
++                if text == original {
++                    *data.initialized.lock().unwrap() = true;
++                    return;
++                }
++                let original_modifiers = keyboard.modifier_state();
++                let restore = data
++                    .original_keymap
++                    .lock()
++                    .unwrap()
++                    .as_ref()
++                    .filter(|(saved, _)| saved == &text)
++                    .map(|(_, mods)| *mods);
 +                if keyboard.set_keymap_from_string(state, text).is_err() {
 +                    resource.post_error(0u32, "invalid XKB virtual keyboard keymap");
 +                    return;
 +                }
-+                data.original_keymap.lock().unwrap().get_or_insert(original);
++                let installed = keyboard.with_xkb_state(state, |context| {
++                    let current = context.xkb().lock().unwrap();
++                    unsafe { current.keymap() }.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
++                });
++                if let Some(mods) = restore {
++                    keyboard.set_modifier_state(mods);
++                    keyboard.with_xkb_state(state, |mut context| {
++                        context.set_layout(Layout(mods.serialized.layout_effective));
++                    });
++                    data.original_keymap.lock().unwrap().take();
++                    data.installed_keymap.lock().unwrap().take();
++                } else {
++                    let mut saved = data.original_keymap.lock().unwrap();
++                    let mut last = data.installed_keymap.lock().unwrap();
++                    // A configuration reload supersedes an earlier baseline.
++                    if saved.is_none() || last.as_ref() != Some(&original) {
++                        *saved = Some((original, original_modifiers));
++                    }
++                    *last = Some(installed);
++                }
 +                *data.initialized.lock().unwrap() = true;
 +            }
 +            zwp_virtual_keyboard_v1::Request::Key {
@@ -797,7 +861,7 @@ new file mode 100644
 +                mods_depressed,
 +                mods_latched,
 +                mods_locked,
-+                group,
++                group: _,
 +            } => {
 +                if !*data.initialized.lock().unwrap() {
 +                    resource.post_error(
@@ -808,6 +872,9 @@ new file mode 100644
 +                }
 +                // Interpret the wire masks with the same map as key events. Keep
 +                // the XKB ref-counts local to the locked compositor context.
++                // The remote client's XKB state cannot observe a layout switch
++                // made by compositor bindings. Keep Niri's selected group.
++                let group = keyboard.modifier_state().serialized.layout_effective;
 +                let mods = keyboard.with_xkb_state(state, |context| {
 +                    let current = context.xkb().lock().unwrap();
 +                    // SAFETY: the temporary state is dropped before current.
@@ -839,10 +906,24 @@ new file mode 100644
 +        for key in std::mem::take(&mut *data.pressed.lock().unwrap()) {
 +            state.on_keyboard_key((key + 8).into(), KeyState::Released, 0, &mut false);
 +        }
-+        if let Some(original) = data.original_keymap.lock().unwrap().take() {
++        if let Some((original, mods)) = data.original_keymap.lock().unwrap().take() {
 +            let keyboard = state.niri.seat.get_keyboard().unwrap();
++            let current = keyboard.with_xkb_state(state, |context| {
++                let xkb = context.xkb().lock().unwrap();
++                unsafe { xkb.keymap() }.get_as_string(xkb::KEYMAP_FORMAT_TEXT_V1)
++            });
++            // A later configuration reload belongs to the desktop. Only undo
++            // a map which this virtual device still owns (e.g. interrupted text).
++            if data.installed_keymap.lock().unwrap().as_ref() != Some(&current) {
++                return;
++            }
 +            if let Err(err) = keyboard.set_keymap_from_string(state, original) {
 +                warn!("could not restore seat keymap after remote keyboard disconnect: {err:?}");
++            } else {
++                keyboard.set_modifier_state(mods);
++                keyboard.with_xkb_state(state, |mut context| {
++                    context.set_layout(Layout(mods.serialized.layout_effective));
++                });
 +            }
 +        }
 +    }

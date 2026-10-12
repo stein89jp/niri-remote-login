@@ -1,0 +1,150 @@
+#!/usr/bin/python3
+"""Reuse configured input and locale settings before starting the private desktop."""
+import json
+import os
+from pathlib import Path
+import re
+import shlex
+import subprocess
+import sys
+
+
+WORKER = "/usr/lib/niri-rdp/session-worker"
+GENERATOR = "/usr/lib/systemd/user-environment-generators/30-systemd-environment-d-generator"
+SETTINGS = {
+    "LANG", "LANGUAGE", "INPUT_METHOD", "XMODIFIERS", "QT_IM_MODULE",
+    "QT_IM_MODULES", "GTK_IM_MODULE", "SDL_IM_MODULE", "CLUTTER_IM_MODULE",
+    "GLFW_IM_MODULE", "XDG_CONFIG_HOME", "XDG_CONFIG_DIRS", "XDG_DATA_HOME",
+    "XDG_DATA_DIRS", "XDG_CACHE_HOME",
+}
+VARIABLE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*\Z")
+ESCAPES = dict(zip('abfnrtv\\\"\'$`', '\a\b\f\n\r\t\v\\\"\'$`'))
+
+
+def selected(name):
+    return bool(VARIABLE.fullmatch(name)) and (
+        name in SETTINGS or name.startswith(("LC_", "XKB_")))
+
+
+def decode_generator_value(value):
+    # systemd emits shell_maybe_quote(value, 0): either the unchanged value or
+    # double quotes with escaped shell punctuation and C/octal control bytes.
+    # Treat every character as data; never execute shell expansions.
+    if not value.startswith('"'):
+        if any(char.isspace() or char in '\\"\0' for char in value):
+            raise ValueError("invalid unquoted generator value")
+        return value
+    if len(value) < 2 or not value.endswith('"'):
+        raise ValueError("unterminated generator value")
+    value = value[1:-1]
+    result = bytearray()
+    index = 0
+    while index < len(value):
+        char = value[index]
+        if char == '"':
+            raise ValueError("unexpected generator quote")
+        if char != "\\":
+            result.extend(os.fsencode(char))
+            index += 1
+            continue
+        index += 1
+        if index == len(value):
+            raise ValueError("incomplete generator escape")
+        escape = value[index]
+        if escape in ESCAPES:
+            result.extend(os.fsencode(ESCAPES[escape]))
+            index += 1
+        elif (len(value[index:index + 3]) == 3 and
+              all(char in "01234567" for char in value[index:index + 3])):
+            number = int(value[index:index + 3], 8)
+            if number > 255:
+                raise ValueError("invalid generator octal escape")
+            result.append(number)
+            index += 3
+        else:
+            raise ValueError("unknown generator escape")
+    decoded = os.fsdecode(bytes(result))
+    if "\0" in decoded:
+        raise ValueError("invalid generator NUL")
+    return decoded
+
+
+def generator_settings(output):
+    settings = {}
+    for line in output.splitlines():
+        name, separator, value = line.partition("=")
+        if separator and selected(name):
+            settings[name] = decode_generator_value(value)
+    return settings
+
+
+def locale_settings(path=Path("/etc/locale.conf")):
+    # locale.conf is assignments without shell expansion. A local login manager
+    # normally supplies these; the broker starts with its own C.UTF-8 default.
+    try:
+        assignments = shlex.split(path.read_text(), comments=True)
+    except (OSError, ValueError):
+        return {}
+    settings = {}
+    for assignment in assignments:
+        name, separator, value = assignment.partition("=")
+        if separator and selected(name) and (name == "LANG" or name.startswith("LC_")):
+            settings[name] = value
+    return settings
+
+
+def manager_settings(environment):
+    runtime = environment.get("XDG_RUNTIME_DIR", "")
+    if not runtime or not Path(runtime).is_absolute():
+        return {}
+    try:
+        result = subprocess.run([
+            "/usr/bin/busctl", "--address=unix:path=" + runtime + "/bus",
+            "--timeout=2", "--json=short", "get-property",
+            "org.freedesktop.systemd1", "/org/freedesktop/systemd1",
+            "org.freedesktop.systemd1.Manager", "Environment",
+        ], env=environment, capture_output=True, text=True,
+            errors="surrogateescape", check=True, timeout=3)
+        reply = json.loads(result.stdout)
+        if reply.get("type") != "as" or not isinstance(reply.get("data"), list):
+            return {}
+        settings = {}
+        for assignment in reply["data"]:
+            if not isinstance(assignment, str):
+                return {}
+            name, separator, value = assignment.partition("=")
+            if separator and selected(name) and "\0" not in value:
+                settings[name] = value
+        return settings
+    except (OSError, subprocess.SubprocessError, ValueError, AttributeError):
+        # A local graphical login need not exist. environment.d remains usable.
+        return {}
+
+
+def session_environment(environment):
+    result = dict(environment)
+    result.update(locale_settings())
+    result.update(manager_settings(environment))
+    try:
+        generated = subprocess.run([GENERATOR], env=result, capture_output=True,
+                                   text=True, errors="surrogateescape",
+                                   check=True, timeout=5)
+        result.update(generator_settings(generated.stdout))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        # Do not print environment contents: even ignored settings may be secret.
+        print("niri-rdp: could not import environment.d settings", file=sys.stderr)
+    return result
+
+
+def main():
+    if sys.argv[1:] != [WORKER, "--environment-ready"]:
+        raise RuntimeError("session-environment requires the fixed session worker")
+    if os.geteuid() == 0:
+        raise RuntimeError("session-environment must run as the authenticated user")
+    if not os.environ.get("NIRI_RDP_RUNTIME_DIR"):
+        raise RuntimeError("broker private session directory missing")
+    os.execve(WORKER, sys.argv[1:], session_environment(os.environ))
+
+
+if __name__ == "__main__":
+    main()

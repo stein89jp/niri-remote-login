@@ -52,6 +52,10 @@ a fixed mask, never the secret or its length. Disconnect cancels access to a
 pending desktop binding and releases its lease; a desktop already created by the
 broker remains available for authenticated resume. The display/input adapters switch to the
 real desktop after successful login, including optional NVENC and live resizing.
+Desktop keyboard input uses the authenticated compositor's existing XKB map,
+including layouts, model, variants and options. The bridge observes later map
+changes instead of imposing a Japanese map, and remote modifier synchronization
+preserves the compositor's active layout group.
 The login form uses the same negotiated graphics wrapper as the desktop and
 repaints once per second while waiting for input, so late client surface setup
 or graphics negotiation does not leave a static black screen. The initial

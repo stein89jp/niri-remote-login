@@ -54,6 +54,11 @@ Super+Enter for a terminal and Super+D for Fuzzel. An optional
 See [upgrade instructions](docs/upgrade.md) for existing remote overrides and
 `headless.kdl.pacnew` files.
 
+The remote desktop inherits the host's configured input-method and locale
+settings and runs the account's ordinary XDG autostart entries on its private
+display and bus. It uses Niri's keyboard map rather than forcing a layout.
+Existing Fcitx5, IBus, and other configured input methods keep their usual setup.
+
 This remains **experimental**. Disposable Niri/RDP integration has demonstrated
 changing application frames, keyboard/pointer input, authentication rejection,
 reconnect, and cleanup. Real installed PAM/logind login, cold boot, Windows
