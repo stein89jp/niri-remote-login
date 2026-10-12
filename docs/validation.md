@@ -1,5 +1,51 @@
 # Validation record
 
+## mstsc static and PCM preference, 2026-10-12
+
+The user reported unintelligible static in a live Windows 10 `mstsc.exe`
+session, after the large audio/video delay had improved. The installed package
+was `niri-remote-login 0.1.0-15`; its frontend journal at 13:21:30 JST identifies
+`RDP audio MS ADPCM: 48 kHz stereo, 388 kbps, 21.08 ms blocks`. The existing
+FFmpeg roundtrip fixture does not establish compatibility with mstsc's playback
+decoder. The exact cause within that compressed playback path is not isolated.
+
+Release 16 prefers the existing 48 kHz stereo S16LE PCM format whenever the
+client accepts it, including when ADPCM appears first in the client's list.
+ADPCM remains available for clients accepting only that offered format. PCM
+uses 20 ms blocks and about 1.54 Mbit/s before framing; all existing pacing,
+bounded capture, receipt-credit and playback-feedback controls still apply.
+
+The new regression fails under the old preference and passes after the change.
+It checks exact signed stereo samples and the client's PCM format index on
+both version 6 WaveInfo/Wave and version 8 Wave2 packets, including the older
+format's four-byte sample prefix. All 15 bridge audio tests passed, including
+healthy batching, nine-second playback backlog, wrapping and disconnect cleanup.
+The actual mstsc listening and lip-sync checks remain in
+[acceptance.md](acceptance.md). No running service was restarted during development.
+
+`make check BRIDGE_CARGO_HOME="$PWD/poc/.cargo-cache"` passed outside the
+sandbox: 71 Python tests (two opt-in checks skipped), five PoC Rust tests,
+four startup checks, all 12 native broker groups, 81 bridge library tests and
+the frontend lifecycle test. The private PipeWire fixture now verifies stereo
+alignment and that over 90% of a steady capture window's energy is the played
+440 Hz tone, instead of accepting any loud samples. Capture/reconnect and codec
+checks passed. The initial sandbox run failed because it denied the private
+D-Bus sockets; its log is retained alongside the successful host run in
+`artifacts/audio-static-fix/`. Rust formatting and whitespace checks passed.
+Clippy completed with the five existing login/Wayland warnings and no audio
+warnings. The combined release 16 package passed its required checks, including
+three headless and five protocol regressions, 81 bridge library tests, the
+frontend lifecycle test, all 12 broker groups and 63 Python tests (one opt-in
+hardware check skipped). Package structure/preservation validation passed and
+extracted it into `artifacts/audio-static-fix/package-root/`. Build reports are
+in that evidence directory; the installable archive is
+`packaging/arch/niri-rdp/niri-remote-login-0.1.0-16-x86_64.pkg.tar.zst`.
+
+The authorized installation attempt stopped at `sudo: a password is required`,
+before pacman or the frontend restart ran. The active session therefore still
+uses release 15 until the user installs the archive and restarts the frontend.
+No broker restart is needed for this frontend-only preference change.
+
 ## Audio playback feedback and Fcitx5, 2026-10-12
 
 Release `0.1.0-15` fixes two audio feedback errors: a receipt confirmation with a

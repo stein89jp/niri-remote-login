@@ -275,11 +275,13 @@ impl SoundServerFactory for Factory {
                 error
             })
             .ok();
-        let mut formats = Vec::new();
+        // mstsc advertises this ADPCM layout but real playback can become
+        // static. Prefer PCM until compressed playback is validated there;
+        // flow control and bounded capture keep either format low-latency.
+        let mut formats = vec![pcm_format()];
         if let Some(encoder) = &encoder {
             formats.push(encoder.format.clone());
         }
-        formats.push(pcm_format());
         Box::new(Backend {
             audio: self.audio.clone(),
             sender: self.sender.clone().expect("sound factory sender"),
@@ -482,6 +484,17 @@ mod tests {
         RdpsndServer,
         tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
     ) {
+        negotiate_version(audio, formats, Version::V8)
+    }
+
+    fn negotiate_version(
+        audio: &Audio,
+        formats: Vec<AudioFormat>,
+        version: Version,
+    ) -> (
+        RdpsndServer,
+        tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
+    ) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut factory = audio.factory();
         factory.set_sender(sender);
@@ -489,7 +502,7 @@ mod tests {
         server.start().unwrap();
         for pdu in [
             ClientAudioOutputPdu::AudioFormat(ClientAudioFormatPdu {
-                version: Version::V8,
+                version,
                 flags: AudioFormatFlags::ALIVE,
                 formats,
                 volume_left: u16::MAX,
@@ -515,10 +528,78 @@ mod tests {
     }
 
     #[test]
-    fn negotiated_adpcm_prefers_compact_audio_with_pcm_fallback() {
+    fn pcm_preferred_over_adpcm_preserves_signed_stereo_on_both_wave_versions() {
+        for version in [Version::V6, Version::V8] {
+            let audio = Audio::default();
+            let adpcm = Adpcm::new().unwrap().format.clone();
+            let mut unsupported = pcm();
+            unsupported.n_samples_per_sec = 44100;
+            let (mut server, mut receiver) =
+                negotiate_version(&audio, vec![adpcm, unsupported, pcm()], version);
+            assert!(server.is_ready());
+            let (mut source, capture) = UnixStream::pair().unwrap();
+            source
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            audio.attach(Some(capture));
+            source.read_exact(&mut [0]).unwrap();
+            // Distinct signed channels and nonzero first samples also check the
+            // four-byte prefix split in the older WaveInfo/Wave wire format.
+            let expected: Vec<u8> = (0..BLOCK_BYTES / 4)
+                .flat_map(|frame| {
+                    let left = ((-30000 + frame as i32 * 31) as i16).to_le_bytes();
+                    let right = ((20000 - frame as i32 * 37) as i16).to_le_bytes();
+                    [left[0], left[1], right[0], right[1]]
+                })
+                .collect();
+            source.write_all(&expected).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let (data, timestamp) = loop {
+                if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                    receiver.try_recv()
+                {
+                    break (data, timestamp);
+                }
+                assert!(Instant::now() < deadline, "expected a 20 ms PCM block");
+                thread::sleep(Duration::from_millis(1));
+            };
+            assert_eq!(
+                data, expected,
+                "PCM must be selected even when ADPCM comes first in the client's list"
+            );
+            let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
+            let bytes = messages[0].encode_unframed_pdu().unwrap();
+            match decode(&bytes).unwrap() {
+                ServerAudioOutputPdu::Wave2(wave) => {
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(wave.format_no, 2);
+                    assert_eq!(wave.data.as_ref(), expected);
+                }
+                ServerAudioOutputPdu::Wave(info) => {
+                    assert_eq!(messages.len(), 2);
+                    assert_eq!(info.format_no, 2);
+                    assert_eq!(usize::from(info.audio_length), expected.len());
+                    let payload = messages[1].encode_unframed_pdu().unwrap();
+                    assert_eq!(payload.len(), expected.len());
+                    assert_eq!(&payload[..4], &[0; 4]);
+                    let mut reconstructed = info.data_prefix.to_vec();
+                    reconstructed.extend_from_slice(&payload[4..]);
+                    assert_eq!(reconstructed, expected);
+                }
+                _ => panic!("expected an audio wave"),
+            }
+            drop(server);
+            assert_eq!(source.read(&mut [0]).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn negotiated_adpcm_used_when_pcm_not_accepted() {
         let audio = Audio::default();
         let format = Adpcm::new().unwrap().format.clone();
-        let (mut server, mut receiver) = negotiate(&audio, vec![pcm(), format.clone()]);
+        let mut unsupported = pcm();
+        unsupported.n_samples_per_sec = 44100;
+        let (mut server, mut receiver) = negotiate(&audio, vec![unsupported, format.clone()]);
         let (mut source, capture) = UnixStream::pair().unwrap();
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
@@ -563,8 +644,7 @@ mod tests {
             0,
             "disconnect must release the encoder and capture FD"
         );
-        // Existing PCM wire/continuity tests exercise the fallback when the
-        // client accepts only PCM, even though the server offered MS ADPCM.
+        // A client accepting only PCM must also remain usable.
         let (server, receiver) = negotiate(&audio, vec![pcm()]);
         assert!(server.is_ready() && receiver.is_empty());
         drop(server);
@@ -574,7 +654,7 @@ mod tests {
     fn adpcm_wire_and_flow_survive_more_than_a_minute_of_both_timestamp_wraps() {
         let audio = Audio::default();
         let mut encoder = Adpcm::new().unwrap();
-        let (mut server, _receiver) = negotiate(&audio, vec![pcm(), encoder.format.clone()]);
+        let (mut server, _receiver) = negotiate(&audio, vec![encoder.format.clone()]);
         let start = Instant::now();
         let pcm = vec![0x35; ADPCM_SAMPLES * 4];
         let mut flow = FlowControl::default();

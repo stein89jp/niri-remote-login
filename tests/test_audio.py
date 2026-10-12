@@ -289,6 +289,21 @@ runpy.run_path(sys.argv[1], run_name="__main__")
                                     data.extend(packet)
                                 values = struct.unpack("<" + "h" * (len(data) // 2), data[:len(data)//2*2])
                                 self.assertGreater(max(map(abs, values)), 1000)
+                                left, right = values[::2], values[1::2]
+                                self.assertEqual(left, right, "identical stereo input must retain channel alignment")
+                                # Loud static also passes the amplitude check. Fit
+                                # the expected tone in the loudest complete window
+                                # to avoid startup silence and playback boundaries.
+                                windows = [left[start:start + 4096]
+                                           for start in range(0, len(left) - 4095, 4096)]
+                                window = max(windows, key=lambda samples: sum(value * value for value in samples))
+                                energy = sum(value * value for value in window)
+                                cosine = sum(value * math.cos(2 * math.pi * 440 * index / 48000)
+                                             for index, value in enumerate(window))
+                                sine = sum(value * math.sin(2 * math.pi * 440 * index / 48000)
+                                           for index, value in enumerate(window))
+                                tone_fraction = 2 * (cosine * cosine + sine * sine) / (len(window) * energy)
+                                self.assertGreater(tone_fraction, 0.9, "monitor must contain the played tone, not noise")
                             finally:
                                 player.terminate()
                                 writer.join(timeout=3)

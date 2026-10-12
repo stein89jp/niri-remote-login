@@ -234,11 +234,13 @@ only a broker-authorized raw PCM descriptor, without access to the user's runtim
 This follows GNOME Remote Login's session-playback model: capture an audio sink
 and send it through RDP ([GNOME implementation](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dvc-audio-playback.c)).
 
-Capture is stereo 48 kHz, signed 16-bit little-endian PCM. The frontend
-automatically prefers MS ADPCM when the client accepts it: independent 1024-byte
-blocks represent 1012 stereo sample frames (21.083 ms), using about 389 kbit/s
-before framing. PCM remains the fallback, using 20 ms blocks and about
-1.54 Mbit/s. No additional audio configuration is required. A client must enable
+Capture is stereo 48 kHz, signed 16-bit little-endian PCM. The frontend prefers
+PCM, using 20 ms blocks and about 1.54 Mbit/s before framing. Windows 10 mstsc
+advertised the MS ADPCM format but produced static during actual playback, so
+compressed audio is no longer preferred merely because it was advertised.
+MS ADPCM remains available if the client does not accept the offered PCM format:
+independent 1024-byte blocks represent 1012 stereo sample frames (21.083 ms),
+using about 389 kbit/s. No additional audio configuration is required. A client must enable
 remote playback and accept one of these formats. No microphone redirection is provided. Audio starts after
 successful Linux authentication, including submission through the login form.
 Disconnect closes capture; authenticated reconnect opens a fresh monitor of the
@@ -263,7 +265,8 @@ Disposable compositor mode has no audio backend.
 `python3 -m unittest tests.test_audio -v` runs real private PipeWire playback,
 captures a tone and repeats after reconnect, and verifies independent ADPCM
 encode/decode blocks with guarded source buffers. Rust tests negotiate both
-formats, decode Wave2 PDUs, verify the client's format index, and check
+formats, verify PCM preference and exact signed stereo samples in both
+WaveInfo/Wave and Wave2 PDUs, verify the client's format index, and check
 backpressure, long playback feedback, timestamp/block wrapping, healthy sample
 continuity and disconnect cleanup. Installed-service and Windows mstsc sound
 playback remain actual-machine acceptance checks.

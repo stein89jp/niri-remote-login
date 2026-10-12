@@ -93,6 +93,16 @@ desktop does not run the new portal startup helper. The installed Niri chooser
 is preserved, with GTK as a fallback; Firefox download preferences are unchanged.
 See [configuration and troubleshooting](install.md#configuration-and-troubleshooting).
 
+Package release 16 prefers PCM audio when both PCM and MS ADPCM are accepted.
+This addresses reported static on Windows 10 mstsc with release 15's automatic
+ADPCM preference. The existing pacing and playback-backlog controls still apply.
+After installing release 16, restart only `niri-rdp-frontend.service` and reconnect
+to negotiate PCM. This drops the RDP connection; the unchanged broker can retain
+the desktop for reconnection within its 45-second grace window. The audio helper
+is unchanged, so this fix does not require logging out or restarting the broker.
+Confirm the new journal entry starts with `RDP audio PCM`, then check speech and
+audio/video delay using the [acceptance procedure](acceptance.md).
+
 The audio pacing and adaptive bitrate changes are included in package release 9.
 Build with `makepkg` (without `-i`) while your remote session remains active.
 Install and restart from a local terminal or an independent SSH session when
