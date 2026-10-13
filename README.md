@@ -134,6 +134,11 @@ python3 -m unittest discover -s tests -v
 integration fixtures live under `scripts/` and `lab/`; they do not start installed
 host services or replace the actual-machine acceptance procedure.
 
+## Author
+Niri Remote Login was created and is maintained by [Rikard Stein](https://github.com/stein89jp).
+
+The original integration code is released under the MIT License. Upstream components retain their respective licenses and copyrights. See [Licensing and Source Availability](docs/licensing.md) for details.
+
 ## License
 
 The [MIT license](LICENSE) covers original integration source. The patched Niri
