@@ -1,23 +1,83 @@
+# Python caches, test reports, and local virtual environments.
 __pycache__/
-*.pyc
-/poc/target/
-/poc/.cargo-cache/
-/poc/private/
-/research/results/
-/bridge/target/
-/bridge/.cargo-cache/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+.venv/
+venv/
+
+# Rust build output and repository-local dependency caches.
+target/
+.cargo-cache/
+/compositor/cargo-home/
+
+# Native build output.
+*.o
+*.obj
+*.a
+*.so
+*.so.*
+*.rlib
+*.rmeta
 /bridge/build/
 /broker/build/
+/broker/niri-rdp-broker
+/broker/broker-tests
+
+# Disposable upstream checkouts, lab fixtures, and validation evidence.
 /compositor/upstream/
-/compositor/.cargo-cache/
-/compositor/cargo-home/
-/compositor/target/
 /lab/sysroot/
 /lab/results/
 /lab/downloads/
 /lab/generated/
 /lab/dynamic-app
-/broker/niri-rdp-broker
-/broker/broker-tests
+/research/results/
 /artifacts/
+# Release downloads are staged locally; publish distributable files as Release assets.
+/releases/
 
+# makepkg products for every Arch recipe; preserve source/release archives elsewhere.
+/packaging/arch/*/src/
+/packaging/arch/*/pkg/
+/packaging/arch/*/repo-*
+/packaging/arch/*/*.tar.*
+/packaging/arch/*/SHA256SUMS
+/packaging/arch/*/SHA256SUMS.sig
+
+# Local runtime identities and environment files; examples may be committed.
+/poc/private/
+/private/
+/tls/
+/.aws/
+*.pem
+*.key
+*.p12
+*.pfx
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+
+# Temporary files, logs, editor backups, and desktop metadata.
+/tmp/
+/temp/
+/.cache/
+*.log
+*.tmp
+*.temp
+*.bak
+*.orig
+*.rej
+*~
+.*.swp
+.*.swo
+.*.swx
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini

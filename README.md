@@ -112,10 +112,11 @@ The separate-package source export is still available:
 python3 scripts/prepare-release.py
 ```
 
-The binary delivery archive under `releases/arch-x86_64/0.1.0/` is a preserved old
-snapshot. It predates resolution support, NVENC, direct listening, automatic TLS
-setup, and the login screen. Use a current release package or source build for
-the workflow above.
+Publish binary packages, matching source bundles, and checksums through GitHub
+Releases. Local release downloads, build caches, package staging trees, and raw
+validation evidence are ignored. Historical checkpoints record earlier source
+inventories and test results; the obsolete 0.1.0 binary delivery is retained in
+Git history.
 
 Run Python tests with:
 

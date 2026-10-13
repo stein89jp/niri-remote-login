@@ -1,5 +1,11 @@
 # Private repository checkpoint — 2026-10-10
 
+Repository cleanup on 2026-10-13 removed the obsolete 0.1.0 delivery archive and
+its checksum from the current source tree. They remain available in Git history.
+The inventory and publication account below are preserved as historical records.
+Current binary packages, matching source bundles, and checksums belong in GitHub
+Releases.
+
 The project now uses Git on branch `main`, with SSH remote
 `git@github.com:stein89jp/niri-remote-login.git`.
 The user created the empty private GitHub repository after SSH authentication
