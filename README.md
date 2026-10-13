@@ -16,10 +16,10 @@ From the directory containing the downloaded package, run:
 
 ```sh
 sudo pacman -Syu
-sudo pacman -U ./niri-remote-login-1.0.0-1-x86_64.pkg.tar.zst
+sudo pacman -U ./niri-remote-login-1.0.2-1-x86_64.pkg.tar.zst
 ```
 
-The example uses version `1.0.0-1`; replace the filename if you downloaded a
+The example uses version `1.0.2-1`; replace the filename if you downloaded a
 different release. Pacman installs the package and its required runtime
 dependencies. Continue with the account authorization and service setup below.
 
