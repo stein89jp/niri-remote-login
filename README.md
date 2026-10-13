@@ -4,6 +4,10 @@ A remote desktop host with a dedicated headless Niri compositor, an IronRDP
 frontend, and a PAM/logind session broker. Install the complete host on an
 up-to-date **Arch Linux x86_64** machine.
 
+This is an **open-source project**. Original integration code is MIT-licensed;
+upstream components retain their respective licenses. See the
+[licensing and source-availability guide](docs/licensing.md).
+
 ## Install a binary release
 
 Download the `niri-remote-login-<version>-<pkgrel>-x86_64.pkg.tar.zst` package
@@ -113,7 +117,9 @@ python3 scripts/prepare-release.py
 ```
 
 Publish binary packages, matching source bundles, and checksums through GitHub
-Releases. Local release downloads, build caches, package staging trees, and raw
+Releases, together with dependency-source information and license notices; see
+[the distribution requirements](docs/licensing.md#maintaining-binary-releases).
+Local release downloads, build caches, package staging trees, and raw
 validation evidence are ignored. Historical checkpoints record earlier source
 inventories and test results; the obsolete 0.1.0 binary delivery is retained in
 Git history.
@@ -127,3 +133,12 @@ python3 -m unittest discover -s tests -v
 `make check` also runs the Rust and broker checks. Disposable transport/desktop
 integration fixtures live under `scripts/` and `lab/`; they do not start installed
 host services or replace the actual-machine acceptance procedure.
+
+## License
+
+The [MIT license](LICENSE) covers original integration source. The patched Niri
+compositor is GPL-3.0-or-later, and IronRDP is MIT OR Apache-2.0. Packaged frontend
+binaries linked to Arch's GPL-enabled FFmpeg require GPL-compliant distribution.
+License texts, third-party notices, matching source bundles, and dependency-source
+links are available with the [release downloads](https://github.com/stein89jp/niri-remote-login/releases).
+See [docs/licensing.md](docs/licensing.md) for component scope and source access.
