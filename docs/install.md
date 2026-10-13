@@ -371,7 +371,11 @@ recent capture samples when the source or network stalls. Recent, validated
 playback feedback can briefly discard capture to let a client buffer drain.
 Optional second confirmations never gate playback; missing replies and old idle
 waves cannot mute sound or continually reduce video quality. Recovery resumes
-consecutive fresh AAC packets after a bounded wait. Recovery may skip sound
+consecutive fresh AAC packets after a bounded wait. Fresh completion feedback
+can recover a backlog longer than one second while the same playback run is
+active and the block number is unambiguous; old-run and reused-number feedback
+cannot restart recovery. Each valid measurement extends recovery by at most
+one second. Recovery may skip sound
 during congestion. No manual delay or
 codec setting is needed. These controls limit accumulating delay; actual mstsc
 audio/video presentation still needs the playback check below.

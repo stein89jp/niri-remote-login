@@ -43,6 +43,17 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+Package release 20 corrects a playback-feedback blind spot: a completion for a
+wave queued longer than one second was discarded even during continuous audio.
+Fresh, unambiguous completions can now trigger bounded backlog recovery, with
+guards against old playback runs and reused block numbers. PCM preference,
+20 ms pacing, zero timestamps, capture bounds and transport credits are unchanged.
+The normal [uninstall](uninstall.md) and NVIDIA [install](install.md) procedures
+build the change; no new settings are needed. Verify speech clarity and growing
+YouTube lip-sync delay after installation using the
+[audio acceptance procedures](acceptance.md). Actual Windows playback with
+release 20 remains pending; simulated queue recovery is not a listening result.
+
 Package release 19 restores PCM preference over AAC and MS ADPCM after Windows
 10 mstsc playback with release 18 produced continuous crackling. It preserves
 release 18's immediate timestamps, capture limits and bounded playback recovery.

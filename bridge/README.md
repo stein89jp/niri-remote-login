@@ -248,11 +248,16 @@ successful Linux authentication, including submission through the login form.
 Disconnect closes capture; authenticated reconnect opens a fresh monitor of the
 retained desktop. At most four waves await receipt confirmation. Optional later
 confirmations provide playback delay measurements; they are never required to
-release a second credit. Only feedback for waves sent within the past second
-can affect playback, and timestamp delays must fit the elapsed time plus a
-300 ms device scheduling allowance. Valid feedback above 300 ms briefly discards
-capture while the queued tail drains. Recovery always expires within a second
-and resumes consecutive fresh packets, allowing AAC to progress beyond priming.
+release a second credit. Fresh completion feedback can describe a wave queued
+for more than a second if the same playback run is still active and its block
+number has not been reused. Feedback from an earlier run, ambiguous reused
+numbers and implausible timestamp delays cannot restart recovery. Timestamp
+delays must fit the elapsed time plus a 300 ms device scheduling allowance.
+Valid feedback above 300 ms briefly discards capture while the queued tail
+drains. Each measurement can extend recovery by at most one second; distinct
+fresh completions can extend the drain, but optional replies never become
+required credits. Recovery expires and resumes consecutive fresh packets,
+allowing AAC to progress beyond priming.
 Missing replies, mixed single/double confirmations and old idle waves cannot
 permanently mute sound or create an ever-growing delay. Later receipt progress
 also retires missing earlier confirmations. Actual audio congestion reduces

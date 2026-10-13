@@ -1,5 +1,85 @@
 # Validation record
 
+## Growing Firefox playback delay and fresh completion feedback, 2026-10-13
+
+The user reported a growing one-to-two-second audio lag during Firefox YouTube
+playback with release 19. Generated still and moving flash/tone clips stayed
+synchronized in VLC through the same Windows mstsc connection. The user
+authorized improvements while preserving the working codecs. The missing Arch
+VLC FFmpeg decoder was diagnosed separately; the user installed VLC plugins,
+and the generated H.264/AAC clips then decoded successfully. Clip source cues
+were verified within one millisecond; that does not measure physical Windows
+presentation latency.
+
+Read-only private audio metadata identified Firefox requesting 3600/48000
+(75 ms) and the S16LE monitor requesting 960/48000 (20 ms). These are requested
+latencies, not actual application or Windows buffer measurements. No session
+audio or video was recorded, and no installed service was restarted.
+
+GNOME Remote Desktop 51.0 at
+`bb44752f785dc93b7dbb437a3d8e1d0205878d66` uses fixed nominal audio codec rates,
+zero playback timestamps and a 300 ms render guard. Its
+[confirmation handler](https://github.com/GNOME/gnome-remote-desktop/blob/bb44752f785dc93b7dbb437a3d8e1d0205878d66/src/grd-rdp-dvc-audio-playback.c#L711)
+ages render measurements from confirmation arrival. Our previous one-second
+filter instead aged the originating wave, discarding genuine two-second
+completion feedback even while audio was being sent continuously. A regression
+with healthy receipt confirmations and delayed playback completion failed
+before the change.
+
+Release 20 admits a delayed completion only when the same playback run is still
+active, its block number has not been reused, the timestamp is plausible and a
+distinct second confirmation identifies completion. A send gap over one second
+starts a new playback epoch. Old-run feedback, ambiguous reused numbers,
+duplicates and clock-like timestamps cannot restart recovery. Optional
+completion replies remain measurements rather than required credits. The
+one-second extension cap applies to each measurement; distinct valid
+completions can extend the total drain, which still expires without a required
+final reply. A simulation of an initial two-second client queue drained to the
+existing 300 ms budget plus one 20 ms block and 3 ms receipt RTT, then sustained
+normal sample cadence with both positive and zero completion timestamps. This
+models backlog recovery and does not establish actual mstsc lip-sync.
+
+The five new regressions cover delayed active completion, prior-run feedback,
+block-number reuse, invalid delayed timestamps and simulated queue drain.
+An independent simulation of the actual FlowControl implementation also passed
+26,000 healthy sends across mixed confirmations, old echoes and clock-like
+timestamps. PCM preference, 48 kHz stereo S16LE, 20 ms pacing, both zero wire
+timestamps, four credits, three capture blocks, 60 ms expiry and AAC continuity
+through ordinary credit waits are unchanged.
+
+A private comparison of GNOME-inspired quantum 256 and 5 ms capture against the
+existing helper showed no useful improvement in 20 ms block availability:
+19.997 versus 19.988 ms mean intervals, 2.305 versus 2.330 ms standard deviation,
+and no gaps above 30 ms. Both retained clean stereo tones during load and
+reconnect; baseline PipeWire already selected quantum 256 during playback.
+Capture configuration therefore remains unchanged.
+
+`make check BRIDGE_CARGO_HOME="$PWD/poc/.cargo-cache"` passed outside the
+socket-restricted sandbox: 72 Python tests (two opt-ins skipped), five PoC Rust
+tests, four startup checks, all 12 native broker groups, 113 bridge library tests
+and the frontend lifecycle test. The 42 audio regressions retain PCM wire-byte
+and credit-wait continuity coverage. Evidence is under
+`artifacts/av-sync-investigation/`, including `check.log`, `stress-flow.log`,
+clip validation and `capture-comparison/results.json`.
+
+Rust formatting and whitespace checks passed. Clippy reports only the five
+existing login/Wayland warnings. The combined `0.1.0-20` package built with
+its required headless/protocol checks, 113 bridge library tests, frontend
+lifecycle test, all 12 native broker groups and 64 Python tests (two opt-ins
+skipped in the package source tree). Structure/preservation validation passed.
+Extracted release binaries passed the private NVENC AVC420 application
+decode/input/reconnect test, TLS login rejection/authentication, JIS input,
+live resize, held-input release and compositor-crash cleanup. Reports are
+`artifacts/av-sync-investigation/package-validation.json` and
+`artifacts/av-sync-investigation/package-integration.json`. The built archive is
+`packaging/arch/niri-rdp/niri-remote-login-0.1.0-20-x86_64.pkg.tar.zst`.
+
+Windows clarity, growing Firefox/YouTube delay, pause/resume and repeated
+reconnect acceptance for release 20 remain pending after the user's manual
+reinstall. The successful release 19 audio combination remains the accepted
+baseline. This fix addresses a reproduced feedback blind spot; the live mstsc
+confirmation pattern and full cause of the user's offset were not measured.
+
 ## Continuous mstsc crackling and PCM playback, 2026-10-12
 
 The user reported that release 18 eliminated the huge sound delay but produced

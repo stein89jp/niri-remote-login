@@ -216,6 +216,7 @@ struct SentWave {
     number: u8,
     timestamp: u16,
     sent_at: Instant,
+    playback_epoch: u64,
     acknowledged: bool,
     first_confirm_at: Option<Instant>,
     feedback_ms: u16,
@@ -233,6 +234,7 @@ struct FlowControl {
     hold_until: Option<Instant>,
     last_warning: Option<Instant>,
     latest_sent: Option<Instant>,
+    playback_epoch: u64,
     receipt_baseline: Option<Duration>,
     last_render_delay: Duration,
 }
@@ -288,11 +290,18 @@ impl FlowControl {
             self.pending -= 1;
         }
         self.pending += 1;
+        if self
+            .latest_sent
+            .is_some_and(|latest| now.saturating_duration_since(latest) > Self::FEEDBACK_WINDOW)
+        {
+            self.playback_epoch = self.playback_epoch.wrapping_add(1);
+        }
         self.latest_sent = Some(now);
         self.recent.push_back(SentWave {
             number,
             timestamp,
             sent_at: now,
+            playback_epoch: self.playback_epoch,
             acknowledged: false,
             first_confirm_at: None,
             feedback_ms: 0,
@@ -376,6 +385,19 @@ impl FlowControl {
         }
         let first_confirm_at = wave.first_confirm_at;
         let elapsed = now.saturating_duration_since(wave.sent_at);
+        // A fresh completion can describe a wave queued for more than a
+        // second. Keep it only while the same audio run is still active and
+        // this block number has not been reused: with zero timestamps, a
+        // newer generation's second echo could otherwise look like old delay.
+        let active_generation = wave.playback_epoch == self.playback_epoch
+            && self.latest_sent.is_some_and(|latest| {
+                now.saturating_duration_since(latest) <= Self::FEEDBACK_WINDOW
+            })
+            && !self
+                .recent
+                .iter()
+                .skip(position + 1)
+                .any(|later| later.number == number);
         let distinct_second = first_confirm_at.is_some_and(|first| {
             now.saturating_duration_since(first) >= Self::DISTINCT_CONFIRM_INTERVAL
         });
@@ -415,7 +437,8 @@ impl FlowControl {
         // permits clients that acknowledge scheduled playback ahead of time.
         // Old echoes can retire history but cannot restart capture recovery.
         let reported = Duration::from_millis(u64::from(held_ms));
-        let reported = if reported <= elapsed + PLAYBACK_BUDGET {
+        let plausible_timestamp = reported <= elapsed + PLAYBACK_BUDGET;
+        let reported = if plausible_timestamp {
             reported
         } else {
             Duration::ZERO
@@ -429,7 +452,9 @@ impl FlowControl {
         // Invalid timestamps must not hide a later valid latency report for
         // this same wave by becoming the highest remembered feedback value.
         wave.feedback_ms = wave.feedback_ms.max(reported.as_millis() as u16);
-        if elapsed > Self::FEEDBACK_WINDOW || render <= wave.feedback_elapsed {
+        let recent_feedback = elapsed <= Self::FEEDBACK_WINDOW
+            || (active_generation && plausible_timestamp && playback_confirmed && distinct_second);
+        if !recent_feedback || render <= wave.feedback_elapsed {
             return;
         }
         wave.feedback_elapsed = render;
@@ -1645,6 +1670,141 @@ mod tests {
         assert!(flow.can_send(start + Duration::from_secs(121)));
         assert!(!flow.check_pressure(start + Duration::from_secs(121)));
         assert!(flow.hold_until.is_none());
+    }
+
+    #[test]
+    fn delayed_playback_feedback_for_active_stream_has_a_bounded_hold() {
+        for timestamp in [0, 2000] {
+            let start = Instant::now();
+            let mut flow = FlowControl::default();
+            // Receipt stays healthy while the client queues two seconds of
+            // playback. The completion report itself is a fresh measurement.
+            for sequence in 0..100u64 {
+                let at = start + Duration::from_millis(sequence * 20);
+                assert!(flow.can_send(at));
+                flow.sent(sequence as u8, 0, at);
+                flow.confirm(sequence as u8, 0, at + Duration::from_millis(3));
+            }
+            let completion = start + Duration::from_millis(2003);
+            flow.confirm(0, timestamp, completion);
+            assert!(flow.check_pressure(completion));
+            assert!(!flow.can_send(completion));
+            assert_eq!(flow.pending, 0, "playback feedback is not a credit");
+            let deadline = flow
+                .hold_until
+                .expect("recent completion must bound backlog");
+            assert_eq!(deadline, completion + FlowControl::FEEDBACK_WINDOW);
+            flow.confirm(0, timestamp, completion + Duration::from_millis(20));
+            assert_eq!(flow.hold_until, Some(deadline));
+            assert!(flow.can_send(deadline));
+            assert!(!flow.check_pressure(deadline));
+            assert!(flow.can_send(start + Duration::from_secs(120)));
+        }
+    }
+
+    #[test]
+    fn delayed_feedback_from_previous_audio_run_cannot_hold_resumed_stream() {
+        for timestamp in [0, 2000] {
+            let start = Instant::now();
+            let mut flow = FlowControl::default();
+            flow.sent(0, 0, start);
+            flow.confirm(0, 0, start + Duration::from_millis(3));
+            let resumed = start + Duration::from_secs(2);
+            flow.sent(1, 0, resumed);
+            flow.confirm(1, 0, resumed + Duration::from_millis(3));
+            flow.confirm(0, timestamp, resumed + Duration::from_millis(10));
+            assert!(flow.can_send(resumed + Duration::from_millis(10)));
+            assert!(!flow.check_pressure(resumed + Duration::from_millis(10)));
+            assert!(flow.hold_until.is_none());
+        }
+    }
+
+    #[test]
+    fn delayed_zero_echo_after_number_reuse_cannot_create_playback_hold() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        for sequence in 0..=256u64 {
+            let at = start + Duration::from_millis(sequence * 20);
+            flow.sent(sequence as u8, 0, at);
+            flow.confirm(sequence as u8, 0, at + Duration::from_millis(3));
+        }
+        let completion = start + Duration::from_millis(5140);
+        flow.confirm(0, 0, completion);
+        assert!(flow.can_send(completion));
+        assert!(!flow.check_pressure(completion));
+        assert!(flow.hold_until.is_none());
+    }
+
+    #[test]
+    fn clock_like_delayed_echo_cannot_create_playback_hold() {
+        let start = Instant::now();
+        let mut flow = FlowControl::default();
+        for sequence in 0..100u64 {
+            let at = start + Duration::from_millis(sequence * 20);
+            flow.sent(sequence as u8, 0, at);
+            flow.confirm(sequence as u8, 0, at + Duration::from_millis(3));
+        }
+        let completion = start + Duration::from_millis(2003);
+        flow.confirm(0, 56301, completion);
+        assert!(flow.can_send(completion));
+        assert!(!flow.check_pressure(completion));
+        assert!(flow.hold_until.is_none());
+    }
+
+    #[test]
+    fn delayed_client_playback_drains_and_recovers_without_required_second_credits() {
+        for reported_timestamp in [false, true] {
+            let start = Instant::now();
+            let mut flow = FlowControl::default();
+            let mut receipts = VecDeque::new();
+            let mut completions = VecDeque::new();
+            let mut sequence = 0u64;
+            let mut client_tail = 1980u64;
+            let mut recovered_waves = 0;
+            for millis in 0..10000u64 {
+                let now = start + Duration::from_millis(millis);
+                while receipts.front().is_some_and(|&(due, _)| due <= millis) {
+                    let (_, number) = receipts.pop_front().unwrap();
+                    flow.confirm(number, 0, now);
+                }
+                while completions
+                    .front()
+                    .is_some_and(|&(due, _, _)| due <= millis)
+                {
+                    let (due, number, sent) = completions.pop_front().unwrap();
+                    let timestamp = if reported_timestamp {
+                        (due - sent) as u16
+                    } else {
+                        0
+                    };
+                    flow.confirm(number, timestamp, now);
+                }
+                if millis % 20 == 0 && flow.can_send(now) {
+                    let number = sequence as u8;
+                    sequence += 1;
+                    flow.sent(number, 0, now);
+                    receipts.push_back((millis + 3, number));
+                    // Real-time rendering starts with a two-second queue.
+                    client_tail = client_tail.max(millis + 3) + 20;
+                    completions.push_back((client_tail, number, millis));
+                    if millis >= 6000 {
+                        assert!(
+                            client_tail - millis <= 323,
+                            "fresh completion must drain playback to its budget plus a block and RTT: {} ms at {} ms",
+                            client_tail - millis,
+                            millis,
+                        );
+                        recovered_waves += 1;
+                    }
+                }
+            }
+            assert!(
+                recovered_waves >= 190,
+                "recovery must restore sample cadence"
+            );
+            assert!(flow.can_send(start + Duration::from_secs(11)));
+            assert!(!flow.check_pressure(start + Duration::from_secs(11)));
+        }
     }
 
     #[test]
