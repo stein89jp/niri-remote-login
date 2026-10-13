@@ -1,14 +1,41 @@
 # Niri Remote Login for Arch Linux
 
 A remote desktop host with a dedicated headless Niri compositor, an IronRDP
-frontend, and a PAM/logind session broker. Install the complete host from one
-build folder on an up-to-date **Arch Linux x86_64** machine:
+frontend, and a PAM/logind session broker. Install the complete host on an
+up-to-date **Arch Linux x86_64** machine.
+
+## Install a binary release
+
+Download the `niri-remote-login-<version>-<pkgrel>-x86_64.pkg.tar.zst` package
+from [GitHub Releases](https://github.com/stein89jp/niri-remote-login/releases).
+From the directory containing the downloaded package, run:
+
+```sh
+sudo pacman -Syu
+sudo pacman -U ./niri-remote-login-1.0.0-1-x86_64.pkg.tar.zst
+```
+
+The example uses version `1.0.0-1`; replace the filename if you downloaded a
+different release. Pacman installs the package and its required runtime
+dependencies. Continue with the account authorization and service setup below.
+
+## Build from source
+
+To build the package yourself instead, run:
 
 ```sh
 sudo pacman -Syu --needed base-devel git
 git clone https://github.com/stein89jp/niri-remote-login.git
 cd niri-remote-login/packaging/arch/niri-rdp
 makepkg -si
+```
+
+## Authorize an account and start the service
+
+After either installation method, authorize your Linux account and enable the
+frontend:
+
+```sh
 sudo usermod -aG niri-rdp-users "$USER"
 sudo systemctl enable --now niri-rdp-frontend.service
 ```
@@ -87,7 +114,8 @@ python3 scripts/prepare-release.py
 
 The binary delivery archive under `releases/arch-x86_64/0.1.0/` is a preserved old
 snapshot. It predates resolution support, NVENC, direct listening, automatic TLS
-setup, and the login screen. Use a current source build for the workflow above.
+setup, and the login screen. Use a current release package or source build for
+the workflow above.
 
 Run Python tests with:
 

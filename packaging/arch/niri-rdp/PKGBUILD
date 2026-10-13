@@ -3,8 +3,8 @@
 # Local inputs are copied and checksum-verified by makepkg, never built in place.
 # Export a portable source bundle with makepkg --allsource.
 pkgname=niri-remote-login
-pkgver=0.1.0
-pkgrel=20
+pkgver=1.0.0
+pkgrel=1
 pkgdesc='Niri remote desktop host with a PAM/logind broker and dedicated headless compositor'
 arch=('x86_64')
 # Niri is GPL-3.0-or-later; the bridge links Arch's GPL-licensed FFmpeg.
