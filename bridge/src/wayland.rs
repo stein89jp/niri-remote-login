@@ -60,6 +60,7 @@ struct CursorSnapshot {
     generation: u64,
     shape: Option<Arc<DisplayUpdate>>,
     position: (u16, u16),
+    position_generation: u64,
     separate: bool,
     visible: bool,
 }
@@ -494,14 +495,18 @@ impl Updates {
             {
                 self.partial.push_back(shape.as_ref().clone());
             }
-            if next.position != self.cursor_previous.position || !self.cursor_previous.separate {
-                self.partial.push_back(DisplayUpdate::PointerPosition(
-                    ironrdp_pdu::pointer::PointerPositionAttribute {
-                        x: next.position.0,
-                        y: next.position.1,
-                    },
-                ));
-            }
+        }
+        // Position PDUs warp the client's local pointer. Only forward a fresh
+        // compositor warp, never a retained position on shape/fallback changes.
+        // A repeated warp to the same coordinate still needs delivery after
+        // intervening client-local motion, hence the independent generation.
+        if next.separate && next.position_generation != self.cursor_previous.position_generation {
+            self.partial.push_back(DisplayUpdate::PointerPosition(
+                ironrdp_pdu::pointer::PointerPositionAttribute {
+                    x: next.position.0,
+                    y: next.position.1,
+                },
+            ));
         }
         self.cursor_previous = next;
     }
@@ -1000,6 +1005,8 @@ impl Dispatch<NiriRdpCursorV1, ()> for State {
                     x.min(u32::from(u16::MAX)) as u16,
                     y.min(u32::from(u16::MAX)) as u16,
                 );
+                s.cursor_snapshot.position_generation =
+                    s.cursor_snapshot.position_generation.wrapping_add(1);
             }
             niri_rdp_cursor_v1::Event::Shape {
                 fd,
@@ -3175,27 +3182,75 @@ pub(crate) mod lifecycle_tests {
         cursor_tx.send_replace(CursorSnapshot {
             generation: 1,
             shape: Some(shape.clone()),
-            position: (10, 20),
             visible: true,
             separate: true,
-        });
-        cursor_tx.send_replace(CursorSnapshot {
-            generation: 2,
-            shape: Some(shape),
-            position: (320, 240),
-            visible: true,
-            separate: true,
+            ..CursorSnapshot::default()
         });
         assert!(matches!(
             updates.next_update().await.unwrap(),
             Some(DisplayUpdate::RGBAPointer(_))
         ));
         assert!(
+            tokio::time::timeout(Duration::from_millis(20), updates.next_update())
+                .await
+                .is_err(),
+            "initial cursor shape must not warp mstsc to the default position"
+        );
+        cursor_tx.send_replace(CursorSnapshot {
+            generation: 2,
+            shape: Some(shape.clone()),
+            position: (10, 20),
+            position_generation: 1,
+            visible: true,
+            separate: true,
+        });
+        cursor_tx.send_replace(CursorSnapshot {
+            generation: 3,
+            shape: Some(shape),
+            position: (320, 240),
+            position_generation: 2,
+            visible: true,
+            separate: true,
+        });
+        assert!(
+            matches!(updates.next_update().await.unwrap(), Some(DisplayUpdate::PointerPosition(position))
+            if position.x == 320 && position.y == 240)
+        );
+        // Returning from embedded fallback must restore the shape without
+        // forcing mstsc back to an old server-observed pointer position.
+        let mut fallback = cursor_tx.borrow().clone();
+        fallback.generation = 4;
+        fallback.separate = false;
+        cursor_tx.send_replace(fallback.clone());
+        assert!(matches!(
+            updates.next_update().await.unwrap(),
+            Some(DisplayUpdate::HidePointer)
+        ));
+        fallback.generation = 5;
+        fallback.separate = true;
+        cursor_tx.send_replace(fallback);
+        assert!(matches!(
+            updates.next_update().await.unwrap(),
+            Some(DisplayUpdate::RGBAPointer(_))
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), updates.next_update())
+                .await
+                .is_err(),
+            "shape restoration must not replay a stale pointer position"
+        );
+        // Client-local motion may intervene without changing the last emitted
+        // position. A subsequent real warp back to it must still be forwarded.
+        let mut warp = cursor_tx.borrow().clone();
+        warp.generation = 6;
+        warp.position_generation += 1;
+        cursor_tx.send_replace(warp);
+        assert!(
             matches!(updates.next_update().await.unwrap(), Some(DisplayUpdate::PointerPosition(position))
             if position.x == 320 && position.y == 240)
         );
         let mut hidden = cursor_tx.borrow().clone();
-        hidden.generation = 3;
+        hidden.generation = 7;
         hidden.visible = false;
         cursor_tx.send_replace(hidden);
         assert!(matches!(

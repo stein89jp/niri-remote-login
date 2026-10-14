@@ -31,21 +31,22 @@ def stop(process):
             process.wait(timeout=3)
 
 
-def case(name, scale=100, idle=False, one_fps=False, reload=False):
-    folder = ROOT / "artifacts/capture-policy" / name
+def case(name, scale=100, idle=False, one_fps=False, reload=False, warp=False):
+    folder = Path(os.environ.get("NIRI_RDP_CAPTURE_EVIDENCE", ROOT / "artifacts/capture-policy")) / name
     folder.mkdir(parents=True, exist_ok=True)
     runtime = Path("/tmp") / ("niri-rdp-capture-" + name)
     runtime.mkdir(mode=0o700, exist_ok=True)
     environment = dict(os.environ, XDG_RUNTIME_DIR=str(runtime), WAYLAND_DISPLAY="wayland-0")
     configuration = folder / "headless.kdl"
+    pointer_policy = 'warp-mouse-to-focus mode="center-xy-always";' if warp else 'focus-follows-mouse;'
     configuration.write_text('output "HEADLESS-1" { scale 1; transform "normal"; position x=0 y=0; }\n'
-        'input { keyboard { xkb { model "jp106"; layout "jp"; }; }; focus-follows-mouse; }\n'
+        'input { keyboard { xkb { model "jp106"; layout "jp"; }; }; ' + pointer_policy + ' }\n'
         'layout { gaps 0; default-column-width { proportion 1.0; }; border { off; }; focus-ring { off; }; }\n'
         'animations { off; }\ngestures { hot-corners { off; }; }\n')
     niri = app = None
     with (folder / "compositor.log").open("w") as niri_log, (folder / "app.log").open("w") as app_log:
         try:
-            niri = subprocess.Popen([str(ROOT / "compositor/upstream/niri-plan-build"), "--config", str(configuration)],
+            niri = subprocess.Popen([os.environ.get("NIRI_RDP_LAB_NIRI", str(ROOT / "compositor/upstream/niri-plan-build")), "--config", str(configuration)],
                                     env=environment, stdout=niri_log, stderr=subprocess.STDOUT, start_new_session=True)
             deadline = time.monotonic() + 10
             while not (runtime / "wayland-0").exists():
@@ -65,6 +66,12 @@ def case(name, scale=100, idle=False, one_fps=False, reload=False):
                 probe_env["NIRI_RDP_PROBE_CURSOR"] = "1"
             if reload:
                 probe_env["NIRI_RDP_PROBE_RELOAD_CONFIG"] = str(configuration)
+            if warp:
+                ipc_path = next(runtime.glob("niri*.sock"))
+                window = next(window for window in ipc(ipc_path, "Windows")["Windows"]
+                              if window["app_id"] == "niri-rdp-proof")
+                probe_env.update(NIRI_RDP_PROBE_WARP_SOCKET=str(ipc_path),
+                                 NIRI_RDP_PROBE_WARP_WINDOW=str(window["id"]))
             probe = subprocess.run([str(ROOT / "bridge/target/debug/capture-probe"), str(runtime / "wayland-0")],
                                    env=probe_env, capture_output=True, text=True, timeout=20)
             (folder / "probe.log").write_text(probe.stdout + probe.stderr)
@@ -124,7 +131,8 @@ def main():
     results = [case("input-one-fps", one_fps=True), case("idle-six-seconds", idle=True)]
     results += [case(f"dpi-{scale}", scale=scale) for scale in (100, 150, 200)]
     results += [case("dpi-reload-150", scale=150, reload=True)]
-    destination = ROOT / "artifacts/capture-policy/report.json"
+    results += [case(f"cursor-warp-{scale}", scale=scale, warp=True) for scale in (100, 150, 200)]
+    destination = Path(os.environ.get("NIRI_RDP_CAPTURE_EVIDENCE", ROOT / "artifacts/capture-policy")) / "report.json"
     destination.write_text(json.dumps(results, indent=2) + "\n")
     print(json.dumps({"capture_policy": "PASS", "cases": len(results), "report": str(destination)}))
 

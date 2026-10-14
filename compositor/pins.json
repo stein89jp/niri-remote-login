@@ -18,7 +18,7 @@
     "patched_cargo_lock_sha256": "aa20e020290f1424de4e0dee6659eb9cf3213ff755883868d87eb042edfdc0e0",
     "patch_sha256_by_path": {
       "patches/0001-remote-headless-bounds-and-startup.patch": "6b8b72743ce43f97275f4551f0f00096dad58b84dfa627950d7308bd0441f91e",
-      "patches/0002-remote-cursor-capture.patch": "9715b9a83f0a3918c3cba6f982c7d499fc7fa5aff356e1bbf222e5ce7a6d07c9"
+      "patches/0002-remote-cursor-capture.patch": "ea913f9920544843f7e6954cf4cf7a9e96940f9ee6c61ab882978c9945df5ab9"
     }
   },
   "alternative": {

@@ -1,5 +1,57 @@
 # Validation record
 
+## mstsc cursor jumping, 2026-10-15
+
+The user reported improved picture quality and approximately four percentage
+points less CPU usage after the performance upgrades, but the Windows 10 mstsc
+cursor itself jumped during movement. The separate cursor path echoed every
+rendered seat position as an RDP Pointer Position update. That update forces the
+client's local pointer to move; delayed input echoes can therefore move it back
+to an older coordinate. Shape/fallback transitions also replayed old positions.
+See Microsoft's [Pointer Position update specification](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/3058381e-c856-4b26-a93c-d8f5514f8c3c).
+
+The maintained compositor patch now advances each cursor subscriber's position
+baseline after accepting input from that subscriber's own Wayland connection.
+Ordinary absolute and relative motion is not echoed; movement from the compositor
+or another virtual pointer still produces an update. A new subscription starts
+at the current seat position without forcing the client's pointer there. The
+frontend independently tracks fresh position events so shape/hide/fallback
+transitions cannot replay stale coordinates, while repeated genuine warps to the
+same target still reach the client. GPU capture, video policies and the accepted
+audio combination are unchanged.
+
+The Rust cursor regression failed before the fix on fallback restoration.
+`artifacts/cursor-fix/before/cursor-before/probe.log` also records the real pinned
+compositor echoing client motion as a warp to `(0,0)`. With the fix,
+`artifacts/cursor-fix/after/report.json` passes nine isolated cases: one-FPS
+input, six-second quiet capture, 100/150/200% DPI, configuration reload and
+two repeated compositor warps at each DPI. Cursor startup and ordinary center/
+corner movement produce zero position echoes; actual center clicks retain their
+logical mapping. The one-FPS input acknowledgement was 4.148 ms before capture.
+The complete bridge suite passed 159 library tests (one benchmark ignored),
+13 controller tests, one lifecycle test and six wire regressions. Fresh archive
+extraction with both maintained patches reproduces the tested cursor sources;
+the patch hash in `compositor/pins.json` is updated.
+
+The combined package release is `1.1.0-2`. Both frontend and compositor must be
+updated, and the retained compositor must exit before the corrected one starts.
+Installing the package alone does not replace an already-running compositor.
+Actual Windows 10 mstsc smoothness after deployment remains user acceptance.
+
+`artifacts/cursor-fix/package-build-checked.log` records successful package
+checks: the bridge/wire/controller suite above, nine compositor lifecycle/
+protocol tests, 13 native broker groups and 72 Python tests (three optional
+checks skipped). The sandbox initially blocked disposable Unix socket binding;
+the same checks passed outside it. `package-validation.json` records package
+structure inspection and workspace extraction without installation.
+`package-cursor/report.json` repeats all nine cursor cases using the extracted
+release compositor. `package-gpu.json` and `package-gpu-evidence/` record the
+extracted package passing real NVIDIA EGL/DMA-BUF capture and AVC444 FreeRDP
+decode/input, live resize, reconnect, held-input release and compositor-crash
+cleanup. The package and its SHA-256 receipt are retained under
+`artifacts/cursor-fix/`. The user will deploy through the documented full
+uninstall/reinstall; the active host services and remote desktop were preserved.
+
 ## Performance and desktop upgrades, 2026-10-14
 
 The implementation follows `PLAN.md`, retaining IronRDP

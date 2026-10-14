@@ -5,11 +5,34 @@ use ironrdp_server::{
 };
 use niri_rdp_bridge::wayland::Desktop;
 use std::{
+    io::{BufRead, BufReader, Write},
     os::unix::net::UnixStream,
     path::Path,
     sync::Arc,
     time::{Duration, Instant},
 };
+async fn no_cursor_echo(
+    updates: &mut dyn ironrdp_server::RdpServerDisplayUpdates,
+    duration: Duration,
+) -> anyhow::Result<()> {
+    let deadline = tokio::time::Instant::now() + duration;
+    loop {
+        match tokio::time::timeout_at(deadline, updates.next_update()).await {
+            Err(_) => return Ok(()),
+            Ok(update) => match update? {
+                Some(DisplayUpdate::PointerPosition(point)) => {
+                    anyhow::bail!(
+                        "client-local motion echoed as RDP warp to {},{}",
+                        point.x,
+                        point.y
+                    )
+                }
+                None => anyhow::bail!("capture ended while checking cursor echoes"),
+                _ => {}
+            },
+        }
+    }
+}
 fn hash(d: &Desktop) -> anyhow::Result<u64> {
     let image = d.snapshot().ok_or_else(|| anyhow::anyhow!("no image"))?;
     let DisplayUpdate::Bitmap(bitmap) = image.as_ref() else {
@@ -60,16 +83,20 @@ fn main() -> anyhow::Result<()> {
             .enable_time()
             .build()?;
         let mut updates = d.updates_send();
-        let (mut shape, mut position) = (None, false);
+        let mut shape = None;
         runtime.block_on(async {
             tokio::time::timeout(Duration::from_secs(3), async {
-                while shape.is_none() || !position {
+                while shape.is_none() {
                     match updates.next_update().await? {
                         Some(DisplayUpdate::RGBAPointer(cursor)) => {
                             shape = Some((cursor.width, cursor.height, cursor.hot_x, cursor.hot_y))
                         }
                         Some(DisplayUpdate::PointerPosition(point)) => {
-                            position = point.x == 320 && point.y == 240
+                            anyhow::bail!(
+                                "cursor startup warped the local pointer to {},{}",
+                                point.x,
+                                point.y
+                            )
                         }
                         None => anyhow::bail!("capture ended while waiting for cursor metadata"),
                         _ => {}
@@ -80,29 +107,58 @@ fn main() -> anyhow::Result<()> {
             .await??;
             Ok::<_, anyhow::Error>(())
         })?;
+        runtime.block_on(no_cursor_echo(updates.as_mut(), Duration::from_millis(100)))?;
         for (x, y) in [(0, 0), (639, 0), (639, 479), (0, 479), (320, 240)] {
             d.mouse(MouseEvent::Move { x, y });
-            runtime.block_on(async {
-                tokio::time::timeout(Duration::from_secs(2), async {
-                    loop {
-                        if let Some(DisplayUpdate::PointerPosition(point)) =
-                            updates.next_update().await?
-                            && point.x == x
-                            && point.y == y
-                        {
-                            break;
+            runtime.block_on(no_cursor_echo(updates.as_mut(), Duration::from_millis(100)))?;
+        }
+        // A real compositor warp must still reach RDP, even when it repeats the
+        // same target after ordinary client-local moves between the two warps.
+        let mut warps = 0;
+        if let Ok(socket) = std::env::var("NIRI_RDP_PROBE_WARP_SOCKET") {
+            let window: u64 = std::env::var("NIRI_RDP_PROBE_WARP_WINDOW")?.parse()?;
+            for _ in 0..2 {
+                d.mouse(MouseEvent::Move { x: 20, y: 20 });
+                runtime.block_on(no_cursor_echo(updates.as_mut(), Duration::from_millis(100)))?;
+                let mut ipc = UnixStream::connect(&socket)?;
+                writeln!(
+                    ipc,
+                    "{{\"Action\":{{\"FocusWindow\":{{\"id\":{window}}}}}}}"
+                )?;
+                let mut reply = String::new();
+                BufReader::new(ipc).read_line(&mut reply)?;
+                anyhow::ensure!(reply.contains("\"Ok\""), "warp IPC failed: {reply}");
+                runtime.block_on(async {
+                    tokio::time::timeout(Duration::from_secs(2), async {
+                        loop {
+                            match updates.next_update().await? {
+                                Some(DisplayUpdate::PointerPosition(point)) => {
+                                    anyhow::ensure!(
+                                        point.x == 320 && point.y == 240,
+                                        "compositor warp reached {},{}, expected 320,240",
+                                        point.x,
+                                        point.y
+                                    );
+                                    break;
+                                }
+                                None => anyhow::bail!("capture ended during compositor warp"),
+                                _ => {}
+                            }
                         }
-                    }
+                        Ok::<_, anyhow::Error>(())
+                    })
+                    .await??;
                     Ok::<_, anyhow::Error>(())
-                })
-                .await??;
-                Ok::<_, anyhow::Error>(())
-            })?;
+                })?;
+                warps += 1;
+            }
+            d.mouse(MouseEvent::Move { x: 320, y: 240 });
+            runtime.block_on(no_cursor_echo(updates.as_mut(), Duration::from_millis(100)))?;
         }
         let (width, height, hot_x, hot_y) = shape.unwrap();
         std::thread::sleep(Duration::from_millis(100));
         println!(
-            "{{\"probe\":\"cursor\",\"scale_percent\":{scale},\"width\":{width},\"height\":{height},\"hot_x\":{hot_x},\"hot_y\":{hot_y},\"position\":[320,240]}}"
+            "{{\"probe\":\"cursor\",\"scale_percent\":{scale},\"width\":{width},\"height\":{height},\"hot_x\":{hot_x},\"hot_y\":{hot_y},\"motion_echoes\":0,\"server_warps\":{warps}}}"
         );
     }
     if let Ok(configuration) = std::env::var("NIRI_RDP_PROBE_RELOAD_CONFIG") {

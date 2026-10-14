@@ -40,7 +40,12 @@ remains a separate acceptance check.
 
 Separate cursor metadata is available from the maintained headless compositor
 only. The frontend selects it using negotiated pointer support and falls back to
-an embedded cursor when the client cannot represent the shape. Clipboard is
+an embedded cursor when the client cannot represent the shape. Supported clients
+move the cursor locally; ordinary remote input is not echoed back as an RDP
+position update, which would force mstsc's newer local pointer backward. Actual
+compositor warps still send position updates, including repeated warps to the
+same target. Shape, visibility and fallback changes do not replay old positions.
+Clipboard is
 Unicode text only, confined to the authenticated compositor connection, limited
 to 1 MiB of UTF-8 text and finite transfer deadlines. Enable clipboard in the RDP
 client's local-resource controls. Files, images and host-local selection access

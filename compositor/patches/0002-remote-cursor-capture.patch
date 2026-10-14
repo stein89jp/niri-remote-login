@@ -30,7 +30,7 @@ diff --git a/src/niri.rs b/src/niri.rs
 @@ -4720,6 +4725,7 @@
                  self.render_windows_for_screen_cast(renderer, output, target_presentation_time);
              }
- 
+
 +            self.render_remote_cursor(renderer, output);
              self.render_for_screencopy_with_damage(renderer, output);
          });
@@ -40,7 +40,7 @@ diff --git a/src/protocols/mod.rs b/src/protocols/mod.rs
 +++ b/src/protocols/mod.rs
 @@ -9,3 +9,5 @@
  pub mod virtual_pointer;
- 
+
  pub mod raw;
 +
 +pub mod remote_cursor;
@@ -72,7 +72,7 @@ diff --git a/src/protocols/remote_cursor.rs b/src/protocols/remote_cursor.rs
 new file mode 100644
 --- /dev/null
 +++ b/src/protocols/remote_cursor.rs
-@@ -0,0 +1,247 @@
+@@ -0,0 +1,292 @@
 +//! Private bounded cursor capture, exposed only in headless remote sessions.
 +use super::raw::remote_cursor::server::{
 +    niri_rdp_cursor_manager_v1::{self, NiriRdpCursorManagerV1},
@@ -98,7 +98,7 @@ new file mode 100644
 +    reexports::wayland_server::{
 +        Client, DataInit, Dispatch, DisplayHandle, GlobalDispatch, New, Resource,
 +    },
-+    utils::{Physical, Point, Rectangle, Scale, SealedFile, Transform},
++    utils::{Logical, Physical, Point, Rectangle, Scale, SealedFile, Transform},
 +};
 +use std::os::fd::AsFd;
 +
@@ -153,6 +153,9 @@ new file mode 100644
 +            if let Some(output) = Output::from_resource(&output)
 +                .filter(|_| state.niri.remote_cursor_state.subscriptions.len() < 16)
 +            {
++                // The RDP client already owns its local pointer position.
++                // Subscribing/reconnecting must not warp it to the old seat.
++                let position = state.niri.remote_cursor_position(&output);
 +                state
 +                    .niri
 +                    .remote_cursor_state
@@ -162,7 +165,7 @@ new file mode 100644
 +                        output: output.clone(),
 +                        pixels: Vec::new(),
 +                        geometry: (0, 0, 0, 0),
-+                        position: None,
++                        position,
 +                        hidden: false,
 +                        unsupported: false,
 +                        signature: Vec::new(),
@@ -187,6 +190,33 @@ new file mode 100644
 +    }
 +}
 +impl Niri {
++    fn remote_cursor_position(&self, output: &Output) -> Option<(u32, u32)> {
++        let geometry = self.global_space.output_geometry(output)?;
++        Some(physical_position(
++            output,
++            geometry,
++            self.seat.get_pointer()?.current_location(),
++        ))
++    }
++
++    pub fn remote_cursor_input_motion(&mut self, client: Option<&Client>) {
++        let Some(client) = client else { return };
++        let location = self.seat.get_pointer().unwrap().current_location();
++        for entry in &mut self.remote_cursor_state.subscriptions {
++            // Only acknowledge motion from this subscriber's input connection.
++            // Other virtual pointers still produce server-driven position updates.
++            if entry.cursor.client().as_ref() != Some(client) {
++                continue;
++            }
++            if let Some(geometry) = self.global_space.output_geometry(&entry.output) {
++                // Advance the render baseline to the position actually accepted
++                // by Niri, including DPI rounding and pointer grabs. Echoing this
++                // input through RDP would snap mstsc's newer local cursor back.
++                entry.position = Some(physical_position(&entry.output, geometry, location));
++            }
++        }
++    }
++
 +    pub fn render_remote_cursor(&mut self, renderer: &mut GlesRenderer, output: &Output) {
 +        self.remote_cursor_state
 +            .subscriptions
@@ -207,10 +237,10 @@ new file mode 100644
 +        };
 +        let point = self.seat.get_pointer().unwrap().current_location() - geometry.loc.to_f64();
 +        let point: Point<i32, Physical> = point.to_physical_precise_round(output_scale);
-+        let size = output.current_mode().unwrap().size;
-+        let position = (
-+            point.x.clamp(0, size.w - 1) as u32,
-+            point.y.clamp(0, size.h - 1) as u32,
++        let position = physical_position(
++            output,
++            geometry,
++            self.seat.get_pointer().unwrap().current_location(),
 +        );
 +        let mut elements = Vec::new();
 +        if self.pointer_visibility.is_visible() {
@@ -320,6 +350,21 @@ new file mode 100644
 +        self.remote_cursor_state = state;
 +    }
 +}
++
++fn physical_position(
++    output: &Output,
++    geometry: Rectangle<i32, Logical>,
++    location: Point<f64, Logical>,
++) -> (u32, u32) {
++    let point = location - geometry.loc.to_f64();
++    let point: Point<i32, Physical> =
++        point.to_physical_precise_round(output.current_scale().fractional_scale());
++    let size = output.current_mode().unwrap().size;
++    (
++        point.x.clamp(0, size.w - 1) as u32,
++        point.y.clamp(0, size.h - 1) as u32,
++    )
++}
 diff --git a/resources/niri-rdp-cursor-v1.xml b/resources/niri-rdp-cursor-v1.xml
 new file mode 100644
 --- /dev/null
@@ -355,3 +400,47 @@ new file mode 100644
 +    </description></event>
 +  </interface>
 +</protocol>
+diff --git a/src/handlers/mod.rs b/src/handlers/mod.rs
+--- a/src/handlers/mod.rs
++++ b/src/handlers/mod.rs
+@@ -12,7 +12,7 @@
+
+ use smithay::backend::allocator::dmabuf::Dmabuf;
+ use smithay::backend::drm::DrmNode;
+-use smithay::backend::input::{InputEvent, TabletToolDescriptor};
++use smithay::backend::input::{Event, InputEvent, TabletToolDescriptor};
+ use smithay::desktop::{PopupKind, PopupManager};
+ use smithay::input::dnd::{self, DnDGrab, DndGrabHandler, DndTarget};
+ use smithay::input::pointer::{CursorIcon, CursorImageStatus, Focus, PointerHandle};
+@@ -667,13 +667,17 @@
+     }
+
+     fn on_virtual_pointer_motion(&mut self, event: VirtualPointerMotionEvent) {
++        let client = event.device().client();
+         self.process_input_event(InputEvent::<VirtualPointerInputBackend>::PointerMotion { event });
++        self.niri.remote_cursor_input_motion(client.as_ref());
+     }
+
+     fn on_virtual_pointer_motion_absolute(&mut self, event: VirtualPointerMotionAbsoluteEvent) {
++        let client = event.device().client();
+         self.process_input_event(
+             InputEvent::<VirtualPointerInputBackend>::PointerMotionAbsolute { event },
+         );
++        self.niri.remote_cursor_input_motion(client.as_ref());
+     }
+
+     fn on_virtual_pointer_button(&mut self, event: VirtualPointerButtonEvent) {
+diff --git a/src/protocols/virtual_pointer.rs b/src/protocols/virtual_pointer.rs
+--- a/src/protocols/virtual_pointer.rs
++++ b/src/protocols/virtual_pointer.rs
+@@ -47,6 +47,10 @@
+ }
+
+ impl VirtualPointer {
++    pub fn client(&self) -> Option<Client> {
++        self.pointer.client()
++    }
++
+     fn data(&self) -> &VirtualPointerUserData {
+         self.pointer.data().unwrap()
+     }

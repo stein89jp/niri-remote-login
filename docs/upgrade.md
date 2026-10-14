@@ -43,6 +43,17 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+Version `1.1.0-2` fixes jumping Windows 10 mstsc cursors by stopping the separate
+cursor path from echoing ordinary mouse movement as client position updates.
+It also prevents shape/fallback changes from replaying stale positions, while
+retaining compositor-driven warps. Build the combined package while connected;
+deploy from a local terminal or independent SSH session. Both the frontend and
+headless compositor change, so end the old remote desktop before starting the
+new version. Restarting only the frontend reconnects to the old retained
+compositor and does not apply the full fix. A fresh session ends the old remote
+applications; save their work before deployment. Check cursor motion, dragging,
+shape changes and focus warps in mstsc after reconnecting.
+
 Package release 20 corrects a playback-feedback blind spot: a completion for a
 wave queued longer than one second was discarded even during continuous audio.
 Fresh, unambiguous completions can now trigger bounded backlog recovery, with
