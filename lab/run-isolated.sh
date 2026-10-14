@@ -13,6 +13,7 @@ args=(--unshare-all --die-with-parent --new-session --ro-bind /usr /usr
       --clearenv --setenv PATH /usr/bin --setenv HOME /home/test
       --setenv XDG_RUNTIME_DIR /tmp/niri-rdp-runtime
       --setenv NIRI_BACKEND headless --setenv LIBGL_ALWAYS_SOFTWARE 1
+      --setenv NIRI_RDP_RENDERER software
       --setenv GALLIUM_DRIVER llvmpipe --setenv XKB_CONFIG_ROOT /usr/share/X11/xkb
       --setenv LD_LIBRARY_PATH /work/lab/sysroot/usr/lib)
 [[ ! -d /etc/fonts ]] || args+=(--ro-bind /etc/fonts /etc/fonts)

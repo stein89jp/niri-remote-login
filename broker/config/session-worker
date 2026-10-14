@@ -31,9 +31,9 @@ export PULSE_SERVER="unix:$NIRI_RDP_RUNTIME_DIR/pulse/native"
 audio_pid=$!
 attempt=0
 while [ ! -S "$NIRI_RDP_RUNTIME_DIR/audio-0" ]; do
-    kill -0 "$audio_pid" || { echo 'remote audio startup failed' >&2; exit 1; }
+    kill -0 "$audio_pid" 2>/dev/null || { echo 'remote audio unavailable; starting desktop without audio' >&2; break; }
     attempt=$((attempt + 1))
-    [ "$attempt" -lt 150 ] || { echo 'remote audio startup timed out' >&2; exit 1; }
+    [ "$attempt" -lt 150 ] || { echo 'remote audio startup delayed; starting desktop while audio recovers' >&2; break; }
     sleep 0.1
 done
 # Reuse the user's desktop settings without starting the shared user services.
@@ -67,4 +67,32 @@ wrapper += 'spawn-at-startup "/usr/lib/niri-rdp/session-portals"\n'
 wrapper += 'spawn-at-startup "/usr/lib/niri-rdp/session-autostart"\n'
 pathlib.Path(sys.argv[2]).write_text(wrapper)
 PY
-exec /usr/lib/niri-rdp/niri-headless --config "$NIRI_RDP_RUNTIME_DIR/config.kdl"
+# Keep the private helper supervised after Niri starts. A healthy desktop is
+# independent of ancillary audio. Restart the helper at most twice per desktop;
+# its own graph supervisor has three finite attempts. Never use shared services.
+/usr/lib/niri-rdp/niri-headless --config "$NIRI_RDP_RUNTIME_DIR/config.kdl" &
+desktop_pid=$!
+audio_restarts=0
+cleanup() {
+    trap - EXIT TERM INT
+    kill "$desktop_pid" "$audio_pid" 2>/dev/null || :
+    wait "$desktop_pid" 2>/dev/null || :
+    wait "$audio_pid" 2>/dev/null || :
+}
+trap cleanup EXIT
+trap 'exit 0' TERM INT
+while kill -0 "$desktop_pid" 2>/dev/null; do
+    if ! kill -0 "$audio_pid" 2>/dev/null && [ "$audio_restarts" -lt 2 ]; then
+        wait "$audio_pid" 2>/dev/null || :
+        audio_restarts=$((audio_restarts + 1))
+        sleep "$audio_restarts"
+        /usr/lib/niri-rdp/session-audio &
+        audio_pid=$!
+        echo "private audio helper restart $audio_restarts of 2; active clients reconnect for fresh capture" >&2
+    fi
+    sleep 0.5
+done
+set +e
+wait "$desktop_pid"
+result=$?
+exit "$result"

@@ -9,8 +9,8 @@ import tarfile
 import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "0.1.0"
-INCLUDE = ("LICENSE", "README.md", "Makefile", "bridge", "broker", "docs", "checkpoints", "scripts", "packaging", "compositor/README.md", "compositor/CHECKPOINT.md", "compositor/pins.json", "compositor/patches", "lab", "poc", "prototype", "tests", "research")
+VERSION = "1.1.0"
+INCLUDE = ("LICENSE", "README.md", "Makefile", "bridge", "broker", "docs", "checkpoints", "scripts", "packaging", "compositor/README.md", "compositor/CHECKPOINT.md", "compositor/pins.json", "compositor/patches", "compositor/protocols", "lab", "poc", "prototype", "tests", "research")
 EXCLUDE = {"target", ".cargo-cache", "cargo-home", "__pycache__", ".git", "build", "private", "sysroot", "downloads", "results", "generated"}
 
 
@@ -81,6 +81,7 @@ def main():
     shutil.copy2(licenses, headless / licenses.name)
     (headless / "PKGBUILD").write_text(template.replace(
         "@PATCH_SHA256@", hashlib.sha256(patch.read_bytes()).hexdigest()).replace(
+        "@CURSOR_PATCH_SHA256@", hashlib.sha256((headless / "0002-remote-cursor-capture.patch").read_bytes()).hexdigest()).replace(
         "@LICENSE_SCRIPT_SHA256@", hashlib.sha256(licenses.read_bytes()).hexdigest()))
     (out / "source-manifest.json").write_text(json.dumps({
         "version": VERSION, "archive_sha256": digest, "files": manifest,

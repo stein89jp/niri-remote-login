@@ -15,11 +15,14 @@ resolved = {node["id"] for node in metadata["resolve"]["nodes"]}
 sections = ["Upstream licenses for the locked Linux Cargo dependency graph.\n"
             "Original integration code is covered by the top-level LICENSE.\n"]
 for package in sorted(metadata["packages"], key=lambda p: (p["name"], p["version"])):
-    if package["id"] not in resolved or package["source"] is None:
+    if package["id"] not in resolved:
         continue
     base = Path(package["manifest_path"]).parent
+    provenance = base / "UPSTREAM"
+    if package["source"] is None and not provenance.is_file():
+        continue
     sections.append(f"\n=== {package['name']} {package['version']} ===\n"
-                    f"Source: {package['source']}\nLicense expression: {package['license']}\n")
+                    f"Source: {package['source'] or provenance.read_text().strip()}\nLicense expression: {package['license']}\n")
     candidates = sorted(p for p in base.iterdir() if p.is_file() and
                         p.name.upper().startswith(("LICENSE", "LICENCE", "COPYING", "NOTICE")))
     if package.get("license_file"):
@@ -36,7 +39,7 @@ if root["name"] == "niri-rdp-bridge":
     def capture(command):
         return subprocess.check_output(command, text=True, stderr=subprocess.STDOUT).strip()
 
-    libraries = ("libavcodec", "libavutil", "libswscale")
+    libraries = ("libavcodec", "libavutil", "libswscale", "libswresample")
     versions = capture(["pkg-config", "--modversion", *libraries]).splitlines()
     sections.append("\n=== FFmpeg system libraries linked by niri-rdp-bridge ===\n"
                     "These dynamically linked libraries are supplied by the platform FFmpeg package; "
@@ -53,5 +56,14 @@ if root["name"] == "niri-rdp-bridge":
     if shutil.which("pacman"):
         sections.append(f"\n--- Arch FFmpeg package metadata ---\n"
                         f"{capture(['pacman', '-Qi', 'ffmpeg'])}\n")
+    sections.append("\n=== Optional GPU capture/conversion system libraries ===\n"
+                    "EGL/OpenGL dispatch is supplied by libglvnd; GBM by Mesa.\n"
+                    "The CUDA driver is dynamically loaded from the installed NVIDIA driver.\n"
+                    "No CUDA toolkit, Video Codec SDK, driver binaries or third-party GPU headers\n"
+                    "are included in this source package. The bridge's small ABI declarations\n"
+                    "and BT.709 compute shader are maintained integration source.\n"
+                    "libglvnd source/license: https://github.com/NVIDIA/libglvnd\n"
+                    "Mesa source/licenses: https://docs.mesa3d.org/license.html\n"
+                    "NVIDIA driver distribution terms: https://www.nvidia.com/en-us/drivers/unix/\n")
 output.write_text("".join(sections))
 print(f"Collected notices for {len(resolved)} resolved packages into {output}")

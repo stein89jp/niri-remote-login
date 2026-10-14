@@ -1,5 +1,309 @@
 # Validation record
 
+## Performance and desktop upgrades, 2026-10-14
+
+The implementation follows `PLAN.md`, retaining IronRDP
+`bf019ca502d1e52616853a5ded68c885cec1e322` and Niri
+`0be60b742762905b7bee1ea67bb5a2fb00859bf0`. Narrow IronRDP server additions
+are maintained under `bridge/vendor/ironrdp-server/`; the cursor extension is the
+second maintained compositor patch. No installed package, active session, host
+service or local desktop was changed. The user owns Git publication and the
+clean reinstall, then actual Windows-to-host acceptance.
+
+The accepted audio combination remains 48 kHz stereo S16LE PCM, 20 ms blocks,
+both zero RDPSND timestamps, four waves, three capture blocks, 60 ms expiry,
+silence suppression and finite playback recovery. Audio source metadata begins
+at the helper's first read from the `parec` monitor; it excludes earlier browser,
+PipeWire and Windows buffering. Graphics ACKs and client decode callbacks do not
+measure physical presentation or establish a shared audio/video clock.
+
+### Focused behavior and failure evidence
+
+- `artifacts/capture-policy/report.json`: real private Wayland application input
+  was acknowledged in 2.139 ms with a one-FPS capture ceiling, before the next
+  capture. A quiet desktop stayed connected for six seconds with unchanged
+  pixels. At 100/150/200%, the same 640×480 physical output had the expected
+  logical dimensions, center-click positions, cursor size and scaled hotspot.
+  Cursor position checks included the physical center and four corners.
+  The sixth case rewrites the private compositor configuration during a 150%
+  session; the remote policy restores its size/scale before input, and a 30-pixel
+  relative move reaches the expected 20-logical-pixel displacement.
+- `artifacts/plan-upgrades/bitmap-refresh-proof.json`: real FreeRDP RefreshRect,
+  SuppressOutput and resume on static content produced the expected decoded
+  refresh/resume updates, with two captures over six seconds and no additional
+  readback for the explicit refresh. Unit coverage also checks overlapping and
+  skipped damage, complete video snapshots, bounded motion/resize queues,
+  critical-event barriers, release/stop, and pending Wayland callback delivery.
+- `artifacts/classic-bitmap-wire-regression.json`: an actual bitmap-PDU decoder
+  reproduced a short-final-row defect before the fix. Complete RGB reconstruction
+  now passes for 1, 64, 256 and 300-row shared-stride subregions.
+- `artifacts/clipboard-integration.json`: three real FreeRDP CLIPRDR connections
+  copied Japanese, emoji, multiline and empty text in both directions through a
+  private compositor. Oversize native offers were rejected with subsequent
+  recovery, rapid ownership changes converged, and another private compositor's
+  selection stayed unchanged. Focused Rust tests cover malformed text, transfer
+  limits, outgoing-response bounds, late response ambiguity and stale generations.
+  GTK/Qt, XWayland and mstsc clipboard acceptance remain separate client checks.
+- `artifacts/audio-resilience/results.json`: 46 Rust audio tests, 14 Python audio
+  tests, a worker recovery check and 13 broker groups passed. Disposable
+  WirePlumber, PipeWire-Pulse and PipeWire kills exercised finite private-graph
+  recovery. Monitor loss and helper death cleaned descendants; desktop-only
+  reconnect remained usable. A 150 ms idle worker observation had zero periodic
+  capture wakeups. Healthy PCM bytes, fragmentation, source age, sequence wrap,
+  credit-wait continuity and loss-triggered AAC reset retain regression coverage.
+- `artifacts/network-liveness.json`: the actual Rust TCP option implementation
+  detected namespace packet blackholes in 22.812 seconds while quiet and 20.414
+  seconds while busy. Reconnect succeeded; 22 seconds of healthy idle and a
+  two-second interruption survived. This transport fixture does not prove real
+  PAM/logind resume; installed-session identity and application retention remain
+  in the post-reinstall matrix.
+
+A longer shared-connection run exposed a missed wake: the clipboard reader could
+queue screencopy callbacks after capture dispatched pending events but before it
+prepared a socket read, leaving no socket readiness for the subsequent wait.
+Capture and clipboard now recheck their queues immediately after acquiring the
+coordinated read guard. With that check disabled, a deterministic two-queue
+socket regression fails after a one-second wait; with it restored, all 24 Wayland
+tests pass in 0.10 seconds. The capture deadline is unchanged. Before/after
+receipts are `artifacts/plan-upgrades/wayland-shared-queue-before.log` and
+`artifacts/plan-upgrades/wayland-shared-queue-after.log`.
+
+The strict graphics fixture waits for actual AVC commands and decoded application
+colors before progressing through input and resize. This found an empty monitor
+list in the pinned library's default ResetGraphics, which FreeRDP 3.32.2 rejected
+while bitmap fallback remained usable. The maintained wrapper now supplies one
+primary monitor with exact inclusive bounds for startup and resize. Software
+compositor AVC420, AVC444 and NVENC-configured bitmap fallback all passed the
+strict extracted-package integrations. Interactive login with GPU capture also
+passed, reporting 14 successful native DMA-BUF/EGL/CUDA/NVENC activations across
+the requested odd and portrait/landscape layouts. Three full GPU reconnect
+repetitions passed with held-input and compositor-crash cleanup. Earlier failed
+runs remain under `artifacts/integration-failures/`; final receipts distinguish
+codec delivery from bitmap fallback rather than inferring it from configuration.
+
+### Comparative measurements and their scope
+
+`artifacts/plan-upgrades/login-benchmark.log` compares 60 debug-build updates.
+At 1080p, full rendering took 3,156,649 µs, cached idle took 7 µs and partial
+form updates took 480,398 µs; at 4K these were 18,108,680, 10 and 1,383,735 µs.
+These are aggregate local render costs, excluding transport/client presentation.
+Password edits beyond the first masked character do not schedule identical
+pixels; public keyboard mapping is cached per thread while secret state is not.
+
+The 36 native NVENC profile comparisons under
+`artifacts/plan-upgrades/video-profiles/` use the RTX 4070 Ti, driver 615.78.08,
+1080p/4K, matched 12 Mbit/s targets, three workloads and two repetitions. The
+4K video fixture improved from approximately 35.3 dB PSNR with p1 to 40.4/40.1 dB
+with p4/p5, while p95 encode cost rose from approximately 13.1 ms to 17.9/21.6 ms.
+Colored text did not gain consistently from the presets. The established p1
+speed profile therefore remains the default; balanced and quality are explicit
+options. Native encoding excludes capture, networking and client decoding.
+
+`artifacts/plan-upgrades/video-avc444-chroma-fixed/` checks the corrected AVC444
+packing/conversion with a synthetic colored-text software-encoder fixture.
+At the same 12 Mbit/s target it measured 38.65 dB PSNR / 0.55 mean absolute error
+for AVC444 versus 18.50 dB / 11.98 for AVC420, with 7.39 versus 2.06 Mbit/s
+nominal payload at the requested 60 FPS. This is a chroma-preservation/decoder experiment, not a Windows quality
+result or hardware throughput comparison. Earlier AVC444 results predating the
+full-chroma conversion fix are diagnostic failures and are not acceptance data.
+AVC420 remains the default.
+
+The eight corrected hardware quality/refinement cases under
+`artifacts/plan-upgrades/video-avc444-final-quality/` use 6 Mbit/s targets at
+1080p/4K. One extra settled AVC444 frame improved mean absolute error from
+22.617 to 21.922 at 1080p and 23.312 to 22.634 at 4K; AVC420 changed from
+20.137 to 20.090 and 21.631 to 21.607. These modest gains do not justify repeated
+IDRs or unlimited static traffic. At this low target the colored-text AVC444
+fixture had mixed whole-image quality and substantial nominal payload cost;
+its 4K encode p95 exceeded the 60-FPS budget. Native nominal rates project
+payload at the requested FPS and must not be reported as sustained wire rates.
+
+The native GPU checks in `artifacts/plan-upgrades/native-nvenc-tests.log`
+exercise DMA-BUF import, GPU BT.709 NV12 conversion, padding, device rejection,
+shared EGL display lifetime and repeated context teardown at 641×369 and 1080p.
+The analytic full-range BT.709/padding comparison has maximum error zero.
+CPU swscale uses different edge resampling, so its maximum edge differences
+are recorded separately and are not described as byte-identical conversion.
+The same hardware run passed live bitrate changes and 180-frame decoder
+continuity. GPU capture remains an explicit `auto` option with SHM fallback.
+
+The final-binary 16 paired hardware-compositor runs in
+`artifacts/plan-upgrades/desktop-gpu-{shm,auto}-v3/` hold the renderer, AVC420 speed
+profile, 12 Mbit/s target and unshaped link constant. Every `auto` case records
+successful native GPU activation, actual AVC commands and no capture fallback;
+SHM controls record zero GPU-capture activations. The video-workload means of two
+six-second repetitions are:
+
+| Output | Capture | Frontend CPU, % of one core | AVC commands/second |
+| --- | --- | ---: | ---: |
+| 1920×1080 | SHM | 23.46 | 37.97 |
+| 1920×1080 | GPU | 11.28 | 35.03 |
+| 3840×2160 | SHM | 42.64 | 19.20 |
+| 3840×2160 | GPU | 11.33 | 18.20 |
+
+These windows include startup. The comparison establishes reduced frontend CPU
+with slightly lower decoded codec cadence; it does not establish an FPS gain,
+4K60, total-system CPU savings or physical presentation latency. GPU capture
+therefore remains opt-in. Individual post-capture-to-GFX-submission p95 windows
+at 4K fall from 14.89–16.09 ms with SHM to 5.92–7.01 ms with GPU capture.
+`video-pipeline-summary-v3.json` inventories all 24 final-binary runs, including
+four lossless references and four GPU AVC444 cases; all decoded their requested
+path. The frontend SHA-256 is
+`789a10ecae4654ed0dd67cac9f29658f0579207f405a20c296544c5cd48cb579`.
+Decoded static-text comparisons use the lossless bitmap
+reference separately from the moving-video timing comparison.
+
+The pre-final-v2 decoded-text comparison is recorded in
+`artifacts/plan-upgrades/desktop-decoded-quality.json`. The helper proves the
+lossless bitmap application's bounds and orientation from asymmetric glyphs and
+exact blue/red rows; both bitmap repeats match within the content rectangle.
+The paired hardware-compositor SHM420, GPU420 and GPU444 captures use the same
+speed profile and target, with actual codec and GPU-activation receipts. GPU444
+modestly improves colored-ink error relative to GPU420, while black text,
+one-pixel surrounds and whole-image PSNR can worsen. This is mixed decoded-text
+quality evidence, not a general quality gain or a reason to change defaults.
+`artifacts/plan-upgrades/desktop-quality-alignment-check.json` checks local glyph
+alignment; no shift or mirror is applied to the metrics. The two focused
+reference tests also reject mirrored, blank and incomplete inputs. These older
+candidate pixels remain useful for comparison but do not establish final-v2
+runtime stability. The final-binary repeat in `desktop-decoded-quality-v3.json`
+validates all four lossless references and 12 AVC screenshots against that exact
+frontend hash, with the same mixed quality conclusion.
+
+The private workload harness records frontend/compositor/application CPU,
+server timing/counters, decoded update cadence, bounded synthetic screenshots,
+wire bytes and GPU samples. NVIDIA utilization/memory samples cover the whole
+device, including other host GPU work; they are not per-fixture attribution.
+Capture-ready timestamps mark frontend observation
+of screencopy readiness, after readback; they exclude event-socket residence and
+physical presentation. `gpu_capture_stride_bytes` is stride × height, not CPU
+traffic or total modifier allocation size. Decode updates can include partial
+rectangles and are not monitor FPS. Link shaping uses a bounded userspace duplex
+relay; it is not kernel `tc` or a physical WAN.
+
+The initial bitmap matrix under `artifacts/plan-upgrades/desktop-bitmap/` is
+invalid: undersized relay TCP buffers throttled even unshaped traffic and left
+zero-frame screenshots. It is retained as a failed diagnostic. After increasing
+the finite socket buffers and enabling TCP_NODELAY, the corrected relay and
+direct loopback proofs measured 4.127 and 4.136 decoded updates/second with real
+pixels. The corrected older-candidate matrices comprise 200 completed runs: 56 bitmap,
+112 NVENC/explicit-bitmap-fallback, 16 paired GPU/SHM, four GPU AVC444, and 12
+45-second shaped followups. All unshaped cases decoded their expected path.
+The 84 six-second shaped windows ended during cold bitmap setup and explicitly
+record `decoded_path_within_window=false`; they are startup diagnostics, not
+codec success or sustained-throughput evidence. All 12 longer shaped cases
+decoded the expected bitmap/AVC path. Raw inventories and aggregation are in
+`bitmap-matrix-summary.json` and `video-pipeline-summary.json`. Their immutable
+frontend hash begins `96357d9b`; `measured-candidate-source.tar.gz` preserves
+the corresponding source before the final wake correction and payload-log
+redactions. Final-binary representative and controller receipts are recorded
+separately. NVENC bitrate is a
+rate-control target; a native complex 4K video fixture projected approximately
+17.1 Mbit/s payload at the requested 60 FPS and a 12 Mbit/s target. That figure
+excludes capture, transport and client work and is not measured wire throughput.
+Use the relay byte receipts to assess the complete path.
+
+The next candidate's 44 workload receipts, source snapshot and exact binary hash
+are preserved in `measured-v2-source.json`, `video-pipeline-summary-v2.json` and
+`joint-policy-summary-v2.json`. The controller comparison exposed duplicate FPS
+gates: capture starts every 50 ms at 20 FPS, but alternating 2/3 ms Ready delays
+made the send gate discard 99 of 200 captures. Authenticated desktops now use
+capture as their sole cadence clock; the login screen retains its independent
+send limit until an authenticated Desktop actually attaches. The focused jitter
+regression and the pre-authentication provider case cover both decisions. Queue,
+graphics credit, encoder concurrency and audio controls remain bounded.
+`double-pacing-fails-before.log` records the failed 101/200-frame trace;
+`double-pacing-fixed-rust-tests.log` records all 159 library tests passing after
+the correction, with the benchmark ignored. All-target Clippy with warnings
+denied also passed (`double-pacing-clippy.log`). The initial six socket-denied
+tests passed when repeated outside the restricted sandbox.
+
+The corrected final runtime completed 16 matched controller runs in
+`joint-policy-{off,on}-v3/` and `joint-policy-{off,on}-long-v3/`.
+Every run completed its full requested window, reached AVC420 delivery and had
+zero duplicate cadence skips. Means of two repetitions, including connection/bitmap startup:
+
+| Added nominal RTT | Window | Baseline AVC commands/s | Optional policy AVC commands/s |
+| --- | --- | ---: | ---: |
+| 20 ms | 24 s | 21.37 | 10.92 |
+| 50 ms | 24 s | 11.74 | 5.35 |
+| 100 ms | 24 s | 6.17 | 3.98 |
+| 200 ms | 60 s | 5.05 | 8.59 |
+
+`joint-policy-summary-v3.json` records per-run client intervals, separate ACK
+telemetry windows, CPU and actual TLS payload rates. These are decoded command
+rates, not physical FPS. The bounded userspace relay has a 10 Mbit/s ceiling;
+its two queued 16 KiB chunks can limit bulk throughput at larger delays.
+The numeric PCM reserve is 1.7 Mbit/s; these graphics cases play no audio.
+The optional controller conservatively reduces bitrate/FPS after multi-second
+cold-start ACKs and recovers gradually. It underperforms at shorter delays in
+these windows and improves delivery in the longer high-delay case. This is not
+uniform performance improvement or a reason for default promotion. The 24
+representative plus 16 controller cases constitute 40 final-runtime workload
+runs, separate from the older 200-candidate and 44-v2 receipts.
+
+### Checks, package and remaining acceptance
+
+`artifacts/plan-upgrades/make-check-v2.log` records 82 Python tests run with
+three optional skips, five PoC Rust tests, four PoC startup checks, all 13 broker
+groups, 157 bridge library tests with one separately executed benchmark ignored
+by default, the frontend lifecycle test, 13 controller-binary tests, the bitmap
+wire test and five clipboard wire tests. Both skipped GPU opt-ins were executed
+separately: all four native video checks passed in
+`artifacts/plan-upgrades/native-nvenc-final-tests.log`. The older PoC loopback
+interop opt-in was not run; current frontend interop is covered by the strict
+real-desktop FreeRDP cases. Rust formatting, all-target bridge Clippy and
+whitespace checks passed.
+
+The unprivileged combined `1.1.0-1` build includes the maintained compositor's
+three headless and five input-protocol checks, all bridge/wire/broker checks,
+and 72 package-source Python tests with three skips: the two GPU opt-ins and
+the prepared-FreeRDP audio fixture, whose development libraries are outside that
+source tree. The audio fixture passes in the root suite, and the native GPU
+checks pass separately. `artifacts/plan-upgrades/package-build-v3.log` records
+the successful final runtime rebuild, including the shared-connection missed-wake
+and duplicate-cadence corrections. Its complete Rust/wire suite includes the
+159 library tests and both new cadence regressions.
+The existing pinned Niri test-only unused-import warning and build-path string
+notice remain in that log; neither is a failed runtime check. The package
+validator inspected safe paths, service/PAM scope, required helpers/docs and
+executable ELF files before unprivileged extraction.
+
+Final runtime package binaries under `artifacts/plan-upgrades/package-final-v3/`
+passed software-compositor AVC420 with `GPU_CAPTURE=auto`, positively exercising
+unsupported-DMA-BUF fallback to SHM; software AVC444/SHM; and explicit
+NVENC-configured bitmap fallback (`software-correctness-handoff.json`). All
+software-renderer cases recorded zero native GPU-capture activations.
+Hardware-compositor GPU AVC444 through the login form passed
+(`package-handoff-gpu444.json`), with 14 native activations across the odd and
+portrait/landscape layouts, actual decoded AVC444, JIS punctuation passwords,
+wrong-password rejection, held-input release, reconnect, compositor-crash cleanup
+and namespace test-broker lease EOF. Real bidirectional clipboard also passed
+again (`package-handoff-clipboard.json`). The earlier bitmap/login/Fcitx case
+passed private Mozc conversion and profile preservation. Clipboard teardown/
+startup races and pre-dechunk limits retain Rust/wire regression coverage.
+
+Runtime and package checks use private sockets, disposable namespaces and
+unprivileged staging. Source/cache preparation is not an installed-machine test.
+The final documentation refresh is packaged without recompiling runtime code;
+`package-handoff.json` verifies its archive hash, current installed documents,
+source snapshot and all 27 runtime/configuration/license hashes against the
+measured `runtime-package-file-hashes-v3.json`. The final extraction is
+`artifacts/plan-upgrades/package-final/`. Environment versions are recorded in
+`environment.json`. Combined portable and legacy source-export verification
+receipts are `source-export-validation.json` and `legacy-source-validation.json`;
+they verify restored source hashes, notices and both compositor patches outside
+the checkout, using locked cached dependencies without installation.
+
+Actual Windows 10 mstsc clarity, presentation latency/FPS, 100/150/200% DPI,
+cursor behavior, clipboard/toolkit interaction, minimized refresh, constrained
+links, repeated reconnects and listening remain pending after the user's clean
+reinstall. At least 30 minutes each of Firefox/YouTube and VLC flash/tone content,
+with initial/final A/V offset, pause/resume, stalls and reconnects, are required.
+Cold boot, service-account GPU permissions, monitor off/disconnected, real
+PAM/logind authorization and final installed-session cleanup also remain pending.
+See [the acceptance matrix](acceptance.md) and [performance procedures](performance.md).
+
 ## Growing Firefox playback delay and fresh completion feedback, 2026-10-13
 
 The user reported a growing one-to-two-second audio lag during Firefox YouTube

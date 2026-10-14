@@ -6,6 +6,7 @@ BRIDGE_CARGO_HOME ?= $(if $(wildcard $(CURDIR)/bridge/.cargo-cache),$(CURDIR)/br
 check:
 	python3 -m unittest discover -s tests -v
 	CARGO_HOME="$(POC_CARGO_HOME)" cargo test --locked --offline --manifest-path poc/Cargo.toml
+	CARGO_HOME="$(POC_CARGO_HOME)" cargo build --locked --offline --manifest-path poc/Cargo.toml
 	python3 poc/tests/startup.py
 	$(MAKE) -C broker check
 	CARGO_HOME="$(BRIDGE_CARGO_HOME)" cargo test --locked --offline --manifest-path bridge/Cargo.toml

@@ -27,9 +27,10 @@ window. Reconnect before expiry to resume; otherwise the broker fully logs out
 and cleans up the desktop, and the next login creates a fresh one after cleanup.
 The timer starts when the broker observes detachment, including frontend exit.
 Logout, compositor exit or broker shutdown ends the desktop immediately.
-The single-connection reject policy can temporarily reject reconnect after a
-silent network loss until the old TCP connection is detected as closed; retry
-then. Installed Windows behavior remains pending validation.
+The single-connection reject policy remains. Linux TCP keepalive and an
+outstanding-write timeout now detect silent loss independently of desktop activity;
+private blackhole tests measured about 20–23 seconds. Retention starts at observed
+detachment. Installed Windows behavior remains pending validation.
 The disposable mode and namespace test broker do not prove persistent PAM-backed
 resume. A compositor crash terminates the capture stream with the library
 `Ok(None)` contract, ending the connection and releasing its broker lease; the frontend keeps accepting.
@@ -85,9 +86,13 @@ output is resized to that same pixel size before capture. The worker retains onl
 latest frame and reuses a mapped SHM buffer until its layout changes. Native BGR
 frames need one owned snapshot copy; padded, inverted or RGB frames are normalized.
 `NIRI_RDP_FPS` bounds capture to 1..60 fps (default 60 with NVENC, 30 with bitmap).
-Capture time counts toward the frame budget and input wakes the worker between
-captures, including at low frame rates. Wayland dispatch/capture waits have
-bounded deadlines. Output removal or capture failure closes the connection.
+Capture time counts toward the frame budget. An eventfd wakes capture negotiation,
+readback and idle waits to service input. Adjacent motion and resize requests
+coalesce within bounded queues while ordered input remains a barrier. Damage-aware
+capture waits on quiet output; health roundtrips distinguish idle from compositor
+failure. Bitmap clients receive sparse rectangles reconstructed from complete
+latest snapshots; video always receives a complete desktop. Output removal or
+capture failure closes the connection.
 
 ## Desktop codecs
 
@@ -96,13 +101,14 @@ bounded deadlines. Output removal or capture failure closes the connection.
 FFmpeg's `h264_nvenc` and send H.264 AVC420 over the negotiated RDP graphics
 channel. Clients without the required graphics/codec capabilities receive bitmap
 updates. The patched headless compositor prefers hardware EGL devices, including
-NVIDIA, and advertises DMA-BUF formats for GPU applications. Its `auto` policy
-falls back to surfaceless rendering if hardware is unavailable; the session
-worker's `software` policy forces llvmpipe. Capture still reads pixels through SHM.
+NVIDIA, and advertises DMA-BUF formats for GPU applications. Its `auto` policy falls back to surfaceless rendering if hardware is unavailable;
+the session worker's `software` policy forces llvmpipe. SHM remains the default
+capture path; GPU capture is an explicit option.
 NVENC accelerates the frontend's video encoding independently of compositor
 rendering. FFmpeg's software scaler converts the captured pixels to full-range
-BT.709 NV12 before NVENC encoding, as required by AVC420. This path does not use
-NVDEC; the RDP client decodes the video.
+BT.709 NV12 before NVENC encoding, as required by AVC420. This default path does not use NVDEC; the RDP client decodes the video. An opt-in
+DMA-BUF/EGL/CUDA path keeps supported capture and BT.709 conversion on the GPU,
+with SHM fallback. See [performance controls](../docs/performance.md).
 
 Color conversion uses up to four FFmpeg workers for larger desktops. A padded
 BGR staging frame enables parallel conversion; small or single-core frames use
@@ -122,8 +128,9 @@ live NVENC rate control without recreating the encoder. Tracking stays bounded
 and resets for reconnects; the graphics acknowledgement-suspension sentinel is
 handled as a protocol mode. Bitmap fallback retains its existing transport.
 See [installation](../docs/install.md#optional-nvidia-encoding) for GPU access and
-renderer policy configuration. This remains a SHM capture path with CPU color
-conversion; it does not claim zero-copy GPU capture and encoding.
+renderer policy configuration. The default remains SHM capture with CPU color conversion. Select GPU capture
+explicitly only with the documented device access and a supported import path;
+server/client decoding timings do not establish physical presentation latency.
 
 Explicit NVENC mode validates the hardware encoder at startup and fails with an
 error if initialization is unavailable. It requires an NVENC-capable NVIDIA GPU,
@@ -216,12 +223,12 @@ Held keys/buttons are released at disconnect, and a bounded compositor sync
 acknowledgment completes input teardown before the socket closes.
 RDP set-1 E0 codes map explicitly to Linux evdev codes. Pointer absolute and
 relative motion is bounded before mapping into the capture output. Click
-coordinates travel with the button event. Output scale 1 and normal transform
-are required; unsupported layouts fail closed. Unicode events commit exact text through a temporary one-level XKB map, including
+coordinates travel with the button event. Normal transform and the explicitly selected output scale are required; unsupported layouts fail closed. Unicode events commit exact text through a temporary one-level XKB map, including
 Japanese and UTF-16 surrogate pairs (emoji). Each character is a balanced tap; the
 physical keymap and held modifiers are restored afterward. Phone-side IME
-composition can submit committed text this way. Pause/E1, clipboard and
-lock-screen behavior remain work.
+composition can submit committed text this way. Pause/E1 and lock-screen behavior remain work. Bidirectional Unicode text
+clipboard uses CLIPRDR and private-session Wayland data control, with bounded
+payloads/deadlines and reconnect cleanup; host-local clipboard access is excluded.
 
 ## Session audio
 
@@ -230,7 +237,7 @@ TLS-protected `rdpsnd` channel. Each desktop starts its own PipeWire,
 PipeWire-Pulse and WirePlumber instances, with a virtual default output named
 **Remote Desktop Audio**. Hardware discovery is disabled on that private graph.
 Applications use its private runtime and Pulse socket; the frontend receives
-only a broker-authorized raw PCM descriptor, without access to the user's runtime.
+only a broker-authorized versioned PCM capture descriptor, without access to the user's runtime.
 This follows GNOME Remote Login's session-playback model: capture an audio sink
 and send it through RDP ([GNOME implementation](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dvc-audio-playback.c)).
 
@@ -274,7 +281,12 @@ capture continuously through socket stalls with bounded buffers.
 Like GNOME, RDPSND timestamps are zero: this desktop uses RDPGFX, without the
 RDPEVOR shared presentation clock that the Wave2 audio timestamp accompanies.
 Internal monotonic times still bound queue age and measure confirmation delays.
-The raw monitor stream carries no upstream sample timestamps. Actual Windows
+The private NRA1 framing carries sequence and CLOCK_MONOTONIC source/relay times.
+Source age begins at the helper's first monitor read, excluding earlier application
+and PipeWire buffering. The frontend expires capture using that source age.
+Audio waits on readiness, feedback and exact pacing deadlines instead of fixed
+two-millisecond polling. Private graph/helper retries are finite; ancillary audio
+failure permits a usable desktop and reconnect obtains a fresh capture descriptor. Actual Windows
 lip-sync and recovery are checked separately; client output latency is not a
 server-controlled shared presentation clock.
 Disposable compositor mode has no audio backend.
@@ -295,8 +307,10 @@ pixels per axis. During the session, clients with the RDP Display Control channe
 can request a new single-display layout at the origin. Live dimensions must be
 200..4096 pixels per axis, with even width as required by Display Control; odd
 heights and portrait layouts are supported. Unsupported layouts are ignored.
-Clients without Display Control keep their initial size. Physical monitor size
-and client DPI scaling do not change the remote output scale, which remains 1.
+Clients without Display Control keep their initial size. Display Control desktop scale metadata selects logical output scaling when
+`NIRI_RDP_SCALE=client` (default); an explicit 1.0–5.0 override takes precedence.
+Physical RDP pixels remain distinct from logical application coordinates. The
+initial scale is 1 until client scale metadata is available.
 
 The capture worker applies each mode through wlr output management on its
 authenticated Wayland connection and verifies Niri's current mode. The maintained
@@ -341,3 +355,13 @@ fixture is transport validation only and does not replace real PAM/logind boot
 testing. The FreeRDP client enables automatic logon to send TLS ClientInfo
 credentials; it retries rejected TLS attempts, whose client error is currently
 a generic transport failure. See coordinator validation for the packaged rerun.
+
+## Upgrade controls and measurements
+
+See [performance](../docs/performance.md) for profile, codec, GPU capture, link
+budget, DPI, diagnostics and reproducible private workload controls. AVC444 and
+new graphics cadence/window policies remain opt-in pending comparative and
+Windows acceptance. Login rendering caches its background and complete refresh;
+bitmap field edits repaint a region, and password edits under the fixed nonempty
+mask do not trigger pixel notifications. XKB maps are cached on their owning
+input thread.

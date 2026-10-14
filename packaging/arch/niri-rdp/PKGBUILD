@@ -3,7 +3,7 @@
 # Local inputs are copied and checksum-verified by makepkg, never built in place.
 # Export a portable source bundle with makepkg --allsource.
 pkgname=niri-remote-login
-pkgver=1.0.2
+pkgver=1.1.0
 pkgrel=1
 pkgdesc='Niri remote desktop host with a PAM/logind broker and dedicated headless compositor'
 arch=('x86_64')
@@ -16,7 +16,7 @@ depends=('pam' 'systemd' 'systemd-libs' 'dbus' 'wayland' 'libxkbcommon'
          'openssl' 'python' 'python-gobject' 'glib2' 'pipewire' 'pipewire-pulse' 'wireplumber' 'libpulse'
          'xdg-desktop-portal' 'xdg-desktop-portal-gtk')
 makedepends=('rust>=1.94' 'cargo' 'git' 'gcc' 'pkgconf')
-provides=('niri-rdp-headless=26.04.remote1-6')
+provides=('niri-rdp-headless=26.04.remote1-8')
 conflicts=('niri-rdp-headless')
 backup=('etc/niri-rdp/frontend.conf' 'etc/niri-rdp/headless.kdl' 'etc/niri-rdp/waybar.json' 'etc/niri-rdp/renderer.conf' 'etc/pam.d/niri-rdp')
 _revision=0be60b742762905b7bee1ea67bb5a2fb00859bf0
@@ -37,12 +37,15 @@ if [[ -f "$_checkout/bridge/Cargo.lock" && -f "$_checkout/LICENSE" ]]; then
                 packaging/frontend.conf packaging/nvidia-frontend.conf
                 packaging/niri-rdp.sysusers packaging/niri-rdp-setup.py
                 packaging/prepare-tls.py scripts/collect-licenses.py
+                scripts/loopback_link.py tests/test_performance_harness.py
                 tests/__init__.py tests/test_host_setup.py tests/test_session_environment.py
-                tests/test_native_video.py tests/video_guard.c tests/video_rate.c tests/test_audio.py tests/audio_codec.c tests/audio_rdpsnd.c
-                compositor/patches/0001-remote-headless-bounds-and-startup.patch)
+                tests/test_native_video.py tests/video_guard.c tests/video_rate.c tests/video_avc444.c tests/video_gpu.c tests/test_audio.py tests/audio_codec.c tests/audio_rdpsnd.c
+                compositor/pins.json)
   while IFS= read -r -d '' _file; do
     _local_files+=("${_file#"$_checkout/"}")
-  done < <(find "$_checkout/bridge/src" "$_checkout/broker/config" \
+  done < <(find "$_checkout/bridge/src" "$_checkout/bridge/tests" "$_checkout/bridge/vendor" "$_checkout/bridge/protocols" \
+                "$_checkout/compositor/patches" "$_checkout/broker/config" \
+                "$_checkout/compositor/protocols" \
                 "$_checkout/packaging/systemd" "$_checkout/docs" \
                 -type f ! -name '*.pyc' -print0 | sort -z)
   for _file in "${_local_files[@]}"; do
@@ -99,13 +102,16 @@ prepare() {
   # absent from the archive and otherwise survive extraction, breaking rebuilds.
   # Preserve the old generated file before the patch creates its replacement.
   local generated previous
-  for generated in src/protocols/virtual_keyboard.rs src/protocols/input_method.rs; do
+  for generated in src/protocols/virtual_keyboard.rs src/protocols/input_method.rs src/protocols/remote_cursor.rs resources/niri-rdp-cursor-v1.xml; do
     if [[ -f $generated ]]; then
       previous=$(mktemp -d "$srcdir/niri-rdp-previous-patch.XXXXXX")
       mv "$generated" "$previous/${generated##*/}"
     fi
   done
-  patch -Np1 -i "$srcdir/niri-remote-login-$pkgver/compositor/patches/0001-remote-headless-bounds-and-startup.patch"
+  local patch_file
+  for patch_file in "$srcdir/niri-remote-login-$pkgver"/compositor/patches/*.patch; do
+    patch -Np1 -i "$patch_file"
+  done
   export CARGO_HOME="$srcdir/cargo-home"
   cargo fetch --locked
   python "$srcdir/niri-remote-login-$pkgver/scripts/collect-licenses.py" Cargo.toml THIRD-PARTY-NOTICES.txt
@@ -135,7 +141,7 @@ check() {
   cd "$srcdir/niri-remote-login-$pkgver"
   env -u CFLAGS -u CXXFLAGS cargo test --locked --offline --manifest-path bridge/Cargo.toml
   make -C broker check
-  python -m unittest tests.test_host_setup tests.test_session_environment tests.test_native_video tests.test_audio -v
+  python -m unittest tests.test_host_setup tests.test_session_environment tests.test_native_video tests.test_audio tests.test_performance_harness -v
 }
 
 package() {
@@ -157,7 +163,7 @@ package() {
   install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
   install -Dm644 THIRD-PARTY-NOTICES.txt "$pkgdir/usr/share/licenses/$pkgname/THIRD-PARTY-NOTICES.txt"
   install -Dm644 README.md "$pkgdir/usr/share/doc/$pkgname/README.md"
-  for document in install acceptance upgrade uninstall; do
+  for document in install acceptance upgrade uninstall performance; do
     install -Dm644 "docs/$document.md" "$pkgdir/usr/share/doc/$pkgname/$document.md"
   done
   install -Dm644 packaging/nvidia-frontend.conf "$pkgdir/usr/share/doc/$pkgname/nvidia-frontend.conf"

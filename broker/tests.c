@@ -346,11 +346,32 @@ static void test_detach_timeout(void) {
     assert(kill(worker, 0) == -1 && errno == ESRCH);
     puts("PASS expired detach grace ends holder and cleans worker, PAM session and credentials");
 }
+static void test_desktop_without_audio(void) {
+    int response[2], desktop[2];
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, response) == 0);
+    assert(socketpair(AF_UNIX, SOCK_STREAM | SOCK_CLOEXEC, 0, desktop) == 0);
+    assert(respond_session(response[1], desktop[0], "/no-private-audio-here", getuid(), getgid()) == 0);
+    unsigned char bytes[5];
+    struct iovec iov = {.iov_base=bytes, .iov_len=sizeof(bytes)};
+    union { struct cmsghdr align; char bytes[CMSG_SPACE(2 * sizeof(int))]; } ancillary;
+    struct msghdr msg = {.msg_iov=&iov, .msg_iovlen=1,
+        .msg_control=ancillary.bytes, .msg_controllen=sizeof(ancillary.bytes)};
+    assert(recvmsg(response[0], &msg, MSG_CMSG_CLOEXEC) == 5);
+    assert(!memcmp(bytes, "NRB1\0", 5));
+    struct cmsghdr *c = CMSG_FIRSTHDR(&msg);
+    assert(c && c->cmsg_type == SCM_RIGHTS && c->cmsg_len == CMSG_LEN(sizeof(int)));
+    int received; memcpy(&received, CMSG_DATA(c), sizeof(received));
+    assert(write(desktop[1], "D", 1) == 1);
+    char byte; assert(read(received, &byte, 1) == 1 && byte == 'D');
+    close(received); close(response[0]); close(response[1]); close(desktop[0]); close(desktop[1]);
+    puts("PASS unavailable ancillary audio preserves authenticated desktop descriptor handoff");
+}
 int main(void) {
     test_request_bounds(); test_conversation(); test_rollback(); test_fd_transfer(); test_process_cleanup();
     test_auth_failures(); test_launch_failure(); test_group_authorization(); test_peer();
     test_resume_session();
     test_detach_timeout();
+    test_desktop_without_audio();
     assert(valid_id("c42") && !valid_id("../gdm") && !valid_id(""));
-    printf("%d native broker groups passed; %d skipped (no PAM/logind session created)\n", 12-peer_skipped, peer_skipped); return 0;
+    printf("%d native broker groups passed; %d skipped (no PAM/logind session created)\n", 13-peer_skipped, peer_skipped); return 0;
 }

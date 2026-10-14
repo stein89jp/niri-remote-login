@@ -12,10 +12,15 @@ ironrdp-server = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019c
 ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
 ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
 ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
+ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
+ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
 ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
 ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
 tokio = { version = "1", features = ["macros", "rt", "time", "signal", "sync"] }
 wayland-client = "=0.31.14"
+wayland-protocols = { version = "=0.32.13", features = ["client", "unstable"] }
+wayland-scanner = "=0.31.11"
 wayland-protocols-wlr = { version = "=0.3.12", features = ["client"] }
 wayland-protocols-misc = { version = "=0.3.12", features = ["client"] }
 tempfile = "=3.20.0"
@@ -23,8 +28,12 @@ xkbcommon = "=0.9.0"
 libc = "0.2"
 
 [dev-dependencies]
-ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
+ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322" }
 
 [build-dependencies]
 cc = "1"
 pkg-config = "0.3"
+
+# Maintained server support; every upstream protocol crate keeps the exact pin.
+[patch."https://github.com/Devolutions/IronRDP"]
+ironrdp-server = { path = "vendor/ironrdp-server" }

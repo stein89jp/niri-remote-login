@@ -1,9 +1,13 @@
 //! Real desktop adapter. IronRDP owns every RDP wire operation.
 pub mod audio;
 pub mod broker;
+pub mod clipboard;
+mod cursor_protocol;
+mod gpu_capture;
 pub(crate) mod keyboard;
 pub mod login;
 mod login_compose;
+pub mod network;
 pub mod performance;
 pub mod video;
 pub mod wayland;
@@ -194,9 +198,117 @@ pub fn bitmap(
     })
 }
 
+/// Compare complete retained desktops, so skipped capture notifications cannot
+/// lose damage. At most 32 rectangular tiles are returned; broad damage uses a
+/// full-frame update. Subregions share immutable Bytes without pixel copies.
+pub(crate) fn bitmap_damage(
+    previous: Option<&BitmapUpdate>,
+    image: &BitmapUpdate,
+) -> Vec<BitmapUpdate> {
+    let Some(previous) = previous.filter(|old| {
+        old.width == image.width
+            && old.height == image.height
+            && old.format == image.format
+            && old.stride == image.stride
+    }) else {
+        return vec![image.clone()];
+    };
+    if previous.data == image.data {
+        return Vec::new();
+    }
+    let width = usize::from(image.width.get());
+    let height = usize::from(image.height.get());
+    let bpp = usize::from(image.format.bytes_per_pixel());
+    let mut regions: Vec<(usize, usize, usize, usize)> = Vec::new();
+    let mut area = 0usize;
+    for y in (0..height).step_by(64) {
+        let h = (height - y).min(64);
+        let mut run: Option<(usize, usize)> = None;
+        for x in (0..width).step_by(64).chain(std::iter::once(width)) {
+            let w = (width - x).min(64);
+            let changed = x != width
+                && (y..y + h).any(|row| {
+                    let start = row * image.stride.get() + x * bpp;
+                    previous.data[start..start + w * bpp] != image.data[start..start + w * bpp]
+                });
+            if changed {
+                area += w * h;
+                if area * 2 >= width * height {
+                    return vec![image.clone()];
+                }
+                run = Some(run.map_or((x, w), |(start, length)| (start, length + w)));
+            } else if let Some((start, length)) = run.take() {
+                if let Some(rect) = regions
+                    .iter_mut()
+                    .rev()
+                    .find(|rect| rect.0 == start && rect.2 == length && rect.1 + rect.3 == y)
+                {
+                    rect.3 += h;
+                } else {
+                    if regions.len() == 32 {
+                        return vec![image.clone()];
+                    }
+                    regions.push((start, y, length, h));
+                }
+            }
+        }
+    }
+    regions
+        .into_iter()
+        .map(|(x, y, width, height)| {
+            image
+                .sub(
+                    x as u16,
+                    y as u16,
+                    NonZeroU16::new(width as u16).unwrap(),
+                    NonZeroU16::new(height as u16).unwrap(),
+                )
+                .unwrap()
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn sparse_bitmap_damage_accumulates_skipped_and_overlapping_changes() {
+        let target = DesktopSize {
+            width: 256,
+            height: 256,
+        };
+        let mut pixels = vec![0u8; 256 * 256 * 4];
+        let initial = capture_bitmap(&pixels, 256, 256, 1024, false, target, false).unwrap();
+        assert!(bitmap_damage(Some(&initial), &initial).is_empty());
+        pixels[4] = 1;
+        // An intermediate capture changes one tile but is never delivered.
+        let skipped = capture_bitmap(&pixels, 256, 256, 1024, false, target, false).unwrap();
+        pixels[4] = 2;
+        pixels[(130 * 256 + 130) * 4] = 3;
+        let current = capture_bitmap(&pixels, 256, 256, 1024, false, target, false).unwrap();
+        let damage = bitmap_damage(Some(&initial), &current);
+        assert_eq!(damage.len(), 2);
+        assert_eq!(
+            (
+                damage[0].x,
+                damage[0].y,
+                damage[0].width.get(),
+                damage[0].height.get()
+            ),
+            (0, 0, 64, 64)
+        );
+        assert_eq!((damage[1].x, damage[1].y), (128, 128));
+        assert_eq!(damage[0].data[4], 2);
+        assert_eq!(skipped.data[4], 1);
+        assert_eq!(damage[1].data[(2 * 256 + 2) * 4], 3);
+        let mut broad = pixels.clone();
+        broad.fill(99);
+        let full = capture_bitmap(&broad, 256, 256, 1024, false, target, false).unwrap();
+        let fallback = bitmap_damage(Some(&current), &full);
+        assert_eq!(fallback.len(), 1);
+        assert_eq!(fallback[0].width.get(), 256);
+        assert_eq!(fallback[0].height.get(), 256);
+    }
     #[test]
     fn scancode_extended_keys_are_distinct_and_unknown_is_rejected() {
         assert_eq!(evdev_key(0x1d, false), Some(29));

@@ -1,7 +1,7 @@
 # Standalone patched binary: does not replace the installed /usr/bin/niri.
 pkgname=niri-rdp-headless
 pkgver=26.04.remote1
-pkgrel=6
+pkgrel=8
 pkgdesc='Pinned PR3953 Niri headless compositor for isolated remote-login sessions'
 arch=('x86_64')
 license=('GPL-3.0-or-later')
@@ -11,15 +11,26 @@ makedepends=('rust' 'cargo' 'git' 'gcc' 'pkgconf' 'python')
 _revision=0be60b742762905b7bee1ea67bb5a2fb00859bf0
 source=("niri-$_revision.tar.gz::https://codeload.github.com/niri-wm/niri/tar.gz/$_revision"
         '0001-remote-headless-bounds-and-startup.patch'
+        '0002-remote-cursor-capture.patch'
         'collect-licenses.py')
 # Patch hash is filled by scripts/prepare-release.py after source validation.
 sha256sums=('680374cae233d2ed1e0f8474aeb017e36872b30b9e291ce43b1521724b8fe2a9'
             '@PATCH_SHA256@'
+            '@CURSOR_PATCH_SHA256@'
             '@LICENSE_SCRIPT_SHA256@')
 
 prepare() {
   cd "$srcdir/niri-$_revision"
-  patch -Np1 -i "$srcdir/0001-remote-headless-bounds-and-startup.patch"
+  local generated previous patch_file
+  for generated in src/protocols/virtual_keyboard.rs src/protocols/input_method.rs src/protocols/remote_cursor.rs resources/niri-rdp-cursor-v1.xml; do
+    if [[ -f $generated ]]; then
+      previous=$(mktemp -d "$srcdir/niri-rdp-previous-patch.XXXXXX")
+      mv "$generated" "$previous/${generated##*/}"
+    fi
+  done
+  for patch_file in "$srcdir"/*.patch; do
+    patch -Np1 -i "$patch_file"
+  done
   export CARGO_HOME="$srcdir/cargo-home"
   cargo fetch --locked
   python "$srcdir/collect-licenses.py" Cargo.toml THIRD-PARTY-NOTICES.txt

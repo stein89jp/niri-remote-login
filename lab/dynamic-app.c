@@ -9,6 +9,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdbool.h>
+#include "performance-pattern.h"
 #include <string.h>
 #include <xkbcommon/xkbcommon.h>
 
@@ -42,6 +43,10 @@ static void draw(struct app *a) {
     if(fd<0 || ftruncate(fd,b->size)<0) {perror("memfd");exit(1);}
     b->data=mmap(NULL,b->size,PROT_READ|PROT_WRITE,MAP_SHARED,fd,0);
     if(b->data==MAP_FAILED){perror("mmap");exit(1);}
+    const char *workload = getenv("NIRI_RDP_TEST_WORKLOAD");
+    if (workload && a->frames >= 2 && (!strcmp(workload, "idle") || !strcmp(workload, "colored-text"))) {
+        munmap(b->data,b->size); close(fd); free(b); return;
+    }
     // Native little-endian XRGB8888: exact baseline BGRA 180,40,30,255.
     uint32_t color=a->button?0xff1eb428:a->key?0xffb4281e:0xff1e28b4;
     uint32_t *pixels=b->data;
@@ -49,6 +54,7 @@ static void draw(struct app *a) {
         for(unsigned x=0;x<a->width;x++)
             pixels[(size_t)y*a->width+x]=y+16>=a->height?
                 (0xff000000|((a->frames*3+x)%256)<<16|((a->frames*7)%256)<<8|x%256):color;
+    if (workload) performance_pattern(pixels,a->width,a->height,a->frames,workload);
     struct wl_shm_pool *pool=wl_shm_create_pool(a->shm,fd,b->size);
     b->wl=wl_shm_pool_create_buffer(pool,0,a->width,a->height,a->width*4,WL_SHM_FORMAT_XRGB8888);
     wl_shm_pool_destroy(pool);close(fd);
@@ -64,6 +70,10 @@ static void ping(void *d,struct xdg_wm_base *wm,uint32_t s){(void)d;xdg_wm_base_
 static const struct xdg_wm_base_listener wm_listener={.ping=ping};
 static void configured(void *d,struct xdg_surface *s,uint32_t serial) {
     struct app *a=d;xdg_surface_ack_configure(s,serial);
+    const char *workload=getenv("NIRI_RDP_TEST_WORKLOAD");
+    if(a->configured && workload && (!strcmp(workload,"idle") || !strcmp(workload,"colored-text"))) {
+        a->frames=0;draw(a);
+    }
     if(!a->configured){a->configured=true;draw(a);}
 }
 static const struct xdg_surface_listener xdg_listener={.configure=configured};

@@ -147,3 +147,12 @@ binaries linked to Arch's GPL-enabled FFmpeg require GPL-compliant distribution.
 License texts, third-party notices, matching source bundles, and dependency-source
 links are available with the [release downloads](https://github.com/stein89jp/niri-remote-login/releases).
 See [docs/licensing.md](docs/licensing.md) for component scope and source access.
+
+The performance upgrade adds damage-aware bitmap updates, responsive bounded
+input/resize handling, cached login pixels, ACK baseline recovery, separate cursor
+updates, private text clipboard and client/explicit DPI scaling. Optional AVC444,
+GPU capture and measured quality profiles are described in
+[performance controls](docs/performance.md). The accepted PCM audio combination
+is preserved; private helper recovery and silent-loss detection improve resilience.
+Actual Windows acceptance remains a post-install check in
+[acceptance](docs/acceptance.md).

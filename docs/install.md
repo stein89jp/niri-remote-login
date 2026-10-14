@@ -186,7 +186,8 @@ Super+Shift+Q logs out and ends the desktop; compositor exit or stopping
 the broker also ends it. A frontend restart preserves the desktop only if you reconnect
 within the same 45-second grace window. After a silent network
 failure, the frontend may temporarily reject a reconnect while it still considers
-the old connection active; retry once it detects that connection has closed.
+the old connection active. Keepalive/write deadlines bound detection; private
+blackhole checks measured about 20–23 seconds, after which a retry can authenticate.
 Each resume rechecks PAM authentication, account policy and group authorization;
 a revoked or expired account cannot resume.
 The compositor
@@ -203,8 +204,10 @@ Configuration priority is `~/.config/niri-rdp/config.kdl`, then your usual
 is honored when set. Each selected configuration is included by a temporary
 wrapper that starts the private desktop portal and ordinary XDG autostart after
 Niri creates its display.
-For your usual configuration, the wrapper also keeps `HEADLESS-1` at scale 1 with
-normal orientation and supplies a private bar startup helper. Physical output
+For your usual configuration, the wrapper starts `HEADLESS-1` at scale 1 with
+normal orientation and supplies a private bar startup helper. The frontend can
+then apply client Display Control DPI scaling or an explicit `NIRI_RDP_SCALE`
+override without rewriting your Niri configuration. Physical output
 settings do not apply to this virtual output.
 Your original files are preserved. The helper waits up to two seconds for
 configured DMS/Waybar/Quickshell startup before supplying a bar; unusually slow or
@@ -394,14 +397,17 @@ logs out the desktop.
 The default `NIRI_RDP_ENCODER=bitmap` sends bitmap updates. A rebuilt frontend
 supports `NIRI_RDP_ENCODER=nvenc`, which passes captured desktop frames to
 FFmpeg's `h264_nvenc` encoder and sends H.264 through the RDP graphics channel
-as AVC420. The client must negotiate that graphics/codec support; otherwise the
+as AVC420 by default. Explicit AVC444 selection also requires client negotiation;
+see [performance controls](performance.md). Without compatible graphics support the
 connection uses bitmap updates. This is host-side encoding. Decoding happens
 on the RDP client, whose hardware acceleration depends on its own GPU and client.
 The current combined package includes NVENC; the archived
 `0.1.0-1` frontend binaries contain neither these fixes nor NVENC support.
-The frontend converts captured pixels to full-range BT.709 on the CPU before
-hardware H.264 encoding. Compositor rendering can run on the GPU, while capture
-still reads pixels through SHM; this is not a zero-copy GPU capture/encode path.
+By default, the frontend reads SHM pixels and converts them to full-range BT.709
+on the CPU before hardware H.264 encoding. Optional `NIRI_RDP_GPU_CAPTURE=auto`
+uses supported DMA-BUF capture, EGL conversion and CUDA/NVENC surfaces, with SHM
+fallback. See [device requirements and measurements](performance.md); GPU
+compositor rendering alone does not prove that capture stays on the GPU.
 
 On the separate test installation, use an NVENC-capable NVIDIA GPU, a working
 NVIDIA driver with its userspace libraries, and an FFmpeg build providing
@@ -498,3 +504,22 @@ sudo rm /etc/systemd/system/niri-rdp-frontend.service.d/nvidia.conf
 sudo systemctl daemon-reload
 sudo systemctl restart niri-rdp-frontend.service
 ```
+
+## Performance and desktop upgrades
+
+The combined 1.1.0 package includes damage-aware capture, input/resize coalescing,
+cached login rendering, stale-ACK recovery, separate negotiated cursor updates,
+private bidirectional Unicode text clipboard and deliberate DPI scaling. Clipboard
+payloads are text-only and limited to 1 MiB, with finite transfers. Enable
+clipboard in mstsc Local Resources.
+
+[Performance controls](performance.md) document optional AVC444, GPU capture,
+quality profiles, coordinated graphics cadence/window, total link budget and
+diagnostics. Existing speed/AVC420/SHM defaults and the accepted PCM audio controls
+remain the baseline. New audio framing and helper supervision are packaged with
+the frontend; a clean reinstall starts matching components. Audio failure permits
+a usable desktop; reconnect after helper recovery obtains fresh capture.
+
+After your clean reinstall, run the Windows and installed-machine checklist in
+[acceptance](acceptance.md), including thirty-minute playback. The recorded
+namespace/decoder checks do not substitute for that listening or display test.

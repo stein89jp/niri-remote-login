@@ -44,8 +44,8 @@ requires hardware EGL, verifies NVIDIA identification and DMA-BUF advertisement,
 and tests SHM capture/input with the NVENC RDP path. It exposes NVIDIA nodes and
 DRM render nodes only, preserving isolation from physical modesetting devices.
 The patch creates private `wayland-0` and HEADLESS-1 initially at 1920×1080, 60 Hz;
-scale=1 and transform=normal are enforced by the supplied config. Capture uses
-existing wlr SHM screencopy; input uses existing virtual keyboard/pointer
+scale=1 and transform=normal are enforced by the supplied config. Capture defaults to existing wlr SHM screencopy with damage waits; an optional
+DMA-BUF import path uses supported GPU buffers; input uses existing virtual keyboard/pointer
 protocols. The bridge changes the HEADLESS-1 mode through existing
 `zwlr_output_manager_v1` custom-mode configuration when a client connects or
 requests a new size. Changes preserve the output, workspaces and applications,
@@ -92,3 +92,11 @@ The fixture's text-input protocol XML is copied from the pinned
 `wayland-protocols` 0.32.13 crate with its upstream license intact; its hash is
 recorded in `pins.json`. The test mounts checkout startup helpers only in the
 private namespace and uses a disposable account database, bus and profile.
+
+The supplemental `0002-remote-cursor-capture.patch` adds a private, headless-only
+cursor protocol. It sends bounded RGBA shape FDs, hotspot, physical position and
+visibility metadata; ordinary motion reuses the last shape. The frontend selects
+it using negotiated RDP pointer limits and retains embedded-cursor fallback.
+Apply both maintained patches in order. Explicit output scaling separates physical
+capture pixels from logical application coordinates. See
+[performance controls](../docs/performance.md) for configuration and acceptance.

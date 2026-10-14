@@ -46,6 +46,7 @@ struct Disposable {
     path: PathBuf,
     output: String,
     video: Option<Video>,
+    clipboard: niri_rdp_bridge::clipboard::Clipboard,
 }
 #[async_trait::async_trait]
 impl ConnectionBinder for Disposable {
@@ -63,6 +64,7 @@ impl ConnectionBinder for Disposable {
         .map_err(|_| server_error("desktop startup task failed"))?
         .map_err(|_| server_error("explicit disposable Wayland socket unavailable"))?;
         *self.active.lock().unwrap() = Some(desktop.clone());
+        desktop.attach_clipboard(self.clipboard.clone());
         Ok(BoundConnection {
             display: match &self.video {
                 Some(video) => video.display(desktop.clone()),
@@ -76,6 +78,7 @@ struct Lifecycle {
     active: Option<Arc<Mutex<Option<Desktop>>>>,
     broker: Option<Arc<Broker>>,
     loopback_only: bool,
+    clipboard: niri_rdp_bridge::clipboard::Clipboard,
 }
 impl ConnectionHandler for Lifecycle {
     fn on_accept(&mut self, p: SocketAddr) -> bool {
@@ -87,6 +90,7 @@ impl ConnectionHandler for Lifecycle {
         duration: Duration,
         error: Option<&ServerError>,
     ) -> PostConnectionAction {
+        self.clipboard.clear();
         if let Some(error) = error {
             eprintln!(
                 "RDP connection {peer} ended after {:.2}s: {}",
@@ -129,6 +133,7 @@ async fn main() -> anyhow::Result<()> {
     let acceptor = identity.make_acceptor()?;
     let output = std::env::var("NIRI_RDP_OUTPUT").unwrap_or_else(|_| "HEADLESS-1".into());
     let video = Video::from_env()?;
+    let clipboard = niri_rdp_bridge::clipboard::Clipboard::default();
     let mut audio = niri_rdp_bridge::audio::Audio::default();
     if let Some(video) = &video {
         audio = audio.with_video(video.clone());
@@ -140,7 +145,8 @@ async fn main() -> anyhow::Result<()> {
                 output,
                 video.clone(),
             )
-            .with_audio(audio.clone()),
+            .with_audio(audio.clone())
+            .with_clipboard(clipboard.clone()),
         );
         // PAM receives ClientInfo credentials within authenticated server TLS.
         // Arbitrary PAM passwords do not supply a server-side NLA/NTLM secret.
@@ -155,11 +161,13 @@ async fn main() -> anyhow::Result<()> {
             }))
             .with_gfx_factory(video.as_ref().map(|v| Box::new(v.clone()) as _))
             .with_sound_factory(Some(Box::new(audio.factory())))
+            .with_cliprdr_factory(Some(Box::new(clipboard.clone())))
             .with_connection_policy(ConnectionPolicy::Reject)
             .with_connection_handler(Some(Box::new(Lifecycle {
                 broker: Some(broker.clone()),
                 active: None,
                 loopback_only: false,
+                clipboard: clipboard.clone(),
             })))
             .build();
         server.set_credential_validator(Some(broker.clone()));
@@ -182,11 +190,13 @@ async fn main() -> anyhow::Result<()> {
                 height: 4096,
             }))
             .with_gfx_factory(video.as_ref().map(|v| Box::new(v.clone()) as _))
+            .with_cliprdr_factory(Some(Box::new(clipboard.clone())))
             .with_connection_policy(ConnectionPolicy::Reject)
             .with_connection_handler(Some(Box::new(Lifecycle {
                 broker: None,
                 active: Some(active.clone()),
                 loopback_only: true,
+                clipboard: clipboard.clone(),
             })))
             .build();
         server.set_credentials(Some(Credentials {
@@ -199,6 +209,7 @@ async fn main() -> anyhow::Result<()> {
             output,
             active,
             video: video.clone(),
+            clipboard: clipboard.clone(),
         })));
         server
     } else {
@@ -209,6 +220,12 @@ async fn main() -> anyhow::Result<()> {
         video.set_suppressed(server.display_suppressed_handle());
     }
     server.set_auto_reconnect_cookie(None);
+    server.set_tcp_socket_config(Some(niri_rdp_bridge::network::configure_tcp_liveness));
+    server.enable_heartbeat(ironrdp_server::heartbeat::HeartbeatConfig {
+        period_secs: 5,
+        warning_count: 3,
+        reconnect_count: 3,
+    });
     println!("Niri RDP frontend on {listen} ({mode}); dedicated session only");
     tokio::select! {result=server.run()=>result?,result=tokio::signal::ctrl_c()=>result?}
     Ok(())
@@ -224,6 +241,7 @@ mod tests {
             active: None,
             broker: None,
             loopback_only: false,
+            clipboard: Default::default(),
         };
         let remote = "192.168.1.50:50000".parse().unwrap();
         assert!(lifecycle.on_accept(remote));

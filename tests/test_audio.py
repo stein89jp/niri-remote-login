@@ -19,6 +19,26 @@ from unittest.mock import Mock, patch
 ROOT = Path(__file__).resolve().parents[1]
 
 
+CAPTURE_HEADER = struct.Struct("!4sIQQQ")
+
+
+def read_exact(connection, length):
+    data = bytearray()
+    while len(data) < length:
+        piece = connection.recv(length - len(data))
+        if not piece:
+            raise EOFError("private capture ended mid-frame")
+        data.extend(piece)
+    return bytes(data)
+
+
+def receive_capture(connection):
+    magic, length, sequence, source_at, relay_at = CAPTURE_HEADER.unpack(read_exact(connection, CAPTURE_HEADER.size))
+    if magic != b"NRA1" or length != 3840 or source_at > relay_at or relay_at > time.monotonic_ns():
+        raise ValueError("invalid private PCM framing")
+    return read_exact(connection, length), sequence, source_at, relay_at
+
+
 class AudioCodecTests(unittest.TestCase):
     def test_audio_codecs_roundtrip_and_dropped_blocks(self):
         if not shutil.which("cc") or not shutil.which("pkg-config"):
@@ -108,11 +128,68 @@ class AudioStartupTests(unittest.TestCase):
                     patch.object(self.module.subprocess, "Popen", side_effect=self.processes), \
                     patch.object(self.module, "wait_for_sink", side_effect=RuntimeError("private audio sink unavailable")):
                 with self.assertRaisesRegex(RuntimeError, "private audio sink unavailable"):
-                    self.module.main()
+                    self.module.run_graph(Path(directory), {})
             self.assertFalse(Path(directory, "audio-0").exists())
         for process in self.processes:
             process.terminate.assert_called_once()
             process.wait.assert_called_once_with(timeout=2)
+
+
+    def test_graph_restart_attempts_are_finite_and_back_off(self):
+        with patch.object(self.module, "run_graph", side_effect=RuntimeError("failed")) as run, \
+                patch.object(self.module.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                self.module.supervise_graph(Path("/private"), {})
+        self.assertEqual(run.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.25, 0.5])
+
+    def test_capture_rejects_older_unframed_readiness_without_starting_monitor(self):
+        client, capture = socket.socketpair()
+        client.sendall(b"A")
+        client.shutdown(socket.SHUT_WR)
+        with patch.object(self.module.subprocess, "Popen") as spawn:
+            self.module.capture(capture, {})
+        spawn.assert_not_called()
+        client.close()
+
+
+class SessionWorkerRecoveryTests(unittest.TestCase):
+    def test_audio_startup_failure_does_not_end_desktop_and_restarts_are_bounded(self):
+        with tempfile.TemporaryDirectory(prefix="niri-audio-worker-") as directory:
+            root = Path(directory)
+            binaries = root / "bin"
+            binaries.mkdir()
+            worker = (ROOT / "broker/config/session-worker").read_text().replace(
+                "/usr/lib/niri-rdp", str(binaries)).replace(
+                "/etc/niri-rdp/renderer.conf", str(root / "renderer.conf"))
+            (root / "worker").write_text(worker)
+            # This private helper fixture always fails before readiness. The
+            # shell must still run its desktop and exhaust exactly two retries.
+            (binaries / "session-audio").write_text("#!/usr/bin/python3\nimport os\nfrom pathlib import Path\n"
+                "p=Path(os.environ['NIRI_RDP_RUNTIME_DIR'])/'audio-attempts'\n"
+                "with p.open('a') as f: f.write('attempt\\n')\nraise SystemExit(1)\n")
+            (binaries / "niri-headless").write_text("#!/usr/bin/python3\nimport os,time\nfrom pathlib import Path\n"
+                "p=Path(os.environ['NIRI_RDP_RUNTIME_DIR'])\n(p/'desktop-started').write_text(str(os.getpid()))\n"
+                "time.sleep(4.5)\n(p/'desktop-finished').touch()\n")
+            for executable in binaries.iterdir():
+                executable.chmod(0o700)
+            environment = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory + "/config",
+                               NIRI_RDP_RUNTIME_DIR=directory)
+            process = subprocess.Popen(["/usr/bin/sh", str(root / "worker"), "--environment-ready"],
+                                       env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                       start_new_session=True)
+            try:
+                _, errors = process.communicate(timeout=9)
+                self.assertEqual(process.returncode, 0, errors.decode())
+                self.assertTrue((root / "desktop-started").exists())
+                self.assertTrue((root / "desktop-finished").exists())
+                self.assertEqual((root / "audio-attempts").read_text().splitlines(), ["attempt"] * 3)
+                self.assertIn(b"starting desktop without audio", errors)
+                self.assertIn(b"restart 2 of 2", errors)
+            finally:
+                if process.poll() is None:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    process.wait()
 
 
 class CaptureBackpressureTests(unittest.TestCase):
@@ -153,7 +230,7 @@ class CaptureBackpressureTests(unittest.TestCase):
             client.settimeout(2)
             received = bytearray()
             while len(received) < module.BLOCK_BYTES or received[-module.BLOCK_BYTES:] != bytes([99]) * module.BLOCK_BYTES:
-                data = client.recv(module.BLOCK_BYTES)
+                data, _, _, _ = receive_capture(client)
                 self.assertTrue(data)
                 received.extend(data)
             self.assertLess(len(received), module.BLOCK_BYTES * 16, "buffered capture must stay below 320 ms")
@@ -207,7 +284,7 @@ class CaptureBackpressureTests(unittest.TestCase):
             expected = samples[:len(samples) // module.BLOCK_BYTES * module.BLOCK_BYTES]
             received = bytearray()
             while len(received) < len(expected):
-                data = client.recv(module.BLOCK_BYTES)
+                data, _, _, _ = receive_capture(client)
                 self.assertTrue(data)
                 received.extend(data)
             self.assertEqual(received, expected, "healthy quantum batching must preserve every PCM sample")
@@ -228,7 +305,9 @@ class CaptureBackpressureTests(unittest.TestCase):
 class AudioIntegrationTests(unittest.TestCase):
     def test_private_sink_monitor_contains_playback_and_survives_reconnect(self):
         with tempfile.TemporaryDirectory(prefix="niri-audio-") as directory:
-            environment = dict(os.environ, NIRI_RDP_RUNTIME_DIR=directory,
+            environment = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory + "/config",
+                               XDG_CACHE_HOME=directory + "/cache", XDG_DATA_HOME=directory + "/data",
+                               GIO_USE_VFS="local", NIRI_RDP_RUNTIME_DIR=directory,
                                XDG_RUNTIME_DIR=directory,
                                PULSE_SERVER="unix:" + directory + "/pulse/native")
             # Delay policy startup to exercise the real interval where the
@@ -275,7 +354,7 @@ runpy.run_path(sys.argv[1], run_name="__main__")
                             with self.assertRaises(TimeoutError):
                                 connection.recv(1)
                             connection.settimeout(3)
-                            connection.sendall(b"A")
+                            connection.sendall(b"NRA1")
                             player = subprocess.Popen(["pacat", "--playback", "--raw",
                                 "--format=s16le", "--rate=48000", "--channels=2", "--latency-msec=20"],
                                 env=environment, stdin=subprocess.PIPE)
@@ -284,7 +363,9 @@ runpy.run_path(sys.argv[1], run_name="__main__")
                             try:
                                 data = bytearray()
                                 while len(data) < 192000:
-                                    packet = connection.recv(3840)
+                                    packet, _, source_at, relay_at = receive_capture(connection)
+                                    self.assertLess(time.monotonic_ns() - source_at, 200_000_000)
+                                    self.assertLessEqual(source_at, relay_at)
                                     self.assertTrue(packet, "monitor closed during playback")
                                     data.extend(packet)
                                 values = struct.unpack("<" + "h" * (len(data) // 2), data[:len(data)//2*2])
@@ -308,6 +389,125 @@ runpy.run_path(sys.argv[1], run_name="__main__")
                                 player.terminate()
                                 writer.join(timeout=3)
                                 player.wait(timeout=3)
+                finally:
+                    if server.poll() is None:
+                        os.killpg(server.pid, signal.SIGTERM)
+                    server.wait(timeout=5)
+
+    @staticmethod
+    def private_children(pid):
+        try:
+            children = Path(f"/proc/{pid}/task/{pid}/children").read_text().split()
+        except FileNotFoundError:
+            return {}
+        result = {}
+        for child in children:
+            try:
+                result[int(child)] = Path(f"/proc/{child}/comm").read_text().strip()
+            except FileNotFoundError:
+                pass
+        return result
+
+    def test_private_daemon_loss_recovers_graph_with_fresh_capture(self):
+        for failed_name in ("wireplumber", "pipewire-pulse", "pipewire"):
+            with self.subTest(daemon=failed_name), tempfile.TemporaryDirectory(prefix="niri-audio-recover-") as directory:
+                environment = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory + "/config",
+                               XDG_CACHE_HOME=directory + "/cache", XDG_DATA_HOME=directory + "/data",
+                               GIO_USE_VFS="local", NIRI_RDP_RUNTIME_DIR=directory, XDG_RUNTIME_DIR=directory,
+                                   PULSE_SERVER="unix:" + directory + "/pulse/native")
+                with tempfile.TemporaryFile() as log:
+                    server = subprocess.Popen(["dbus-run-session", "--", "python3",
+                                               str(ROOT / "broker/config/session-audio")], env=environment,
+                                              stdout=log, stderr=log, start_new_session=True)
+                    try:
+                        deadline = time.monotonic() + 15
+                        while not Path(directory, "audio-0").is_socket():
+                            self.assertIsNone(server.poll())
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(0.05)
+                        helper = next(pid for pid, name in self.private_children(server.pid).items() if name == "python3")
+                        old = self.private_children(helper)
+                        failed = next(pid for pid, name in old.items() if name == failed_name)
+                        with socket.socket(socket.AF_UNIX) as active:
+                            active.settimeout(3)
+                            active.connect(directory + "/audio-0")
+                            active.sendall(b"NRA1")
+                            receive_capture(active)
+                            os.kill(failed, signal.SIGKILL)
+                            # Already framed socket data can finish, but active
+                            # capture closes rather than replaying or changing codec.
+                            while active.recv(4096):
+                                self.assertLess(time.monotonic(), deadline)
+                        while True:
+                            fresh = self.private_children(helper)
+                            if len(fresh) == 3 and set(old).isdisjoint(fresh) and Path(directory, "audio-0").is_socket():
+                                break
+                            self.assertIsNone(server.poll())
+                            self.assertLess(time.monotonic(), deadline)
+                            time.sleep(0.05)
+                        with socket.socket(socket.AF_UNIX) as resumed:
+                            resumed.settimeout(3)
+                            resumed.connect(directory + "/audio-0")
+                            resumed.sendall(b"NRA1")
+                            payload, sequence, source_at, _ = receive_capture(resumed)
+                            self.assertEqual(sequence, 0, "new descriptor has a fresh capture sequence")
+                            self.assertEqual(len(payload), 3840)
+                            self.assertLess(time.monotonic_ns() - source_at, 100_000_000)
+                        log.seek(0)
+                        self.assertIn(b"Restarting private audio graph (attempt 2)", log.read())
+                    finally:
+                        if server.poll() is None:
+                            os.killpg(server.pid, signal.SIGTERM)
+                        server.wait(timeout=5)
+
+    def test_monitor_loss_allows_fresh_reconnect_and_helper_death_ends_daemons(self):
+        with tempfile.TemporaryDirectory(prefix="niri-audio-helper-") as directory:
+            environment = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory + "/config",
+                               XDG_CACHE_HOME=directory + "/cache", XDG_DATA_HOME=directory + "/data",
+                               GIO_USE_VFS="local", NIRI_RDP_RUNTIME_DIR=directory, XDG_RUNTIME_DIR=directory,
+                               PULSE_SERVER="unix:" + directory + "/pulse/native")
+            with tempfile.TemporaryFile() as log:
+                server = subprocess.Popen(["dbus-run-session", "--", "python3",
+                                           str(ROOT / "broker/config/session-audio")], env=environment,
+                                          stdout=log, stderr=log, start_new_session=True)
+                try:
+                    deadline = time.monotonic() + 15
+                    while not Path(directory, "audio-0").is_socket():
+                        self.assertIsNone(server.poll())
+                        self.assertLess(time.monotonic(), deadline)
+                        time.sleep(0.05)
+                    helper = next(pid for pid, name in self.private_children(server.pid).items() if name == "python3")
+                    daemons = self.private_children(helper)
+                    with socket.socket(socket.AF_UNIX) as connection:
+                        connection.settimeout(3)
+                        connection.connect(directory + "/audio-0")
+                        connection.sendall(b"NRA1")
+                        receive_capture(connection)
+                        monitor = next(pid for pid, name in self.private_children(helper).items() if name == "parec")
+                        os.kill(monitor, signal.SIGKILL)
+                        while connection.recv(4096):
+                            self.assertLess(time.monotonic(), deadline)
+                    with socket.socket(socket.AF_UNIX) as resumed:
+                        resumed.settimeout(3)
+                        resumed.connect(directory + "/audio-0")
+                        resumed.sendall(b"NRA1")
+                        self.assertEqual(receive_capture(resumed)[1], 0)
+                    self.assertEqual(daemons, {pid: name for pid, name in self.private_children(helper).items() if name != "parec"})
+                    os.kill(helper, signal.SIGKILL)
+                    server.wait(timeout=5)
+                    deadline = time.monotonic() + 3
+                    while True:
+                        live = []
+                        for pid in daemons:
+                            try:
+                                if Path(f"/proc/{pid}/stat").read_text().split()[2] != "Z":
+                                    live.append(pid)
+                            except (FileNotFoundError, ProcessLookupError):
+                                pass
+                        if not live:
+                            break
+                        self.assertLess(time.monotonic(), deadline, "helper death must end its private graph")
+                        time.sleep(0.05)
                 finally:
                     if server.poll() is None:
                         os.killpg(server.pid, signal.SIGTERM)

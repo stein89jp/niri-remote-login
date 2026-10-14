@@ -282,10 +282,12 @@ static int session_socket_fd(const char *private, uid_t uid, gid_t gid, const ch
 static int desktop_fd(const char *private, uid_t uid, gid_t gid) {
     return session_socket_fd(private, uid, gid, "wayland-0");
 }
-// Ordered capabilities: compositor followed by raw stereo S16LE 48 kHz PCM.
+// Ordered capabilities: compositor, then optional versioned private PCM.
+// Audio is ancillary: an unavailable helper cannot reject an authenticated
+// resume of a healthy desktop. A later reconnect receives a fresh descriptor.
 static int respond_session(int fd, int desktop, const char *private, uid_t uid, gid_t gid) {
     int audio = session_socket_fd(private, uid, gid, "audio-0");
-    if (audio < 0) return -1;
+    if (audio < 0) return respond(fd, 0, desktop);
     int descriptors[2] = {desktop, audio};
     unsigned char reply[5] = {'N','R','B','1',0};
     struct iovec iov = {.iov_base=reply, .iov_len=sizeof(reply)};

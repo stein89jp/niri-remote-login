@@ -119,6 +119,7 @@ pub struct Broker {
     active: Mutex<Option<Desktop>>,
     login: Mutex<Option<Login>>,
     audio: crate::audio::Audio,
+    clipboard: crate::clipboard::Clipboard,
 }
 fn requires_login_screen(credentials: &Credentials) -> bool {
     credentials.password.is_empty()
@@ -137,10 +138,15 @@ impl Broker {
             active: Mutex::new(None),
             login: Mutex::new(None),
             audio: Default::default(),
+            clipboard: Default::default(),
         }
     }
     pub fn with_audio(mut self, audio: crate::audio::Audio) -> Self {
         self.audio = audio;
+        self
+    }
+    pub fn with_clipboard(mut self, clipboard: crate::clipboard::Clipboard) -> Self {
+        self.clipboard = clipboard;
         self
     }
     pub fn discard(&self) {
@@ -148,6 +154,7 @@ impl Broker {
             login.stop();
         }
         self.audio.clear();
+        self.clipboard.clear();
         self.pending.lock().unwrap().take();
         if let Some(desktop) = self.active.lock().unwrap().take() {
             desktop.stop();
@@ -204,7 +211,9 @@ impl ConnectionBinder for Broker {
                     ""
                 },
             );
-            let login = login.with_audio(self.audio.clone());
+            let login = login
+                .with_audio(self.audio.clone())
+                .with_clipboard(self.clipboard.clone());
             let bound = login.bound();
             *self.login.lock().unwrap() = Some(login);
             return Ok(bound);
@@ -227,6 +236,7 @@ impl ConnectionBinder for Broker {
         .map_err(|_| server_error("desktop startup task failed"))?
         .map_err(|_| server_error("Wayland desktop failed"))?;
         self.audio.attach(audio_socket);
+        desktop.attach_clipboard(self.clipboard.clone());
         *self.active.lock().unwrap() = Some(desktop.clone());
         let display = match &self.video {
             Some(video) => video.display(desktop.clone()),

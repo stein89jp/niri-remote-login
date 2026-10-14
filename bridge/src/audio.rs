@@ -10,6 +10,7 @@ use std::{
     collections::VecDeque,
     ffi::{CStr, c_char, c_void},
     io::{Read, Write},
+    os::fd::{AsRawFd, FromRawFd, OwnedFd},
     os::unix::net::UnixStream,
     sync::{
         Arc, Mutex,
@@ -30,6 +31,187 @@ const MAX_CAPTURE_BLOCKS: usize = 3; // At most 64 ms of capture batching/jitter
 const PLAYBACK_BUDGET: Duration = Duration::from_millis(300);
 const CAPTURE_BUDGET: Duration = Duration::from_millis(60);
 const SILENCE_TAIL_BLOCKS: usize = 5; // 100 ms flushes bounded AAC lookahead.
+const CAPTURE_MAGIC: &[u8; 4] = b"NRA1";
+const CAPTURE_HEADER_BYTES: usize = 32;
+
+/// Linux CLOCK_MONOTONIC is shared by the helper and frontend, unlike Instant's
+/// private representation. This age starts at the helper's first monitor read;
+/// browser/PipeWire buffering before that observable point is not measured.
+fn monotonic_ns() -> u64 {
+    let mut value: libc::timespec = unsafe { std::mem::zeroed() };
+    assert_eq!(
+        unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut value) },
+        0
+    );
+    value.tv_sec as u64 * 1_000_000_000 + value.tv_nsec as u64
+}
+
+struct Wake {
+    fd: OwnedFd,
+    #[cfg(test)]
+    waits: std::sync::atomic::AtomicUsize,
+}
+impl Default for Wake {
+    fn default() -> Self {
+        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
+        assert!(fd >= 0, "audio wake descriptor unavailable");
+        Self {
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
+            #[cfg(test)]
+            waits: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+}
+impl Wake {
+    fn notify(&self) {
+        let value = 1u64;
+        // Saturation means a wake is already pending. No application data enters
+        // this descriptor, and its owner remains live throughout the syscall.
+        unsafe { libc::write(self.fd.as_raw_fd(), (&value as *const u64).cast(), 8) };
+    }
+    fn wait(&self, socket: Option<&UnixStream>, deadline: Option<Instant>) -> bool {
+        #[cfg(test)]
+        self.waits.fetch_add(1, Ordering::Relaxed);
+        let mut descriptors = [
+            libc::pollfd {
+                fd: self.fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: socket.map_or(-1, AsRawFd::as_raw_fd),
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let timeout = deadline.map_or(-1, |at| {
+            let remaining = at.saturating_duration_since(Instant::now());
+            // Round upward: sub-millisecond deadlines must not spin at zero.
+            remaining
+                .as_millis()
+                .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
+                .min(i32::MAX as u128) as i32
+        });
+        let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout) };
+        if result < 0 {
+            return std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
+        }
+        if descriptors[0].revents != 0 {
+            let mut value = 0u64;
+            unsafe { libc::read(self.fd.as_raw_fd(), (&mut value as *mut u64).cast(), 8) };
+        }
+        true
+    }
+}
+
+struct CaptureSocket {
+    stream: UnixStream,
+    framed: bool,
+}
+
+/// Decode only the explicitly selected private protocol. A wrong version or
+/// truncated frame ends audio, so metadata can never become audible PCM.
+struct CaptureReader {
+    socket: CaptureSocket,
+    header: [u8; CAPTURE_HEADER_BYTES],
+    header_filled: usize,
+    payload: [u8; BLOCK_BYTES],
+    payload_filled: usize,
+    payload_offset: usize,
+    source_ns: u64,
+    expected_sequence: Option<u64>,
+    discontinuity: bool,
+    relay_age: Duration,
+    socket_age: Duration,
+}
+impl CaptureReader {
+    fn new(socket: CaptureSocket) -> std::io::Result<Self> {
+        let mut this = Self {
+            socket,
+            header: [0; CAPTURE_HEADER_BYTES],
+            header_filled: 0,
+            payload: [0; BLOCK_BYTES],
+            payload_filled: 0,
+            payload_offset: 0,
+            source_ns: 0,
+            expected_sequence: None,
+            discontinuity: false,
+            relay_age: Duration::ZERO,
+            socket_age: Duration::ZERO,
+        };
+        this.socket.stream.write_all(if this.socket.framed {
+            CAPTURE_MAGIC
+        } else {
+            b"A"
+        })?;
+        this.socket.stream.set_nonblocking(true)?;
+        Ok(this)
+    }
+    fn read(&mut self, destination: &mut [u8]) -> std::io::Result<(usize, Instant)> {
+        if !self.socket.framed {
+            return self
+                .socket
+                .stream
+                .read(destination)
+                .map(|length| (length, Instant::now()));
+        }
+        while self.header_filled < CAPTURE_HEADER_BYTES {
+            let n = self
+                .socket
+                .stream
+                .read(&mut self.header[self.header_filled..])?;
+            if n == 0 {
+                return Ok((0, Instant::now()));
+            }
+            self.header_filled += n;
+            if self.header_filled == CAPTURE_HEADER_BYTES {
+                let sequence = u64::from_be_bytes(self.header[8..16].try_into().unwrap());
+                self.source_ns = u64::from_be_bytes(self.header[16..24].try_into().unwrap());
+                let relay_ns = u64::from_be_bytes(self.header[24..32].try_into().unwrap());
+                if &self.header[..4] != CAPTURE_MAGIC
+                    || u32::from_be_bytes(self.header[4..8].try_into().unwrap()) as usize
+                        != BLOCK_BYTES
+                    || self.source_ns > relay_ns
+                    || relay_ns > monotonic_ns()
+                {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "invalid private PCM frame",
+                    ));
+                }
+                self.discontinuity = self
+                    .expected_sequence
+                    .is_some_and(|expected| expected != sequence);
+                self.expected_sequence = Some(sequence.wrapping_add(1));
+                self.relay_age = Duration::from_nanos(relay_ns - self.source_ns);
+                self.socket_age = Duration::from_nanos(monotonic_ns().saturating_sub(relay_ns));
+            }
+        }
+        while self.payload_filled < BLOCK_BYTES {
+            let n = self
+                .socket
+                .stream
+                .read(&mut self.payload[self.payload_filled..])?;
+            if n == 0 {
+                return Ok((0, Instant::now()));
+            }
+            self.payload_filled += n;
+        }
+        let length = destination.len().min(BLOCK_BYTES - self.payload_offset);
+        destination[..length]
+            .copy_from_slice(&self.payload[self.payload_offset..self.payload_offset + length]);
+        self.payload_offset += length;
+        let now = Instant::now();
+        let age = Duration::from_nanos(monotonic_ns().saturating_sub(self.source_ns));
+        let captured_at = now.checked_sub(age).unwrap_or(now - CAPTURE_BUDGET * 2);
+        if self.payload_offset == BLOCK_BYTES {
+            self.header_filled = 0;
+            self.payload_filled = 0;
+            self.payload_offset = 0;
+        }
+        Ok((length, captured_at))
+    }
+}
 
 unsafe extern "C" {
     fn niri_audio_new(error: *mut c_char, length: usize) -> *mut c_void;
@@ -474,7 +656,8 @@ impl FlowControl {
 
 #[derive(Clone, Default)]
 pub struct Audio {
-    socket: Arc<Mutex<Option<UnixStream>>>,
+    socket: Arc<Mutex<Option<CaptureSocket>>>,
+    wake: Arc<Wake>,
     video: Option<crate::video::Video>,
 }
 impl std::fmt::Debug for Audio {
@@ -488,10 +671,28 @@ impl Audio {
         self
     }
     pub fn attach(&self, socket: Option<UnixStream>) {
-        *self.socket.lock().unwrap() = socket;
+        if socket.is_none() {
+            eprintln!(
+                "RDP audio unavailable: desktop remains usable; reconnect after private audio recovery"
+            );
+        }
+        *self.socket.lock().unwrap() = socket.map(|stream| CaptureSocket {
+            stream,
+            framed: true,
+        });
+        self.wake.notify();
     }
     pub fn clear(&self) {
         self.socket.lock().unwrap().take();
+        self.wake.notify();
+    }
+    #[cfg(test)]
+    fn attach_test_pcm(&self, stream: UnixStream) {
+        *self.socket.lock().unwrap() = Some(CaptureSocket {
+            stream,
+            framed: false,
+        });
+        self.wake.notify();
     }
     pub fn factory(&self) -> Factory {
         Factory {
@@ -629,22 +830,30 @@ impl RdpsndServerHandler for Backend {
                 .spawn(move || {
                     let _feedback_guard = FeedbackGuard(feedback.clone());
                     // Negotiation may precede submission of credentials on the login form.
-                    let mut socket = loop {
+                    let wake = &audio.wake;
+                    let socket = loop {
                         if stopped.load(Ordering::Acquire) {
                             return;
                         }
                         if let Some(socket) = audio.socket.lock().unwrap().take() {
                             break socket;
                         }
-                        thread::sleep(Duration::from_millis(20));
+                        if !wake.wait(None, None) { return; }
                     };
-                    if socket.write_all(b"A").is_err() || socket.set_nonblocking(true).is_err() {
-                        return;
-                    }
+                    let mut socket = match CaptureReader::new(socket) {
+                        Ok(socket) => socket,
+                        Err(error) => {
+                            eprintln!("RDP audio capture unavailable: {error}; desktop continues, reconnect for a fresh descriptor");
+                            return;
+                        }
+                    };
                     let start = Instant::now();
                     let mut block = vec![0u8; block_bytes];
                     let mut captured = VecDeque::new();
                     let mut filled = 0;
+                    let mut block_at: Option<Instant> = None;
+                    let mut telemetry = crate::performance::Telemetry::from_env();
+                    let mut credit_wait_start = None;
                     let mut number = 0u8;
                     let mut next_send = start;
                     let mut silent_blocks = 0usize;
@@ -662,8 +871,27 @@ impl RdpsndServerHandler for Backend {
                                 break 'capture;
                             }
                             match socket.read(&mut block[filled..]) {
-                                Ok(0) => break 'capture,
-                                Ok(n) => filled += n,
+                                Ok((0, _)) => {
+                                    eprintln!("RDP audio capture ended: desktop continues; reconnect for a fresh descriptor");
+                                    break 'capture;
+                                }
+                                Ok((n, at)) => {
+                                    if std::mem::take(&mut socket.discontinuity) {
+                                        if filled > 0 {
+                                            block.copy_within(filled..filled + n, 0);
+                                            filled = 0;
+                                            block_at = None;
+                                        }
+                                        reset_codec = true;
+                                        telemetry.count("discarded_blocks", 1);
+                                    }
+                                    filled += n;
+                                    block_at = Some(if socket.socket.framed { block_at.map_or(at, |old| old.min(at)) } else { at });
+                                    telemetry.count("capture_reads", 1);
+                                    telemetry.sample("monitor_source_age", Instant::now().saturating_duration_since(at));
+                                    telemetry.sample("relay_age", socket.relay_age);
+                                    telemetry.sample("socket_age", socket.socket_age);
+                                },
                                 Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
                                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                                     drained = true;
@@ -680,8 +908,9 @@ impl RdpsndServerHandler for Backend {
                                 if captured.len() == MAX_CAPTURE_BLOCKS {
                                     captured.pop_front();
                                     reset_codec = true;
+                                    telemetry.count("discarded_blocks", 1);
                                 }
-                                captured.push_back((block.clone(), Instant::now()));
+                                captured.push_back((block.clone(), block_at.take().unwrap()));
                                 filled = 0;
                             }
                         }
@@ -711,19 +940,28 @@ impl RdpsndServerHandler for Backend {
                         }) {
                             captured.pop_front();
                             reset_codec = true;
+                            telemetry.count("discarded_blocks", 1);
                         }
                         if !queue.can_send(now) {
+                            telemetry.count("credit_waits", 1);
+                            credit_wait_start.get_or_insert(now);
                             // A full credit window can be an ordinary ACK wait.
                             // Keep its bounded recent capture and codec overlap;
                             // only discard samples during actual delay recovery.
                             if pressure && !captured.is_empty() {
+                                telemetry.count("discarded_blocks", captured.len() as u64);
                                 captured.clear();
                                 reset_codec = true;
                             }
                         } else if now >= next_send
-                            && let Some((data, _)) = captured.pop_front()
+                            && let Some((data, captured_at)) = captured.pop_front()
                         {
+                            if let Some(at) = credit_wait_start.take() {
+                                telemetry.sample("credit_wait", now.saturating_duration_since(at));
+                            }
+                            telemetry.sample("sample_age_at_send", now.saturating_duration_since(captured_at));
                             if reset_codec {
+                                telemetry.count("codec_recoveries", 1);
                                 if let Err(error) = encoder.reset() {
                                     eprintln!("RDP audio recovery stopped: {error}");
                                     break;
@@ -745,6 +983,7 @@ impl RdpsndServerHandler for Backend {
                             if silent_blocks > SILENCE_TAIL_BLOCKS {
                                 continue;
                             }
+                            let encode_started = Instant::now();
                             let data = match encoder.encode(data) {
                                 Ok(Some(data)) => data,
                                 Ok(None) => continue, // Bounded AAC frame assembly/lookahead.
@@ -753,6 +992,8 @@ impl RdpsndServerHandler for Backend {
                                     break;
                                 }
                             };
+                            telemetry.sample("encode", encode_started.elapsed());
+                            telemetry.count("wire_payload_bytes", data.len() as u64);
                             // The graphics path has no RDPEVOR presentation
                             // clock to pair with Wave2. Match GNOME Remote
                             // Desktop's immediate playback timestamps rather
@@ -766,8 +1007,23 @@ impl RdpsndServerHandler for Backend {
                                 break;
                             }
                         }
+                        // Capture readiness, exact pacing/expiry, feedback, and
+                        // stop are the only wake sources. No fixed idle polling.
+                        let mut deadline = captured.front().map(|(_, at)| *at + CAPTURE_BUDGET + Duration::from_millis(1));
+                        if !captured.is_empty() {
+                            let send_at = if queue.can_send(now) { Some(next_send) } else { queue.hold_until.filter(|until| *until > now) };
+                            if let Some(send_at) = send_at {
+                                deadline = Some(deadline.map_or(send_at, |old| old.min(send_at)));
+                            }
+                            if !pressure && let Some(oldest) = queue.recent.iter().find(|wave| !wave.acknowledged) {
+                                let pressure_at = oldest.sent_at + queue.receipt_budget() + Duration::from_millis(1);
+                                deadline = Some(deadline.map_or(pressure_at, |old| old.min(pressure_at)));
+                            }
+                        }
                         drop(queue);
-                        thread::sleep(Duration::from_millis(2));
+                        telemetry.report("audio", now);
+                        if !wake.wait(Some(&socket.socket.stream), deadline) { break; }
+                        telemetry.count("readiness_wakes", 1);
                     }
                 })
                 .map_err(|e| Box::new(e) as Box<dyn RdpsndError>)?,
@@ -779,9 +1035,11 @@ impl RdpsndServerHandler for Backend {
             .lock()
             .unwrap()
             .confirm(block_no, timestamp, Instant::now());
+        self.audio.wake.notify();
     }
     fn stop(&mut self) {
         self.stopped.store(true, Ordering::Release);
+        self.audio.wake.notify();
         if let Some(worker) = self.worker.take() {
             let _ = worker.join();
         }
@@ -855,6 +1113,155 @@ mod tests {
         pcm_format()
     }
 
+    fn private_frame(sequence: u64, source_ns: u64, pcm: &[u8]) -> Vec<u8> {
+        assert_eq!(pcm.len(), BLOCK_BYTES);
+        let mut frame = CAPTURE_MAGIC.to_vec();
+        frame.extend_from_slice(&(BLOCK_BYTES as u32).to_be_bytes());
+        frame.extend_from_slice(&sequence.to_be_bytes());
+        frame.extend_from_slice(&source_ns.to_be_bytes());
+        frame.extend_from_slice(&monotonic_ns().to_be_bytes());
+        frame.extend_from_slice(pcm);
+        frame
+    }
+
+    #[test]
+    fn private_capture_metadata_survives_fragmentation_and_sequence_wrap() {
+        let (mut source, capture) = UnixStream::pair().unwrap();
+        let mut reader = CaptureReader::new(CaptureSocket {
+            stream: capture,
+            framed: true,
+        })
+        .unwrap();
+        let mut hello = [0; 4];
+        source.read_exact(&mut hello).unwrap();
+        assert_eq!(&hello, CAPTURE_MAGIC);
+        let at = monotonic_ns() - 35_000_000;
+        let pcm = (0..BLOCK_BYTES)
+            .map(|index| index as u8)
+            .collect::<Vec<_>>();
+        let frame = private_frame(u64::MAX, at, &pcm);
+        source.write_all(&frame[..7]).unwrap();
+        let mut data = [0; BLOCK_BYTES];
+        assert_eq!(
+            reader.read(&mut data).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        source
+            .write_all(&frame[7..CAPTURE_HEADER_BYTES + 5])
+            .unwrap();
+        assert_eq!(
+            reader.read(&mut data).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock
+        );
+        source
+            .write_all(&frame[CAPTURE_HEADER_BYTES + 5..])
+            .unwrap();
+        let (length, observed) = reader.read(&mut data).unwrap();
+        assert_eq!(length, BLOCK_BYTES);
+        assert_eq!(data.as_slice(), pcm);
+        assert!(Instant::now().duration_since(observed) >= Duration::from_millis(35));
+        assert!(!reader.discontinuity);
+        source
+            .write_all(&private_frame(0, monotonic_ns(), &pcm))
+            .unwrap();
+        reader.read(&mut data).unwrap();
+        assert!(!reader.discontinuity, "sequence wrap is healthy continuity");
+        source
+            .write_all(&private_frame(5, monotonic_ns(), &pcm))
+            .unwrap();
+        reader.read(&mut data).unwrap();
+        assert!(
+            reader.discontinuity,
+            "relay sample loss must reset codec overlap"
+        );
+    }
+
+    #[test]
+    fn malformed_private_metadata_cannot_be_decoded_as_pcm() {
+        for field in [0, 4, 16] {
+            let (mut source, capture) = UnixStream::pair().unwrap();
+            let mut reader = CaptureReader::new(CaptureSocket {
+                stream: capture,
+                framed: true,
+            })
+            .unwrap();
+            let mut frame = private_frame(0, monotonic_ns(), &vec![0x33; BLOCK_BYTES]);
+            frame[field..field + 4].fill(0xff);
+            source.write_all(&frame).unwrap();
+            let mut destination = [0; BLOCK_BYTES];
+            assert_eq!(
+                reader.read(&mut destination).unwrap_err().kind(),
+                std::io::ErrorKind::InvalidData
+            );
+            assert_eq!(destination, [0; BLOCK_BYTES]);
+        }
+    }
+
+    #[test]
+    fn whole_pipeline_expiry_discards_pcm_received_after_frontend_stall() {
+        let audio = Audio::default();
+        let (server, mut receiver) = negotiate(&audio, vec![pcm()]);
+        let (mut source, capture) = UnixStream::pair().unwrap();
+        source
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let stale = vec![0x22; BLOCK_BYTES];
+        source
+            .write_all(&private_frame(0, monotonic_ns() - 100_000_000, &stale))
+            .unwrap();
+        audio.attach(Some(capture));
+        source.read_exact(&mut [0; 4]).unwrap();
+        thread::sleep(Duration::from_millis(30));
+        assert!(
+            receiver.is_empty(),
+            "receipt time must not renew stale source samples"
+        );
+        let fresh = vec![0x55; BLOCK_BYTES];
+        source
+            .write_all(&private_frame(1, monotonic_ns(), &fresh))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        loop {
+            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                receiver.try_recv()
+            {
+                assert_eq!(data, fresh);
+                assert_eq!(timestamp, 0);
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(server);
+    }
+
+    #[test]
+    fn worker_stop_interrupts_indefinite_capture_and_attachment_waits() {
+        for attach in [false, true] {
+            let audio = Audio::default();
+            let (server, _) = negotiate(&audio, vec![pcm()]);
+            let (mut source, capture) = UnixStream::pair().unwrap();
+            if attach {
+                source
+                    .set_read_timeout(Some(Duration::from_secs(1)))
+                    .unwrap();
+                audio.attach(Some(capture));
+                source.read_exact(&mut [0; 4]).unwrap();
+            }
+            thread::sleep(Duration::from_millis(30));
+            let before = audio.wake.waits.load(Ordering::Relaxed);
+            thread::sleep(Duration::from_millis(150));
+            let idle_wakes = audio.wake.waits.load(Ordering::Relaxed) - before;
+            assert_eq!(
+                idle_wakes, 0,
+                "quiet capture and unauthenticated waits must not poll"
+            );
+            let now = Instant::now();
+            drop(server);
+            assert!(now.elapsed() < Duration::from_millis(200));
+        }
+    }
+
     #[test]
     fn aac_fallback_uses_raw_packets_and_immediate_timestamps() {
         for version in [Version::V6, Version::V8] {
@@ -867,7 +1274,7 @@ mod tests {
             source
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            audio.attach(Some(capture));
+            audio.attach_test_pcm(capture);
             source.read_exact(&mut [0]).unwrap();
             source.write_all(&vec![0x35; BLOCK_BYTES * 3]).unwrap();
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -921,7 +1328,7 @@ mod tests {
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
         let mut sent = 0usize;
         for _ in 0..SILENCE_TAIL_BLOCKS + 5 {
@@ -979,7 +1386,7 @@ mod tests {
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
         // Withhold receipt credit until the transport queue is full. Continue
         // capturing so recovery must discard both old PCM and AAC lookahead.
@@ -1068,7 +1475,7 @@ mod tests {
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
         let take_wave = |receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>| {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -1157,7 +1564,7 @@ mod tests {
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
         let take_wave = |receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>| {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -1284,7 +1691,7 @@ mod tests {
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
         source.write_all(&vec![0x11; BLOCK_BYTES * 3]).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1353,7 +1760,7 @@ mod tests {
             source
                 .set_read_timeout(Some(Duration::from_secs(2)))
                 .unwrap();
-            audio.attach(Some(capture));
+            audio.attach_test_pcm(capture);
             source.read_exact(&mut [0]).unwrap();
             // Distinct signed channels and nonzero first samples also check the
             // four-byte prefix split in the older WaveInfo/Wave wire format.
@@ -1418,7 +1825,7 @@ mod tests {
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
         source.write_all(&vec![0x35; ADPCM_SAMPLES * 4]).unwrap();
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -1524,7 +1931,7 @@ mod tests {
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
         source.write_all(&vec![0x35; ADPCM_SAMPLES * 4]).unwrap();
         assert_eq!(
@@ -1547,7 +1954,7 @@ mod tests {
             "login screen must not produce sound"
         );
         let (mut source, capture) = UnixStream::pair().unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
@@ -2148,7 +2555,7 @@ mod tests {
         burst.extend(vec![0x22; BLOCK_BYTES]);
         burst.extend([0x33; 7]);
         source.write_all(&burst).unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
         thread::sleep(Duration::from_millis(50));
         assert_eq!(
@@ -2189,7 +2596,7 @@ mod tests {
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
         for _ in 0..MAX_PENDING {
             source.write_all(&vec![0x11; BLOCK_BYTES]).unwrap();
@@ -2254,7 +2661,7 @@ mod tests {
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
         let take_wave = |receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>| {
             let deadline = Instant::now() + Duration::from_secs(2);
@@ -2347,7 +2754,7 @@ mod tests {
         source
             .set_read_timeout(Some(Duration::from_secs(2)))
             .unwrap();
-        audio.attach(Some(capture));
+        audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
         const QUANTUM_BYTES: usize = 4096;
         let samples: Vec<u8> = (0..QUANTUM_BYTES * 32 / 4)

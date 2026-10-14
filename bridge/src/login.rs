@@ -1,11 +1,13 @@
 //! Restricted TLS login screen. No Wayland connection exists before PAM accepts.
-use crate::{bitmap, broker, video::Video, wayland::Desktop};
+use crate::{broker, video::Video, wayland::Desktop};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{
     BoundConnection, DesktopSize, DisplayUpdate, KeyboardEvent, MouseButton, MouseEvent,
     RdpServerDisplay, RdpServerDisplayUpdates, RdpServerInputHandler, ServerResult,
 };
 use std::{
+    cell::RefCell,
+    num::{NonZeroU16, NonZeroUsize},
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
@@ -31,7 +33,7 @@ impl Drop for Password {
         self.clear();
     }
 }
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 enum LoginFailure {
     MissingCredentials,
     Rejected,
@@ -67,6 +69,10 @@ struct State {
     retry_at: Instant,
     stopped: bool,
     desktop: Option<Desktop>,
+    pointer_max_size: u16,
+    pending_layout: Option<DisplayControlMonitorLayout>,
+    suppressed: bool,
+    refresh_epoch: u64,
 }
 #[derive(Clone)]
 pub struct Login {
@@ -76,6 +82,7 @@ pub struct Login {
     output: String,
     video: Option<Video>,
     audio: crate::audio::Audio,
+    clipboard: crate::clipboard::Clipboard,
 }
 impl Login {
     pub fn new(
@@ -140,16 +147,25 @@ impl Login {
                 retry_at: Instant::now(),
                 stopped: false,
                 desktop: None,
+                pointer_max_size: 0,
+                pending_layout: None,
+                suppressed: false,
+                refresh_epoch: 0,
             })),
             changed,
             path,
             output,
             video,
             audio: Default::default(),
+            clipboard: Default::default(),
         }
     }
     pub fn with_audio(mut self, audio: crate::audio::Audio) -> Self {
         self.audio = audio;
+        self
+    }
+    pub fn with_clipboard(mut self, clipboard: crate::clipboard::Clipboard) -> Self {
+        self.clipboard = clipboard;
         self
     }
     pub fn bound(&self) -> BoundConnection {
@@ -162,6 +178,7 @@ impl Login {
         let mut state = self.state.lock().unwrap();
         state.stopped = true;
         self.audio.clear();
+        self.clipboard.clear();
         state.password.clear();
         state.compose.reset();
         state.unicode = Default::default();
@@ -206,6 +223,7 @@ impl Login {
         let output = self.output.clone();
         let changed = self.changed.clone();
         let audio = self.audio.clone();
+        let clipboard = self.clipboard.clone();
         // PAM and compositor startup may block; neither runs in the RDP loop.
         std::thread::spawn(move || {
             let result = broker::open(&path, &username, &password.0).and_then(|session| {
@@ -228,6 +246,12 @@ impl Login {
                 match result {
                     Ok(Some((mut desktop, audio_socket))) if !state.stopped => {
                         audio.attach(audio_socket);
+                        desktop.attach_clipboard(clipboard.clone());
+                        desktop.pointer_capabilities(state.pointer_max_size);
+                        desktop.set_output_suppressed(state.suppressed);
+                        if let Some(layout) = state.pending_layout.take() {
+                            desktop.request_layout(layout);
+                        }
                         // Preserve lock state and modifiers held while signing in.
                         let synchronized =
                             if let Some(KeyboardEvent::Synchronize(flags)) = &state.synchronize {
@@ -290,6 +314,7 @@ impl Login {
         if state.stopped || state.busy {
             return;
         }
+        let visible = VisibleState::from(&*state);
         if state.password_focus {
             if state.password.0.len() + character.len_utf8() <= 512 {
                 state.password.0.push(character);
@@ -298,8 +323,11 @@ impl Login {
             state.username.push(character);
         }
         state.failure = None;
+        let changed = visible != VisibleState::from(&*state);
         drop(state);
-        self.notify();
+        if changed {
+            self.notify();
+        }
     }
 }
 impl RdpServerInputHandler for Login {
@@ -383,11 +411,12 @@ impl RdpServerInputHandler for Login {
         if !down {
             return;
         }
-        if {
+        let shortcut = {
             let state = self.state.lock().unwrap();
             // Windows sends a synthetic left Ctrl alongside AltGr.
             state.control[1] || (state.control[0] && !state.alt[1]) || state.alt[0]
-        } {
+        };
+        if shortcut {
             return;
         }
         if code == 28 {
@@ -398,6 +427,7 @@ impl RdpServerInputHandler for Login {
         if state.busy || state.stopped {
             return;
         }
+        let visible = VisibleState::from(&*state);
         match code {
             15 => {
                 state.compose.reset();
@@ -444,8 +474,11 @@ impl RdpServerInputHandler for Login {
                 return;
             }
         }
+        let changed = visible != VisibleState::from(&*state);
         drop(state);
-        self.notify();
+        if changed {
+            self.notify();
+        }
     }
     fn mouse(&mut self, event: MouseEvent) {
         let desktop = self.state.lock().unwrap().desktop.clone();
@@ -478,7 +511,9 @@ impl RdpServerInputHandler for Login {
                 state.unicode = Default::default();
             }
             drop(state);
-            self.notify();
+            if previous_focus != self.state.lock().unwrap().password_focus {
+                self.notify();
+            }
             if (172..206).contains(&y) {
                 self.submit();
             }
@@ -487,6 +522,37 @@ impl RdpServerInputHandler for Login {
 }
 #[async_trait::async_trait]
 impl RdpServerDisplay for Login {
+    fn request_refresh(&mut self) {
+        let mut state = self.state.lock().unwrap();
+        state.refresh_epoch = state.refresh_epoch.wrapping_add(1);
+        if let Some(mut desktop) = state.desktop.clone() {
+            desktop.request_refresh();
+        }
+        drop(state);
+        if let Some(video) = &self.video {
+            video.request_refresh();
+        }
+        self.notify();
+    }
+    fn set_output_suppressed(&mut self, suppressed: bool) {
+        let mut state = self.state.lock().unwrap();
+        if state.suppressed && !suppressed {
+            state.refresh_epoch = state.refresh_epoch.wrapping_add(1);
+        }
+        state.suppressed = suppressed;
+        if let Some(mut desktop) = state.desktop.clone() {
+            desktop.set_output_suppressed(suppressed);
+        }
+        drop(state);
+        self.notify();
+    }
+    fn pointer_capabilities(&mut self, max_size: u16) {
+        let mut state = self.state.lock().unwrap();
+        state.pointer_max_size = max_size;
+        if let Some(mut desktop) = state.desktop.clone() {
+            desktop.pointer_capabilities(max_size);
+        }
+    }
     async fn size(&mut self) -> DesktopSize {
         let desktop = self.state.lock().unwrap().desktop.clone();
         match desktop {
@@ -501,17 +567,29 @@ impl RdpServerDisplay for Login {
             first: true,
             desktop: None,
             repaint: tokio::time::Instant::now() + Duration::from_secs(1),
+            cached: None,
+            delivered_initial: false,
+            refresh_epoch: 0,
         });
         // Use the negotiated graphics channel for the form as well as the
         // desktop. mstsc may stop presenting classic bitmaps once GFX opens.
         match &self.video {
-            Some(video) => Ok(video.wrap_updates(updates)?),
+            Some(video) => {
+                let state = self.state.clone();
+                Ok(video.wrap_updates_with_desktop_provider(
+                    updates,
+                    Arc::new(move || state.lock().unwrap().desktop.clone()),
+                )?)
+            }
             None => Ok(updates),
         }
     }
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
-        if let Some(mut desktop) = self.state.lock().unwrap().desktop.clone() {
+        let mut state = self.state.lock().unwrap();
+        if let Some(mut desktop) = state.desktop.clone() {
             desktop.request_layout(layout);
+        } else {
+            state.pending_layout = Some(layout);
         }
         // Keep the initial negotiated size while the login form is active.
     }
@@ -522,6 +600,9 @@ struct Updates {
     first: bool,
     desktop: Option<Box<dyn RdpServerDisplayUpdates + Send>>,
     repaint: tokio::time::Instant,
+    cached: Option<LoginFramebuffer>,
+    delivered_initial: bool,
+    refresh_epoch: u64,
 }
 #[async_trait::async_trait]
 impl RdpServerDisplayUpdates for Updates {
@@ -535,17 +616,39 @@ impl RdpServerDisplayUpdates for Updates {
             }
             let desktop = self.login.state.lock().unwrap().desktop.clone();
             if let Some(desktop) = desktop {
-                self.desktop = Some(desktop.updates_send());
+                self.desktop = Some(if self.login.video.is_some() {
+                    desktop.updates_full_send()
+                } else {
+                    desktop.updates_send()
+                });
+                continue;
+            }
+            let suppressed = self.login.state.lock().unwrap().suppressed;
+            if suppressed && self.delivered_initial {
+                if self.rx.changed().await.is_err() {
+                    return Ok(None);
+                }
                 continue;
             }
             if self.first || self.rx.has_changed().unwrap_or(false) {
                 self.first = false;
                 self.rx.borrow_and_update();
                 self.repaint = tokio::time::Instant::now() + Duration::from_secs(1);
-                return Ok(Some(DisplayUpdate::Bitmap(
-                    render(&self.login.state.lock().unwrap())
-                        .map_err(|_| crate::server_error("login framebuffer dimensions invalid"))?,
-                )));
+                let state = self.login.state.lock().unwrap();
+                let full = self.refresh_epoch != state.refresh_epoch;
+                self.refresh_epoch = state.refresh_epoch;
+                self.delivered_initial = true;
+                let visible = VisibleState::from(&*state);
+                let cached = self
+                    .cached
+                    .get_or_insert_with(|| LoginFramebuffer::new(&state));
+                if cached.visible != visible {
+                    cached.repaint(&state);
+                    if self.login.video.is_none() && !full {
+                        return Ok(Some(DisplayUpdate::Bitmap(cached.region())));
+                    }
+                }
+                return Ok(Some(DisplayUpdate::Bitmap(cached.snapshot())));
             }
             // A client can initialize its surface or negotiate GFX after the
             // first bitmap, and refresh requests do not produce input events.
@@ -562,6 +665,12 @@ impl RdpServerDisplayUpdates for Updates {
         }
     }
 }
+thread_local! {
+    // XKB objects stay on the input thread. The cache holds the public keyboard
+    // map only; password characters and compose state remain in the form.
+    static TRANSLATION: RefCell<Option<(String, xkb::Context, xkb::Keymap)>> = const { RefCell::new(None) };
+}
+
 fn login_text(
     text: &str,
     evdev: u32,
@@ -571,36 +680,41 @@ fn login_text(
     altgr: bool,
     compose: &mut crate::login_compose::ComposeInput,
 ) -> Option<String> {
-    // Only owned text crosses threads in Login's Mutex. XKB's raw-pointer
-    // objects are local to this event, so no unsafe Send implementation is needed.
-    let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
-    let map = xkb::Keymap::new_from_string(
-        &context,
-        text.to_owned(),
-        xkb::KEYMAP_FORMAT_TEXT_V1,
-        xkb::KEYMAP_COMPILE_NO_FLAGS,
-    )?;
-    let mut state = xkb::State::new(&map);
-    let mut locked = 0;
-    for (active, name) in [(caps, "Lock"), (num_lock, "NumLock")] {
-        let index = map.mod_get_index(name);
-        if active && index < 32 {
-            locked |= 1 << index;
+    TRANSLATION.with(|cached| {
+        let mut cached = cached.borrow_mut();
+        if cached.as_ref().is_none_or(|(last, _, _)| last != text) {
+            let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
+            let map = xkb::Keymap::new_from_string(
+                &context,
+                text.to_owned(),
+                xkb::KEYMAP_FORMAT_TEXT_V1,
+                xkb::KEYMAP_COMPILE_NO_FLAGS,
+            )?;
+            *cached = Some((text.to_owned(), context, map));
         }
-    }
-    state.update_mask(0, 0, locked, 0, 0, 0);
-    for (held, key) in [(shift[0], 42u32), (shift[1], 54), (altgr, 100)] {
-        if held {
-            state.update_key((key + 8).into(), xkb::KeyDirection::Down);
+        let (_, context, map) = cached.as_ref().unwrap();
+        let mut state = xkb::State::new(map);
+        let mut locked = 0;
+        for (active, name) in [(caps, "Lock"), (num_lock, "NumLock")] {
+            let index = map.mod_get_index(name);
+            if active && index < 32 {
+                locked |= 1 << index;
+            }
         }
-    }
-    let code = (evdev + 8).into();
-    let text = compose.press(
-        &context,
-        state.key_get_one_sym(code),
-        state.key_get_utf8(code),
-    );
-    (!text.is_empty()).then_some(text)
+        state.update_mask(0, 0, locked, 0, 0, 0);
+        for (held, key) in [(shift[0], 42u32), (shift[1], 54), (altgr, 100)] {
+            if held {
+                state.update_key((key + 8).into(), xkb::KeyDirection::Down);
+            }
+        }
+        let code = (evdev + 8).into();
+        let text = compose.press(
+            context,
+            state.key_get_one_sym(code),
+            state.key_get_utf8(code),
+        );
+        (!text.is_empty()).then_some(text)
+    })
 }
 #[cfg(test)]
 fn login_character(
@@ -631,10 +745,36 @@ fn form(size: DesktopSize) -> (i32, i32, i32) {
         width,
     )
 }
+// Only values that alter pixels belong here. In particular, the mask records
+// emptiness, never the password or its length.
+#[derive(PartialEq, Eq)]
+struct VisibleState {
+    width: u16,
+    height: u16,
+    username: String,
+    password_present: bool,
+    password_focus: bool,
+    busy: bool,
+    failure: Option<LoginFailure>,
+    keyboard_layout: String,
+}
+impl From<&State> for VisibleState {
+    fn from(state: &State) -> Self {
+        Self {
+            width: state.size.width,
+            height: state.size.height,
+            username: state.username.clone(),
+            password_present: !state.password.0.is_empty(),
+            password_focus: state.password_focus,
+            busy: state.busy,
+            failure: state.failure.clone(),
+            keyboard_layout: state.keyboard_layout.clone(),
+        }
+    }
+}
 fn render(state: &State) -> anyhow::Result<ironrdp_server::BitmapUpdate> {
     let size = state.size;
     let mut pixels = vec![0; usize::from(size.width) * usize::from(size.height) * 4];
-    let (left, top, width) = form(size);
     let mut canvas = Canvas {
         pixels: &mut pixels,
         size,
@@ -646,6 +786,104 @@ fn render(state: &State) -> anyhow::Result<ironrdp_server::BitmapUpdate> {
         i32::from(size.height),
         [35, 27, 22],
     );
+    paint_form(&mut canvas, state);
+    // Canvas already produces the exact BGR wire order; avoid a second full
+    // allocation and conversion just to force the unused alpha byte.
+    Ok(ironrdp_server::BitmapUpdate {
+        x: 0,
+        y: 0,
+        width: NonZeroU16::new(size.width).ok_or_else(|| anyhow::anyhow!("empty login width"))?,
+        height: NonZeroU16::new(size.height)
+            .ok_or_else(|| anyhow::anyhow!("empty login height"))?,
+        format: ironrdp_server::PixelFormat::BgrX32,
+        data: pixels.into(),
+        stride: NonZeroUsize::new(usize::from(size.width) * 4).unwrap(),
+    })
+}
+struct LoginFramebuffer {
+    visible: VisibleState,
+    pixels: Vec<u8>,
+    snapshot: Option<ironrdp_server::BitmapUpdate>,
+}
+impl LoginFramebuffer {
+    fn new(state: &State) -> Self {
+        let bitmap = render(state).expect("negotiated login dimensions are nonzero");
+        Self {
+            visible: VisibleState::from(state),
+            pixels: bitmap.data.to_vec(),
+            snapshot: Some(bitmap),
+        }
+    }
+    fn repaint(&mut self, state: &State) {
+        if self.visible.width != state.size.width || self.visible.height != state.size.height {
+            *self = Self::new(state);
+            return;
+        }
+        let (left, top, _) = form(state.size);
+        let mut canvas = Canvas {
+            pixels: &mut self.pixels,
+            size: state.size,
+        };
+        // The desktop background is allocated and filled once. Repaint only
+        // the fields, form and status line when their visible state changes.
+        canvas.rect(
+            left,
+            top,
+            i32::from(state.size.width) - left,
+            242,
+            [35, 27, 22],
+        );
+        paint_form(&mut canvas, state);
+        self.visible = VisibleState::from(state);
+        self.snapshot = None;
+    }
+    fn snapshot(&mut self) -> ironrdp_server::BitmapUpdate {
+        self.snapshot
+            .get_or_insert_with(|| {
+                framebuffer(
+                    self.pixels.clone(),
+                    DesktopSize {
+                        width: self.visible.width,
+                        height: self.visible.height,
+                    },
+                    0,
+                    0,
+                )
+            })
+            .clone()
+    }
+    fn region(&self) -> ironrdp_server::BitmapUpdate {
+        let size = DesktopSize {
+            width: self.visible.width,
+            height: self.visible.height,
+        };
+        let (left, top, _) = form(size);
+        let region = DesktopSize {
+            width: size.width - left as u16,
+            height: (size.height - top as u16).min(242),
+        };
+        let mut pixels =
+            Vec::with_capacity(usize::from(region.width) * usize::from(region.height) * 4);
+        for y in top as usize..top as usize + usize::from(region.height) {
+            let offset = (y * usize::from(size.width) + left as usize) * 4;
+            pixels.extend_from_slice(&self.pixels[offset..offset + usize::from(region.width) * 4]);
+        }
+        framebuffer(pixels, region, left as u16, top as u16)
+    }
+}
+fn framebuffer(pixels: Vec<u8>, size: DesktopSize, x: u16, y: u16) -> ironrdp_server::BitmapUpdate {
+    ironrdp_server::BitmapUpdate {
+        x,
+        y,
+        width: NonZeroU16::new(size.width).unwrap(),
+        height: NonZeroU16::new(size.height).unwrap(),
+        format: ironrdp_server::PixelFormat::BgrX32,
+        data: pixels.into(),
+        stride: NonZeroUsize::new(usize::from(size.width) * 4).unwrap(),
+    }
+}
+fn paint_form(canvas: &mut Canvas<'_>, state: &State) {
+    let (left, top, width) = form(state.size);
     canvas.text(left, top, "Niri remote login", [240, 240, 240]);
     canvas.text(left, top + 40, "Linux username", [200, 200, 200]);
     canvas.rect(
@@ -706,15 +944,6 @@ fn render(state: &State) -> anyhow::Result<ironrdp_server::BitmapUpdate> {
             .map_or(keyboard_hint.as_str(), |failure| failure.message()),
         [200, 200, 200],
     );
-    Ok(bitmap(
-        &pixels,
-        u32::from(size.width),
-        u32::from(size.height),
-        u32::from(size.width) * 4,
-        false,
-        size,
-        false,
-    )?)
 }
 struct Canvas<'a> {
     pixels: &'a mut [u8],
@@ -1153,6 +1382,145 @@ mod tests {
             render(&state).unwrap().data
         };
         assert_eq!(first, second);
+    }
+
+    #[test]
+    fn cached_regions_reconstruct_login_and_idle_reuses_owned_pixels() {
+        for size in [
+            DesktopSize {
+                width: 200,
+                height: 200,
+            },
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            },
+            DesktopSize {
+                width: 3840,
+                height: 2160,
+            },
+        ] {
+            let login = login("alice");
+            let mut state = login.state.lock().unwrap();
+            state.size = size;
+            let mut cache = LoginFramebuffer::new(&state);
+            let first = cache.snapshot();
+            let idle = cache.snapshot();
+            assert_eq!(first.data.as_ptr(), idle.data.as_ptr());
+            let mut reconstructed = first.data.to_vec();
+            for (username, focus, failure, busy) in [
+                ("bob", false, None, false),
+                ("b", true, Some(LoginFailure::Rejected), false),
+                ("alice", true, None, true),
+            ] {
+                state.username = username.into();
+                state.password_focus = focus;
+                state.failure = failure;
+                state.busy = busy;
+                cache.repaint(&state);
+                let region = cache.region();
+                for row in 0..usize::from(region.height.get()) {
+                    let offset = ((usize::from(region.y) + row) * usize::from(size.width)
+                        + usize::from(region.x))
+                        * 4;
+                    let source = row * region.stride.get();
+                    reconstructed[offset..offset + region.stride.get()]
+                        .copy_from_slice(&region.data[source..source + region.stride.get()]);
+                }
+                assert_eq!(reconstructed, render(&state).unwrap().data);
+                assert_eq!(cache.snapshot().data, reconstructed);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn password_edits_after_first_mask_do_not_notify_or_transmit_length() {
+        let login = login("alice");
+        let mut updates = login.clone().updates().await.unwrap();
+        updates.next_update().await.unwrap();
+        login.character('a');
+        updates.next_update().await.unwrap();
+        let generation = *login.changed.borrow();
+        for c in "日本😀password".chars() {
+            login.character(c);
+        }
+        assert_eq!(*login.changed.borrow(), generation);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), updates.next_update())
+                .await
+                .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn suppressed_login_retains_initial_surface_and_resumes_cached_full_refresh() {
+        let mut login = login("");
+        login.set_output_suppressed(true);
+        let mut updates = login.updates().await.unwrap();
+        let Some(DisplayUpdate::Bitmap(first)) = updates.next_update().await.unwrap() else {
+            panic!("missing startup surface");
+        };
+        login.character('a');
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), updates.next_update())
+                .await
+                .is_err()
+        );
+        login.set_output_suppressed(false);
+        let Some(DisplayUpdate::Bitmap(resumed)) = updates.next_update().await.unwrap() else {
+            panic!("missing resumed surface");
+        };
+        assert_eq!(
+            (resumed.x, resumed.y, resumed.width, resumed.height),
+            (first.x, first.y, first.width, first.height)
+        );
+        login.request_refresh();
+        let Some(DisplayUpdate::Bitmap(refreshed)) = updates.next_update().await.unwrap() else {
+            panic!("missing explicit refresh");
+        };
+        assert_eq!(refreshed.data.as_ptr(), resumed.data.as_ptr());
+    }
+
+    #[test]
+    #[ignore = "comparative login rendering measurement"]
+    fn login_render_benchmark() {
+        for size in [
+            DesktopSize {
+                width: 1920,
+                height: 1080,
+            },
+            DesktopSize {
+                width: 3840,
+                height: 2160,
+            },
+        ] {
+            let login = login("alice");
+            let mut state = login.state.lock().unwrap();
+            state.size = size;
+            let start = Instant::now();
+            for _ in 0..60 {
+                std::hint::black_box(render(&state).unwrap());
+            }
+            let uncached_us = start.elapsed().as_micros();
+            let mut cache = LoginFramebuffer::new(&state);
+            let start = Instant::now();
+            for _ in 0..60 {
+                std::hint::black_box(cache.snapshot());
+            }
+            let idle_us = start.elapsed().as_micros();
+            let start = Instant::now();
+            let mut bytes = 0;
+            for i in 0..60 {
+                state.username = format!("user{i}");
+                cache.repaint(&state);
+                bytes += cache.region().data.len();
+            }
+            let editing_us = start.elapsed().as_micros();
+            println!(
+                "{{\"component\":\"login\",\"width\":{},\"height\":{},\"updates\":60,\"uncached_us\":{uncached_us},\"cached_idle_us\":{idle_us},\"partial_edit_us\":{editing_us},\"partial_bytes\":{bytes}}}",
+                size.width, size.height
+            );
+        }
     }
 
     #[tokio::test]

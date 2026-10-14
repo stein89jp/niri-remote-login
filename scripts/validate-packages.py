@@ -14,7 +14,7 @@ EXPECTED = {
     "niri-remote-login": {
         "usr/lib/niri-rdp/niri-rdp-bridge", "usr/lib/niri-rdp/niri-rdp-broker",
         "usr/lib/niri-rdp/encoder-probe",
-        "usr/lib/niri-rdp/session-worker", "usr/lib/niri-rdp/session-desktop", "etc/pam.d/niri-rdp", "etc/niri-rdp/headless.kdl",
+        "usr/lib/niri-rdp/session-worker", "usr/lib/niri-rdp/session-desktop", "usr/lib/niri-rdp/session-audio", "etc/pam.d/niri-rdp", "etc/niri-rdp/headless.kdl",
         "usr/lib/niri-rdp/session-portals", "usr/share/xdg-desktop-portal/niri-rdp-portals.conf",
         "usr/lib/niri-rdp/session-environment", "usr/lib/niri-rdp/session-autostart",
         "usr/lib/niri-rdp/session-input-method",
@@ -23,6 +23,7 @@ EXPECTED = {
         "usr/lib/systemd/system/niri-rdp-nvidia-devices.service",
         "usr/share/doc/niri-remote-login/install.md", "usr/share/doc/niri-remote-login/uninstall.md",
         "usr/share/doc/niri-remote-login/upgrade.md", "usr/share/doc/niri-remote-login/acceptance.md",
+        "usr/share/doc/niri-remote-login/performance.md",
         "usr/share/doc/niri-remote-login/nvidia-frontend.conf",
         "usr/share/licenses/niri-remote-login/LICENSE", "usr/share/licenses/niri-remote-login/THIRD-PARTY-NOTICES.txt",
     },

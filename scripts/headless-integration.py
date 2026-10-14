@@ -260,6 +260,9 @@ def main():
             bridge_env["NIRI_RDP_ENCODER"] = encoder
             if fps := os.environ.get("NIRI_RDP_LAB_FPS"):
                 bridge_env["NIRI_RDP_FPS"] = fps
+            for setting in ("VIDEO_CODEC", "GPU_CAPTURE", "ADAPTIVE_GRAPHICS", "VIDEO_PROFILE", "SCALE", "DIAGNOSTICS", "LINK_MBPS"):
+                if value := os.environ.get("NIRI_RDP_LAB_" + setting):
+                    bridge_env["NIRI_RDP_" + setting] = value
             fixture = None
             if tls_contract:
                 fixture = MockBroker(runtime, username, password)
@@ -286,6 +289,9 @@ def main():
                 client_env.pop("NIRI_RDP_TEST_NLA")
             if gfx:
                 client_env["NIRI_RDP_TEST_GFX"] = "1"
+            avc444 = gfx and os.environ.get("NIRI_RDP_LAB_VIDEO_CODEC") in ("auto", "avc444")
+            if avc444:
+                client_env["NIRI_RDP_TEST_AVC444"] = "1"
             bad = subprocess.run([str(ROOT / "artifacts/rdp-desktop-client")],
                                  env=dict(client_env, NIRI_RDP_TEST_PASSWORD=secrets.token_hex(24)),
                                  capture_output=True, text=True, timeout=25)
@@ -307,8 +313,9 @@ def main():
                 if good.returncode or "NIRI_RDP_APP_KEY_POINTER_RELEASE_OK" not in good.stdout:
                     raise RuntimeError(f"real desktop RDP roundtrip {i} failed: rc={good.returncode} "
                                        f"{good.stdout} {good.stderr}")
-                if gfx and "NIRI_RDP_AVC420_DECODED_FRAMES" not in good.stdout:
-                    raise RuntimeError("NVENC roundtrip used bitmap fallback instead of decoded AVC420")
+                codec_marker = "NIRI_RDP_AVC444_DECODED_STREAMS" if avc444 else "NIRI_RDP_AVC420_DECODED_FRAMES"
+                if gfx and not re.search(rf"{codec_marker} [1-9][0-9]*", good.stdout):
+                    raise RuntimeError("NVENC roundtrip did not decode the requested negotiated codec")
                 if login_screen:
                     for marker in ("NIRI_RDP_LOGIN_SCREEN_WITHOUT_CLIENT_CREDENTIALS",
                                    "NIRI_RDP_LOGIN_SCREEN_WRONG_PASSWORD_REJECTED",
@@ -441,13 +448,26 @@ def main():
                 # negotiated size, so authentication reuses the login surface.
                 expected_graphics = (3 * len(DESKTOP_SIZES) + 2 +
                                      (len(DESKTOP_SIZES) + 1 if fcitx else 0)) if gfx else 0
-                actual_graphics = bridge_log.count("RDP graphics using NVENC H.264 AVC420")
+                codec = "AVC444" if avc444 else "AVC420"
+                actual_graphics = bridge_log.count("RDP graphics using NVENC H.264 " + codec)
                 if actual_graphics != expected_graphics:
-                    raise RuntimeError(f"expected {expected_graphics} NVENC AVC420 initializations, "
+                    raise RuntimeError(f"expected {expected_graphics} NVENC {codec} initializations, "
                                        f"observed {actual_graphics}")
-                key = ("nvenc_avc420_graphics_real_app_decode_input_reconnect" if gfx else
+                key = (f"nvenc_{codec.lower()}_graphics_real_app_decode_input_reconnect" if gfx else
                        "nvenc_bitmap_fallback_for_client_without_graphics")
                 results[key] = "passed"
+                if os.environ.get("NIRI_RDP_LAB_REQUIRE_GPU") == "1":
+                    if not gpu_rendering or not gfx or os.environ.get("NIRI_RDP_LAB_GPU_CAPTURE") != "auto":
+                        raise RuntimeError("GPU capture proof requires hardware renderer, graphics client and auto capture")
+                    activations = re.findall(
+                        r"RDP GPU capture using EGL/CUDA DMA-BUF NVENC \((\d+)x(\d+)\)", bridge_log)
+                    dimensions = {tuple(map(int, dimensions)) for dimensions in activations}
+                    if not set(DESKTOP_SIZES).issubset(dimensions):
+                        raise RuntimeError(f"GPU capture did not encode every requested layout: {sorted(dimensions)}")
+                    results["gpu_dmabuf_egl_cuda_nvenc_real_decode_resize_reconnect"] = {
+                        "native_encoder_activations": len(activations),
+                        "encoded_dimensions": sorted(dimensions),
+                    }
             if fixture:
                 deadline = time.monotonic() + 3
                 while fixture.closed != fixture.accepted and time.monotonic() < deadline:
@@ -480,6 +500,13 @@ def main():
                 stop(proc)
             for log in logs:
                 log.close()
+            if evidence := os.environ.get("NIRI_RDP_LAB_EVIDENCE"):
+                destination = Path(evidence).resolve()
+                if not destination.is_relative_to(ROOT / "artifacts"):
+                    raise RuntimeError("integration evidence must stay under artifacts/")
+                destination.mkdir(parents=True, exist_ok=True)
+                for path in private.glob("*.log"):
+                    shutil.copy2(path, destination / path.name)
         rendered = json.dumps(results, indent=2) + "\n"
         if report := os.environ.get("NIRI_RDP_LAB_REPORT"):
             Path(report).write_text(rendered)

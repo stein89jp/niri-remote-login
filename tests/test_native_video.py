@@ -12,6 +12,44 @@ ROOT = Path(__file__).resolve().parents[1]
 
 class NativeVideoTests(unittest.TestCase):
     @unittest.skipUnless(os.environ.get("NIRI_RDP_TEST_NVENC") == "1",
+                         "opt-in NVIDIA DMA-BUF test: NIRI_RDP_TEST_NVENC=1")
+    def test_gpu_dmabuf_bt709_padding_and_context_cleanup(self):
+        flags = subprocess.run(
+            ["pkg-config", "--cflags", "--libs", "libavcodec", "libavutil", "libswscale",
+             "egl", "gl", "gbm"], check=True, capture_output=True, text=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            executable = str(Path(directory) / "video-gpu")
+            subprocess.run(
+                ["cc", "-O2", "-Wall", "-Wextra", str(ROOT / "tests/video_gpu.c"),
+                 "-o", executable, *shlex.split(flags.stdout), "-lm"],
+                check=True, capture_output=True, text=True,
+            )
+            result = subprocess.run(
+                [executable, os.environ.get("NIRI_RDP_GPU_DEVICE", "/dev/dri/renderD128")],
+                capture_output=True, text=True, timeout=30,
+            )
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("PASS:", result.stdout)
+            print(result.stdout.strip())
+
+    def test_avc444_packing_and_single_decoder_reference_chain(self):
+        flags = subprocess.run(
+            ["pkg-config", "--cflags", "--libs", "libavcodec", "libavutil", "libswscale"],
+            check=True, capture_output=True, text=True,
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            executable = str(Path(directory) / "video-avc444")
+            subprocess.run(
+                ["cc", "-O2", "-Wall", "-Wextra", str(ROOT / "tests/video_avc444.c"),
+                 "-o", executable, *shlex.split(flags.stdout)],
+                check=True, capture_output=True, text=True,
+            )
+            result = subprocess.run([executable], capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("64 consecutive main/aux views", result.stdout)
+
+    @unittest.skipUnless(os.environ.get("NIRI_RDP_TEST_NVENC") == "1",
                          "opt-in NVIDIA hardware test: NIRI_RDP_TEST_NVENC=1")
     def test_live_nvenc_bitrate_changes_and_decoder_continuity(self):
         flags = subprocess.run(

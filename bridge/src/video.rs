@@ -5,6 +5,7 @@ use ironrdp_egfx::{
     pdu::{Avc420Region, CapabilitiesAdvertisePdu, CapabilitySet},
     server::{GraphicsPipelineHandler, GraphicsPipelineServer},
 };
+use ironrdp_pdu::gcc::{Monitor, MonitorFlags};
 use ironrdp_server::{
     BitmapUpdate, DesktopSize, DisplayUpdate, EgfxServerMessage, GfxDvcBridge, GfxServerFactory,
     GfxServerHandle, PixelFormat, RdpServerDisplay, RdpServerDisplayUpdates, ServerEvent,
@@ -12,25 +13,60 @@ use ironrdp_server::{
 };
 use std::{
     ffi::{CStr, c_char, c_int, c_void},
+    os::fd::AsRawFd,
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 use tokio::{sync::mpsc::UnboundedSender, task::JoinHandle};
 
 unsafe extern "C" {
-    fn niri_video_new(
+    fn niri_video_free(encoder: *mut c_void);
+    fn niri_video_new_config(
         width: c_int,
         height: c_int,
         software: c_int,
         fps: c_int,
         bitrate: c_int,
+        preset: c_int,
+        spatial_aq: c_int,
+        avc444: c_int,
         error: *mut c_char,
         length: usize,
     ) -> *mut c_void;
-    fn niri_video_free(encoder: *mut c_void);
+    fn niri_video_set_rate(encoder: *mut c_void, bitrate: c_int, fps: c_int) -> c_int;
+    fn niri_video_encode_pair(
+        encoder: *mut c_void,
+        pixels: *const u8,
+        stride: c_int,
+        force_idr: c_int,
+        main: *mut *const u8,
+        main_size: *mut c_int,
+        aux: *mut *const u8,
+        aux_size: *mut c_int,
+        error: *mut c_char,
+        length: usize,
+    ) -> c_int;
+    fn niri_video_encode_dmabuf(
+        encoder: *mut c_void,
+        fd: c_int,
+        fourcc: u32,
+        stride: u32,
+        offset: u32,
+        modifier: u64,
+        device: u64,
+        force_idr: c_int,
+        main: *mut *const u8,
+        main_size: *mut c_int,
+        aux: *mut *const u8,
+        aux_size: *mut c_int,
+        error: *mut c_char,
+        length: usize,
+    ) -> c_int;
+    fn niri_video_timings(encoder: *mut c_void, convert_ms: *mut f64, encode_ms: *mut f64);
+    #[cfg(test)]
     fn niri_video_set_bitrate(encoder: *mut c_void, bitrate: c_int) -> c_int;
     fn niri_video_encode(
         encoder: *mut c_void,
@@ -48,6 +84,31 @@ pub struct Encoder {
     width: u16,
     height: u16,
     bitrate: u32,
+    fps: u32,
+    avc444: bool,
+    software: bool,
+    gpu_active: bool,
+}
+#[derive(Debug)]
+struct EncodedFrame {
+    main: Vec<u8>,
+    auxiliary: Option<Vec<u8>>,
+    conversion: Duration,
+    encode: Duration,
+    captured_at: Option<Instant>,
+    received_at: Instant,
+}
+impl From<Vec<u8>> for EncodedFrame {
+    fn from(main: Vec<u8>) -> Self {
+        Self {
+            main,
+            auxiliary: None,
+            conversion: Duration::ZERO,
+            encode: Duration::ZERO,
+            captured_at: None,
+            received_at: Instant::now(),
+        }
+    }
 }
 // The FFmpeg context has a single owner; access from encoding tasks is serialized.
 unsafe impl Send for Encoder {}
@@ -57,6 +118,34 @@ impl Drop for Encoder {
     }
 }
 impl Encoder {
+    fn set_rate(&mut self, bitrate: u32, fps: u32) -> anyhow::Result<bool> {
+        if (self.bitrate, self.fps) == (bitrate, fps) {
+            return Ok(false);
+        }
+        anyhow::ensure!(
+            (1_000_000..=100_000_000).contains(&bitrate) && (1..=60).contains(&fps),
+            "invalid adaptive H.264 rate"
+        );
+        if fps != self.fps {
+            *self = Self::new_rate(
+                self.width,
+                self.height,
+                self.software,
+                self.avc444,
+                fps,
+                bitrate,
+            )?;
+            return Ok(true);
+        }
+        anyhow::ensure!(
+            unsafe { niri_video_set_rate(self.ptr, bitrate as c_int, fps as c_int) } == 0,
+            "native bitrate reconfiguration failed"
+        );
+        self.bitrate = bitrate;
+        self.fps = fps;
+        Ok(false)
+    }
+    #[cfg(test)]
     fn set_bitrate(&mut self, bitrate: u32) -> anyhow::Result<()> {
         if bitrate == self.bitrate {
             return Ok(());
@@ -78,19 +167,42 @@ impl Encoder {
         Self::new(width, height, false)
     }
     fn new(width: u16, height: u16, software: bool) -> anyhow::Result<Self> {
+        Self::new_mode(width, height, software, false)
+    }
+    fn new_mode(width: u16, height: u16, software: bool, avc444: bool) -> anyhow::Result<Self> {
+        Self::new_rate(
+            width,
+            height,
+            software,
+            avc444,
+            crate::performance::frame_rate()?,
+            crate::performance::bitrate()?,
+        )
+    }
+    fn new_rate(
+        width: u16,
+        height: u16,
+        software: bool,
+        avc444: bool,
+        fps: u32,
+        bitrate: u32,
+    ) -> anyhow::Result<Self> {
         anyhow::ensure!(
             width >= 1 && height >= 1 && width <= 4096 && height <= 4096,
             "H.264 dimensions must be within 1..4096"
         );
-        let bitrate = crate::performance::bitrate()?;
+        let (preset, spatial_aq) = crate::performance::quality_profile()?;
         let mut error = [0 as c_char; 256];
         let ptr = unsafe {
-            niri_video_new(
+            niri_video_new_config(
                 width.into(),
                 height.into(),
                 software.into(),
-                crate::performance::frame_rate()? as c_int,
+                fps as c_int,
                 bitrate as c_int,
+                preset as c_int,
+                spatial_aq.into(),
+                avc444.into(),
                 error.as_mut_ptr(),
                 error.len(),
             )
@@ -105,8 +217,148 @@ impl Encoder {
             width,
             height,
             bitrate,
+            fps,
+            avc444,
+            software,
+            gpu_active: false,
         })
     }
+    fn timings(&self) -> (Duration, Duration) {
+        let (mut conversion, mut encode) = (0.0, 0.0);
+        unsafe { niri_video_timings(self.ptr, &mut conversion, &mut encode) };
+        (
+            Duration::from_secs_f64(conversion.max(0.0) / 1000.0),
+            Duration::from_secs_f64(encode.max(0.0) / 1000.0),
+        )
+    }
+    fn encoded(
+        &self,
+        main: *const u8,
+        main_size: c_int,
+        aux: *const u8,
+        aux_size: c_int,
+    ) -> anyhow::Result<EncodedFrame> {
+        anyhow::ensure!(
+            main_size > 0 && !main.is_null() && aux_size >= 0 && (aux_size == 0 || !aux.is_null()),
+            "invalid native H.264 packets"
+        );
+        let (conversion, encode) = self.timings();
+        Ok(EncodedFrame {
+            main: unsafe { std::slice::from_raw_parts(main, main_size as usize) }.to_vec(),
+            auxiliary: if aux_size > 0 {
+                Some(unsafe { std::slice::from_raw_parts(aux, aux_size as usize) }.to_vec())
+            } else {
+                None
+            },
+            conversion,
+            encode,
+            captured_at: None,
+            received_at: Instant::now(),
+        })
+    }
+    fn encode_views(
+        &mut self,
+        image: &BitmapUpdate,
+        force_idr: bool,
+    ) -> anyhow::Result<EncodedFrame> {
+        if !self.avc444 {
+            let main = self.encode(image, force_idr)?;
+            let (conversion, encode) = self.timings();
+            return Ok(EncodedFrame {
+                main,
+                auxiliary: None,
+                conversion,
+                encode,
+                captured_at: None,
+                received_at: Instant::now(),
+            });
+        }
+        anyhow::ensure!(
+            image.x == 0
+                && image.y == 0
+                && image.width.get() == self.width
+                && image.height.get() == self.height
+                && matches!(image.format, PixelFormat::BgrA32 | PixelFormat::BgrX32),
+            "AVC444 requires full BGR desktop"
+        );
+        let stride = image.stride.get();
+        anyhow::ensure!(
+            stride >= usize::from(self.width) * 4
+                && stride <= 4096 * 4
+                && image.data.len() >= stride * usize::from(self.height),
+            "invalid AVC444 input"
+        );
+        let mut error = [0 as c_char; 256];
+        let (mut main, mut aux) = (std::ptr::null(), std::ptr::null());
+        let (mut main_size, mut aux_size) = (0, 0);
+        let result = unsafe {
+            niri_video_encode_pair(
+                self.ptr,
+                image.data.as_ptr(),
+                stride as c_int,
+                force_idr.into(),
+                &mut main,
+                &mut main_size,
+                &mut aux,
+                &mut aux_size,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        anyhow::ensure!(
+            result == 0,
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        self.encoded(main, main_size, aux, aux_size)
+    }
+    fn encode_gpu(
+        &mut self,
+        image: &crate::wayland::GpuFrame,
+        force_idr: bool,
+    ) -> anyhow::Result<EncodedFrame> {
+        anyhow::ensure!(
+            image.width == u32::from(self.width) && image.height == u32::from(self.height),
+            "GPU frame geometry changed"
+        );
+        anyhow::ensure!(!image.inverted, "inverted GPU capture uses SHM fallback");
+        let mut error = [0 as c_char; 256];
+        let (mut main, mut aux) = (std::ptr::null(), std::ptr::null());
+        let (mut main_size, mut aux_size) = (0, 0);
+        let result = unsafe {
+            niri_video_encode_dmabuf(
+                self.ptr,
+                image.fd.as_raw_fd(),
+                image.fourcc,
+                image.stride,
+                image.offset,
+                image.modifier,
+                image.device,
+                force_idr.into(),
+                &mut main,
+                &mut main_size,
+                &mut aux,
+                &mut aux_size,
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        anyhow::ensure!(
+            result == 0,
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        let result = self.encoded(main, main_size, aux, aux_size)?;
+        if !self.gpu_active {
+            eprintln!(
+                "RDP GPU capture using EGL/CUDA DMA-BUF NVENC ({}x{})",
+                self.width, self.height
+            );
+        }
+        self.gpu_active = true;
+        Ok(result)
+    }
+    #[cfg(test)]
     fn encode_frame(
         encoder: &mut Option<Self>,
         image: &BitmapUpdate,
@@ -172,9 +424,28 @@ struct Shared {
     suppressed: Arc<AtomicBool>,
     rate: Arc<Mutex<crate::performance::AdaptiveBitrate>>,
     audio_generation: u64,
+    refresh: Arc<AtomicU64>,
+    encode_gate: Arc<EncodeGate>,
+}
+struct EncodeGate(Arc<tokio::sync::Semaphore>);
+impl Default for EncodeGate {
+    fn default() -> Self {
+        Self(Arc::new(tokio::sync::Semaphore::new(1)))
+    }
 }
 #[derive(Clone, Default)]
 pub struct Video(Arc<Mutex<Shared>>);
+type DesktopProvider = Arc<dyn Fn() -> Option<crate::wayland::Desktop> + Send + Sync>;
+
+fn primary_monitor(width: u16, height: u16) -> Vec<Monitor> {
+    vec![Monitor {
+        left: 0,
+        top: 0,
+        right: i32::from(width) - 1,
+        bottom: i32::from(height) - 1,
+        flags: MonitorFlags::PRIMARY,
+    }]
+}
 
 /// Sound feedback follows the active graphics context, including when sound
 /// negotiation happens first. Older connections cannot reduce a newer one's rate.
@@ -205,6 +476,13 @@ impl AudioFeedback {
     }
 }
 impl Video {
+    pub fn request_refresh(&self) {
+        self.0
+            .lock()
+            .unwrap()
+            .refresh
+            .fetch_add(1, Ordering::SeqCst);
+    }
     /// Create once per sound backend, then clone into its capture worker.
     pub fn audio_feedback(&self) -> AudioFeedback {
         let mut state = self.0.lock().unwrap();
@@ -219,6 +497,10 @@ impl Video {
         // Reject invalid capture settings before accepting client connections.
         crate::performance::frame_rate()?;
         crate::performance::bitrate()?;
+        crate::performance::quality_profile()?;
+        crate::performance::avc444_requested()?;
+        crate::performance::gpu_capture_requested()?;
+        crate::performance::joint_adaptation_requested()?;
         match std::env::var("NIRI_RDP_ENCODER")
             .as_deref()
             .unwrap_or("bitmap")
@@ -262,14 +544,38 @@ impl Video {
         &self,
         desktop: &crate::wayland::Desktop,
     ) -> ServerResult<Box<dyn RdpServerDisplayUpdates + Send>> {
-        self.wrap_updates(desktop.updates_send())
+        self.wrap_updates_with_desktop(desktop.updates_full_send(), Some(desktop.clone()))
     }
+    #[cfg(test)]
     pub(crate) fn wrap_updates(
         &self,
         inner: Box<dyn RdpServerDisplayUpdates + Send>,
     ) -> ServerResult<Box<dyn RdpServerDisplayUpdates + Send>> {
+        self.wrap_updates_with_desktop(inner, None)
+    }
+    pub(crate) fn wrap_updates_with_desktop_provider(
+        &self,
+        inner: Box<dyn RdpServerDisplayUpdates + Send>,
+        provider: DesktopProvider,
+    ) -> ServerResult<Box<dyn RdpServerDisplayUpdates + Send>> {
+        let mut stream = self.make_updates(inner, None)?;
+        stream.desktop_provider = Some(provider);
+        Ok(Box::new(stream))
+    }
+    fn wrap_updates_with_desktop(
+        &self,
+        inner: Box<dyn RdpServerDisplayUpdates + Send>,
+        desktop: Option<crate::wayland::Desktop>,
+    ) -> ServerResult<Box<dyn RdpServerDisplayUpdates + Send>> {
+        Ok(Box::new(self.make_updates(inner, desktop)?))
+    }
+    fn make_updates(
+        &self,
+        inner: Box<dyn RdpServerDisplayUpdates + Send>,
+        desktop: Option<crate::wayland::Desktop>,
+    ) -> ServerResult<VideoUpdates> {
         let state = self.0.lock().unwrap();
-        Ok(Box::new(VideoUpdates {
+        Ok(VideoUpdates {
             inner,
             handle: state
                 .handle
@@ -290,7 +596,23 @@ impl Video {
             known_generation: state.generation.load(Ordering::SeqCst),
             suppressed: state.suppressed.clone(),
             rate: state.rate.clone(),
-        }))
+            desktop,
+            desktop_provider: None,
+            pending_gpu: false,
+            gpu_failed: false,
+            last_gpu: None,
+            refinement: None,
+            next_frame: Instant::now(),
+            diagnostics: crate::performance::Telemetry::from_env(),
+            credit_wait_started: None,
+            fallback_previous: None,
+            fallback_partial: Default::default(),
+            fallback_resume: false,
+            refresh: state.refresh.clone(),
+            known_refresh: state.refresh.load(Ordering::SeqCst),
+            pending_refresh: 0,
+            encode_gate: state.encode_gate.clone(),
+        })
     }
     pub fn set_suppressed(&self, suppressed: Arc<AtomicBool>) {
         self.0.lock().unwrap().suppressed = suppressed;
@@ -317,7 +639,7 @@ impl GraphicsPipelineHandler for Handler {
             .acknowledged(frame_id, queue_depth, Instant::now());
     }
     fn max_frames_in_flight(&self) -> u32 {
-        2
+        self.1.lock().unwrap().max_frames_in_flight()
     }
 }
 impl ServerEventSender for Video {
@@ -337,6 +659,10 @@ impl GfxServerFactory for Video {
         let rate = {
             let previous = state.rate.lock().unwrap();
             let mut rate = crate::performance::AdaptiveBitrate::new(previous.ceiling(), now);
+            rate.set_frame_rate_ceiling(crate::performance::frame_rate().unwrap_or(60));
+            rate.enable_joint_adaptation(
+                crate::performance::joint_adaptation_requested().unwrap_or(false),
+            );
             rate.inherit_audio_congestion(&previous, now);
             Arc::new(Mutex::new(rate))
         };
@@ -365,11 +691,24 @@ impl RdpServerDisplay for VideoDisplay {
     fn request_layout(&mut self, layout: DisplayControlMonitorLayout) {
         self.inner.request_layout(layout);
     }
+    fn pointer_capabilities(&mut self, max_size: u16) {
+        self.inner.pointer_capabilities(max_size);
+    }
+    fn request_refresh(&mut self) {
+        self.video.request_refresh();
+        self.inner.request_refresh();
+    }
+    fn set_output_suppressed(&mut self, suppressed: bool) {
+        if !suppressed {
+            self.video.request_refresh();
+        }
+        self.inner.set_output_suppressed(suppressed);
+    }
     async fn updates(&mut self) -> ServerResult<Box<dyn RdpServerDisplayUpdates>> {
         Ok(self.video.updates_send(&self.inner)?)
     }
 }
-type EncodingTask = JoinHandle<anyhow::Result<Vec<u8>>>;
+type EncodingTask = JoinHandle<anyhow::Result<EncodedFrame>>;
 struct VideoUpdates {
     inner: Box<dyn RdpServerDisplayUpdates + Send>,
     handle: GfxServerHandle,
@@ -386,8 +725,38 @@ struct VideoUpdates {
     known_generation: u64,
     suppressed: Arc<AtomicBool>,
     rate: Arc<Mutex<crate::performance::AdaptiveBitrate>>,
+    desktop: Option<crate::wayland::Desktop>,
+    desktop_provider: Option<DesktopProvider>,
+    pending_gpu: bool,
+    gpu_failed: bool,
+    last_gpu: Option<Arc<crate::wayland::GpuFrame>>,
+    refinement: Option<(Instant, Instant)>,
+    next_frame: Instant,
+    diagnostics: crate::performance::Telemetry,
+    credit_wait_started: Option<Instant>,
+    fallback_previous: Option<BitmapUpdate>,
+    fallback_partial: std::collections::VecDeque<BitmapUpdate>,
+    fallback_resume: bool,
+    refresh: Arc<AtomicU64>,
+    known_refresh: u64,
+    pending_refresh: u64,
+    encode_gate: Arc<EncodeGate>,
 }
 impl VideoUpdates {
+    fn cadence_due(&self, now: Instant) -> bool {
+        // Authenticated capture already uses the selected FPS. Ready-time
+        // jitter must not lose frames to a second, independently phased clock.
+        // A login provider can exist before it returns an actual Desktop.
+        self.desktop.is_some() || self.force_idr || now >= self.next_frame
+    }
+    fn attach_authenticated_desktop(&mut self) {
+        if self.desktop.is_none() {
+            self.desktop = self
+                .desktop_provider
+                .as_ref()
+                .and_then(|provider| provider());
+        }
+    }
     fn unchanged(&self, image: &BitmapUpdate) -> bool {
         !self.force_idr
             && self.last_image.as_ref().is_some_and(|previous| {
@@ -398,8 +767,13 @@ impl VideoUpdates {
                     && previous.data == image.data
             })
     }
+    #[cfg(test)]
     fn submit(&mut self, data: &[u8], width: u16, height: u16) -> ServerResult<()> {
+        self.submit_frame(&EncodedFrame::from(data.to_vec()), width, height)
+    }
+    fn submit_frame(&mut self, data: &EncodedFrame, width: u16, height: u16) -> ServerResult<()> {
         let mut gfx = self.handle.lock().unwrap();
+        gfx.set_max_frames_in_flight(self.rate.lock().unwrap().max_frames_in_flight());
         if !gfx.is_ready() || !gfx.supports_avc420() {
             return Err(server_error("H.264 graphics channel closed"));
         }
@@ -415,28 +789,77 @@ impl VideoUpdates {
                 // Reactivation can replace this update stream while its old
                 // surfaces remain in the connection's graphics context.
                 if gfx.surface_ids().next().is_some() {
-                    gfx.resize(width, height);
+                    let mut rate = self.rate.lock().unwrap();
+                    rate.reset_frames();
+                    gfx.set_max_frames_in_flight(rate.max_frames_in_flight());
+                    self.credit_wait_started = None;
                 }
+                // The pinned library's automatic reset uses zero monitors,
+                // which conforming clients reject. A private Niri desktop is
+                // one primary monitor; ResetGraphics uses inclusive bounds.
+                gfx.resize_with_monitors(width, height, primary_monitor(width, height));
                 gfx.set_output_dimensions(width, height);
                 let id = gfx
                     .create_surface(width, height)
                     .ok_or_else(|| server_error("graphics surface failed"))?;
                 gfx.map_surface_to_output(id, 0, 0);
                 self.surface = Some(id);
-                eprintln!("RDP graphics using NVENC H.264 AVC420 ({width}x{height})");
+                eprintln!(
+                    "RDP graphics using NVENC H.264 {} ({width}x{height})",
+                    if data.auxiliary.is_some() {
+                        "AVC444"
+                    } else {
+                        "AVC420"
+                    }
+                );
                 id
             }
         };
-        let frame = gfx.send_avc420_frame(
-            surface,
-            data,
-            &[Avc420Region::full_frame(width, height, 22)],
-            self.start.elapsed().as_millis() as u32,
-        );
+        // Region QP/quality is informational (MS-RDPEGFX 2.2.4.4.1), not a
+        // decoder knob. Leave the valid conservative estimate in place; actual
+        // rate-controlled QP comes from H.264, not this metadata.
+        let regions = [Avc420Region::full_frame(width, height, 22)];
+        let frame = if let Some(auxiliary) = &data.auxiliary {
+            gfx.send_avc444_frame(
+                surface,
+                &data.main,
+                &regions,
+                Some(auxiliary),
+                Some(&regions),
+                self.start.elapsed().as_millis() as u32,
+            )
+        } else {
+            gfx.send_avc420_frame(
+                surface,
+                &data.main,
+                &regions,
+                self.start.elapsed().as_millis() as u32,
+            )
+        };
         // If a reference frame is dropped, the next accepted frame must be an IDR.
         self.force_idr = frame.is_none();
         if let Some(id) = frame {
             self.rate.lock().unwrap().sent(id, Instant::now());
+            self.diagnostics.count("delivered_frames", 1);
+            self.diagnostics.count(
+                "h264_payload_bytes",
+                (data.main.len() + data.auxiliary.as_ref().map_or(0, Vec::len)) as u64,
+            );
+            self.diagnostics.sample("conversion", data.conversion);
+            self.diagnostics.sample("encode", data.encode);
+            let now = Instant::now();
+            self.diagnostics.sample(
+                "worker_receipt_to_submit",
+                now.saturating_duration_since(data.received_at),
+            );
+            if let Some(captured_at) = data.captured_at {
+                self.diagnostics.sample(
+                    "capture_ready_to_submit",
+                    now.saturating_duration_since(captured_at),
+                );
+            } else {
+                self.diagnostics.count("unknown_capture_age", 1);
+            }
         }
         let channel = gfx
             .channel_id()
@@ -448,6 +871,20 @@ impl VideoUpdates {
         )
         .map_err(|e| server_error(format!("graphics framing failed: {e}")))?;
         if !messages.is_empty() {
+            if self.diagnostics.enabled() {
+                self.diagnostics.count(
+                    "graphics_dvc_bytes",
+                    messages
+                        .iter()
+                        .map(|message| {
+                            message
+                                .encode_unframed_pdu()
+                                .map_or(0, |bytes| bytes.len() as u64)
+                        })
+                        .sum(),
+                );
+            }
+            self.diagnostics.report("video", Instant::now());
             self.sender
                 .send(ServerEvent::Egfx(EgfxServerMessage::SendMessages {
                     messages,
@@ -464,6 +901,23 @@ impl RdpServerDisplayUpdates for VideoUpdates {
             return Ok(None);
         }
         loop {
+            self.attach_authenticated_desktop();
+            let refresh = self.refresh.load(Ordering::SeqCst);
+            if refresh != self.known_refresh {
+                self.known_refresh = refresh;
+                self.force_idr = true;
+                self.refinement = None;
+                self.fallback_previous = None;
+                self.fallback_partial.clear();
+            }
+            if !self.fallback_partial.is_empty() {
+                let gfx = self.handle.lock().unwrap();
+                if gfx.is_ready() && gfx.supports_avc420() {
+                    self.fallback_partial.clear();
+                } else {
+                    return Ok(self.fallback_partial.pop_front().map(DisplayUpdate::Bitmap));
+                }
+            }
             if let Some((task, width, height, generation)) = &mut self.pending {
                 // Keep the handle in self: cancellation of this future cannot lose an encoded reference frame.
                 let result = task.await;
@@ -472,24 +926,56 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                 self.pending = None;
                 let data = match result {
                     Ok(Ok(data)) => data,
+                    Ok(Err(error)) if self.pending_gpu => {
+                        eprintln!("RDP GPU capture unavailable; restoring SHM capture: {error}");
+                        self.gpu_failed = true;
+                        self.pending_gpu = false;
+                        self.last_gpu = None;
+                        self.encoder.lock().unwrap().take();
+                        self.force_idr = true;
+                        self.refinement = None;
+                        if let Some(desktop) = &self.desktop {
+                            desktop.set_gpu_capture(false);
+                        }
+                        continue;
+                    }
                     other => {
                         self.ended = true;
                         return Err(server_error(format!("NVENC encoding failed: {other:?}")));
                     }
                 };
                 if self.generation.load(Ordering::SeqCst) != generation
+                    || self.refresh.load(Ordering::SeqCst) != self.pending_refresh
                     || (self.surface.is_some() && self.suppressed.load(Ordering::Relaxed))
                 {
                     // Decoder recovery/minimize can invalidate an in-flight reference frame.
                     self.force_idr = true;
                     continue;
                 }
-                if let Err(error) = self.submit(&data, width, height) {
+                if let Err(error) = self.submit_frame(&data, width, height) {
                     self.ended = true;
                     return Err(error);
                 }
             }
-            let Some(update) = self.inner.next_update().await? else {
+            let timer = self.refinement.map(|(due, _)| due);
+            let update = if let Some(due) = timer {
+                tokio::select! {
+                    biased;
+                    update=self.inner.next_update()=>update?,
+                    _=tokio::time::sleep_until(due.into())=> {
+                        let now=Instant::now();
+                        let (_,expires)=self.refinement.unwrap();
+                        if now>=expires {self.refinement=None;continue;}
+                        if !self.rate.lock().unwrap().permits_refinement(now) || self.suppressed.load(Ordering::Relaxed) {
+                            self.refinement=Some((now+Duration::from_millis(250),expires));continue;
+                        }
+                        self.last_image.clone().map(DisplayUpdate::Bitmap)
+                    }
+                }
+            } else {
+                self.inner.next_update().await?
+            };
+            let Some(update) = update else {
                 return Ok(None);
             };
             let image = match update {
@@ -497,67 +983,228 @@ impl RdpServerDisplayUpdates for VideoUpdates {
                 DisplayUpdate::Resize(size) => {
                     self.encoder.lock().unwrap().take();
                     self.last_image = None;
+                    self.fallback_previous = None;
+                    self.fallback_partial.clear();
+                    self.last_gpu = None;
+                    self.refinement = None;
+                    if let Some(desktop) = &self.desktop {
+                        desktop.set_gpu_capture(false);
+                    }
                     self.surface = None;
                     self.force_idr = true;
                     self.rate.lock().unwrap().reset_frames();
                     let mut gfx = self.handle.lock().unwrap();
                     if gfx.is_ready() && gfx.supports_avc420() {
-                        gfx.resize(size.width, size.height);
+                        gfx.resize_with_monitors(
+                            size.width,
+                            size.height,
+                            primary_monitor(size.width, size.height),
+                        );
                     }
                     return Ok(Some(DisplayUpdate::Resize(size)));
                 }
                 other => return Ok(Some(other)),
             };
             let generation = self.generation.load(Ordering::SeqCst);
+            self.attach_authenticated_desktop();
+            let refresh = self.refresh.load(Ordering::SeqCst);
+            if refresh != self.known_refresh {
+                self.known_refresh = refresh;
+                self.force_idr = true;
+                self.refinement = None;
+                self.fallback_previous = None;
+                self.fallback_partial.clear();
+            }
             if generation != self.known_generation {
                 self.surface = None;
                 self.force_idr = true;
                 self.known_generation = generation;
+                self.refinement = None;
+                self.last_gpu = None;
+                self.encoder.lock().unwrap().take();
+                self.fallback_previous = None;
+                self.fallback_partial.clear();
+                if let Some(desktop) = &self.desktop {
+                    desktop.set_gpu_capture(false);
+                }
             }
             // mstsc can suppress output during connection setup before it has
             // a surface. Deliver the first graphics frame so initialization
             // cannot deadlock on the client's later un-suppress request.
             if self.surface.is_some() && self.suppressed.load(Ordering::Relaxed) {
                 self.force_idr = true;
+                self.refinement = None;
+                if let Some(desktop) = &self.desktop {
+                    desktop.set_gpu_capture(false);
+                }
                 continue;
             }
+            let avc444;
             {
-                let gfx = self.handle.lock().unwrap();
+                let mut gfx = self.handle.lock().unwrap();
+                let (fps, window) = {
+                    let mut rate = self.rate.lock().unwrap();
+                    rate.check_stall(Instant::now());
+                    (rate.frame_rate(), rate.max_frames_in_flight())
+                };
+                gfx.set_max_frames_in_flight(window);
+                if let Some(desktop) = &self.desktop {
+                    desktop.set_video_frame_rate(fps);
+                }
                 if !gfx.is_ready() || !gfx.supports_avc420() {
                     if self.surface.is_some() {
                         self.ended = true;
                         return Err(server_error("H.264 graphics channel closed"));
                     }
+                    if let Some(desktop) = &self.desktop {
+                        desktop.set_gpu_capture(false);
+                        if desktop.is_gpu_bitmap(&image) {
+                            continue;
+                        }
+                    }
+                    if self.suppressed.load(Ordering::Relaxed) && self.fallback_previous.is_some() {
+                        self.fallback_resume = true;
+                        continue;
+                    }
+                    if self.fallback_resume {
+                        self.fallback_resume = false;
+                        self.fallback_previous = None;
+                    }
                     // Keep older clients usable, including those with AVC disabled.
-                    return Ok(Some(DisplayUpdate::Bitmap(image)));
-                }
-                if gfx.should_backpressure() {
-                    self.rate.lock().unwrap().check_stall(Instant::now());
+                    self.fallback_partial.extend(crate::bitmap_damage(
+                        self.fallback_previous.as_ref(),
+                        &image,
+                    ));
+                    self.fallback_previous = Some(image);
+                    if let Some(image) = self.fallback_partial.pop_front() {
+                        return Ok(Some(DisplayUpdate::Bitmap(image)));
+                    }
+                    self.diagnostics
+                        .count("unchanged_bitmap_fallback_frames", 1);
                     continue;
                 }
+                if gfx.should_backpressure() {
+                    self.diagnostics.count("credit_wait_frames", 1);
+                    self.credit_wait_started.get_or_insert(Instant::now());
+                    continue;
+                }
+                if let Some(started) = self.credit_wait_started.take() {
+                    self.diagnostics.sample(
+                        "graphics_credit_wait",
+                        Instant::now().saturating_duration_since(started),
+                    );
+                }
+                avc444 = gfx.supports_avc444()
+                    && crate::performance::avc444_requested()
+                        .map_err(|e| server_error(e.to_string()))?;
             }
+            let now = Instant::now();
+            let (bitrate, fps) = {
+                let rate = self.rate.lock().unwrap();
+                (rate.current(), rate.frame_rate())
+            };
+            if !self.cadence_due(now) {
+                self.diagnostics.count("cadence_skipped_frames", 1);
+                continue;
+            }
+            let gpu = if let Some(desktop) = &self.desktop {
+                if !self.gpu_failed
+                    && crate::performance::gpu_capture_requested()
+                        .map_err(|e| server_error(e.to_string()))?
+                {
+                    desktop.set_gpu_capture(true);
+                }
+                if desktop.is_gpu_bitmap(&image) {
+                    match desktop.gpu_frame_for(&image).or_else(|| {
+                        self.last_gpu.clone().filter(|_| {
+                            self.last_image
+                                .as_ref()
+                                .is_some_and(|last| last.data == image.data)
+                        })
+                    }) {
+                        Some(frame) => Some(frame),
+                        None => {
+                            self.diagnostics.count("overwritten_gpu_frames", 1);
+                            continue;
+                        }
+                    }
+                } else {
+                    None
+                }
+            } else {
+                None
+            };
             // Continue consuming capture heartbeats so capability recovery,
             // minimize/resume and backpressure still wake on a static desktop.
             // Avoid conversion, GPU upload and wire traffic for identical pixels.
             if self.unchanged(&image) {
-                continue;
+                let eligible = self
+                    .refinement
+                    .is_some_and(|(due, expires)| now >= due && now < expires)
+                    && self.rate.lock().unwrap().permits_refinement(now);
+                if !eligible {
+                    self.diagnostics.count("unchanged_frames", 1);
+                    continue;
+                }
+                self.refinement = None;
+                self.diagnostics.count("refinement_frames", 1);
+            } else {
+                self.refinement = Some((
+                    now + Duration::from_millis(750),
+                    now + Duration::from_secs(6),
+                ));
             }
             let (width, height) = (image.width.get(), image.height.get());
+            // Acquire asynchronously before submitting blocking work. Dropped
+            // streams may retain an already-running native call; replacements
+            // cannot create another context or enqueue more blocking tasks.
+            let waiting = Instant::now();
+            let permit = self
+                .encode_gate
+                .0
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|_| server_error("graphics encoder gate closed"))?;
+            if waiting.elapsed() > Duration::from_millis(150) {
+                self.diagnostics.count("superseded_encoder_wait_frames", 1);
+                continue;
+            }
             self.last_image = Some(image.clone());
+            self.last_gpu = gpu.clone();
+            self.next_frame = now + Duration::from_secs_f64(1.0 / f64::from(fps));
             let encoder = self.encoder.clone();
             let force_idr = self.force_idr;
-            let bitrate = self.rate.lock().unwrap().current();
+            self.pending_gpu = gpu.is_some();
+            self.pending_refresh = self.known_refresh;
+            let captured_at = gpu.as_ref().map(|frame| frame.captured_at).or_else(|| {
+                self.desktop
+                    .as_ref()
+                    .and_then(|desktop| desktop.capture_time_for(&image))
+            });
+            let received_at = now;
             // Encoder initialization and GPU submission run off the input/network thread.
             let task = tokio::task::spawn_blocking(move || {
+                let _permit = permit;
                 let mut encoder = encoder.lock().unwrap();
-                if let Some(encoder) = encoder.as_mut() {
-                    encoder.set_bitrate(bitrate)?;
+                let changed = encoder.as_ref().is_none_or(|encoder| {
+                    (encoder.width, encoder.height, encoder.avc444) != (width, height, avc444)
+                        || (encoder.gpu_active && gpu.is_none())
+                });
+                if changed {
+                    let software = encoder.as_ref().is_some_and(|encoder| encoder.software);
+                    *encoder = Some(Encoder::new_mode(width, height, software, avc444)?);
                 }
-                Encoder::encode_frame(&mut encoder, &image, force_idr, |w, h| {
-                    let mut encoder = Encoder::nvenc(w, h)?;
-                    encoder.set_bitrate(bitrate)?;
-                    Ok(encoder)
-                })
+                let encoder = encoder.as_mut().unwrap();
+                let recreated = encoder.set_rate(bitrate, fps)?;
+                let mut encoded = if let Some(gpu) = gpu {
+                    encoder.encode_gpu(&gpu, force_idr || changed || recreated)
+                } else {
+                    encoder.encode_views(&image, force_idr || changed || recreated)
+                }?;
+                encoded.captured_at = captured_at;
+                encoded.received_at = received_at;
+                Ok(encoded)
             });
             self.pending = Some((task, width, height, generation));
         }
@@ -657,9 +1304,81 @@ mod tests {
                 known_generation: 0,
                 suppressed: state.suppressed.clone(),
                 rate: state.rate.clone(),
+                desktop: None,
+                desktop_provider: None,
+                pending_gpu: false,
+                gpu_failed: false,
+                last_gpu: None,
+                refinement: None,
+                next_frame: Instant::now(),
+                diagnostics: crate::performance::Telemetry::from_env(),
+                credit_wait_started: None,
+                fallback_previous: None,
+                fallback_partial: Default::default(),
+                fallback_resume: false,
+                refresh: state.refresh.clone(),
+                known_refresh: state.refresh.load(Ordering::SeqCst),
+                pending_refresh: 0,
+                encode_gate: state.encode_gate.clone(),
             },
             receiver,
         )
+    }
+    #[test]
+    fn authenticated_capture_cadence_survives_readback_jitter() {
+        let (mut stream, _) = updates(vec![]);
+        let (desktop, _) = crate::wayland::lifecycle_tests::fake_desktop(DesktopSize {
+            width: 64,
+            height: 64,
+        });
+        stream.desktop = Some(desktop);
+        stream.force_idr = false;
+        let start = Instant::now();
+        let period = Duration::from_millis(50);
+        stream.next_frame = start;
+        let mut delivered = 0;
+        // Capture starts at exactly 20 FPS. Alternating readback latency is
+        // legal: Ready notifications need not be spaced exactly 50 ms apart.
+        for frame in 0..200 {
+            let readback = Duration::from_millis(2 + frame % 2);
+            let ready = start + period * frame as u32 + readback;
+            if stream.cadence_due(ready) {
+                delivered += 1;
+                stream.next_frame = ready + period;
+            }
+        }
+        assert_eq!(
+            delivered, 200,
+            "a second receipt-time clock must not halve source-paced capture"
+        );
+    }
+    #[test]
+    fn unauthenticated_desktop_provider_keeps_send_cadence() {
+        let (mut stream, _) = updates(vec![]);
+        stream.force_idr = false;
+        let authenticated = Arc::new(Mutex::new(None));
+        let current = authenticated.clone();
+        stream.desktop_provider = Some(Arc::new(move || current.lock().unwrap().clone()));
+        let now = Instant::now();
+        stream.next_frame = now + Duration::from_millis(50);
+        stream.attach_authenticated_desktop();
+        assert!(stream.desktop.is_none());
+        assert!(!stream.cadence_due(now));
+        assert!(stream.cadence_due(stream.next_frame));
+        stream.force_idr = true;
+        assert!(
+            stream.cadence_due(now),
+            "explicit refresh remains immediate"
+        );
+        stream.force_idr = false;
+        let (desktop, _) = crate::wayland::lifecycle_tests::fake_desktop(DesktopSize {
+            width: 64,
+            height: 64,
+        });
+        *authenticated.lock().unwrap() = Some(desktop);
+        stream.attach_authenticated_desktop();
+        assert!(stream.desktop.is_some());
+        assert!(stream.cadence_due(now));
     }
     #[tokio::test(flavor = "current_thread")]
     async fn failed_or_panicked_encoding_task_ends_without_repolling() {
@@ -724,6 +1443,219 @@ mod tests {
         assert!(stream.encoder.lock().unwrap().is_none());
         assert!(stream.pending.is_none());
         assert!(events.try_recv().is_err());
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn nvenc_bitmap_fallback_suppresses_idle_and_preserves_sparse_changes_and_refresh() {
+        let DisplayUpdate::Bitmap(initial) = sized_image(256, 256) else {
+            unreachable!()
+        };
+        let mut changed = initial.clone();
+        let mut pixels = changed.data.to_vec();
+        pixels[4 * (130 * 256 + 130)] = 128;
+        changed.data = pixels.into();
+        let (mut stream, mut events) = updates(vec![
+            DisplayUpdate::Bitmap(initial.clone()),
+            DisplayUpdate::Bitmap(initial.clone()),
+            DisplayUpdate::Bitmap(changed.clone()),
+            DisplayUpdate::Bitmap(changed.clone()),
+        ]);
+        advertise(&stream.handle, false);
+        let Some(DisplayUpdate::Bitmap(first)) = stream.next_update().await.unwrap() else {
+            panic!("initial full bitmap")
+        };
+        assert_eq!(first.width.get(), 256);
+        let Some(DisplayUpdate::Bitmap(damage)) = stream.next_update().await.unwrap() else {
+            panic!("changed partial bitmap")
+        };
+        assert_eq!(
+            (damage.x, damage.y, damage.width.get(), damage.height.get()),
+            (128, 128, 64, 64)
+        );
+        assert!(
+            stream.next_update().await.unwrap().is_none(),
+            "duplicate heartbeats must produce no additional bitmaps"
+        );
+        assert!(stream.encoder.lock().unwrap().is_none());
+        assert!(events.try_recv().is_err());
+        stream.refresh.fetch_add(1, Ordering::SeqCst);
+        stream.inner = Box::new(Sequence(vec![DisplayUpdate::Bitmap(changed)].into()));
+        let Some(DisplayUpdate::Bitmap(full)) = stream.next_update().await.unwrap() else {
+            panic!("explicit refresh must replay full bitmap")
+        };
+        assert_eq!(
+            (full.x, full.y, full.width.get(), full.height.get()),
+            (0, 0, 256, 256)
+        );
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn explicit_refresh_discards_pending_reference_and_sends_idr_without_surface_recreation()
+    {
+        use ironrdp_egfx::pdu::Avc420BitmapStream;
+        let (mut stream, mut events) = updates(vec![]);
+        advertise(&stream.handle, true);
+        stream.known_generation = stream.generation.load(Ordering::SeqCst);
+        let DisplayUpdate::Bitmap(image) = image() else {
+            unreachable!()
+        };
+        let fps = stream.rate.lock().unwrap().frame_rate();
+        let mut encoder = Encoder::new_rate(64, 64, true, false, fps, 12_000_000).unwrap();
+        let first = encoder.encode_views(&image, true).unwrap();
+        let pointer = encoder.ptr;
+        stream.submit_frame(&first, 64, 64).unwrap();
+        let surface = stream.surface;
+        events.try_recv().unwrap();
+        *stream.encoder.lock().unwrap() = Some(encoder);
+        stream.last_image = Some(image.clone());
+        let (release, wait) = tokio::sync::oneshot::channel();
+        stream.pending = Some((
+            tokio::spawn(async move {
+                wait.await.unwrap();
+                Ok(vec![0, 0, 0, 1, 0x41].into())
+            }),
+            64,
+            64,
+            stream.known_generation,
+        ));
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        stream.inner = Box::new(Channel(receiver));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(10), stream.next_update())
+                .await
+                .is_err()
+        );
+        stream.refresh.fetch_add(1, Ordering::SeqCst);
+        release.send(()).unwrap();
+        sender.send(DisplayUpdate::Bitmap(image)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.next_update())
+                .await
+                .is_err()
+        );
+        assert_eq!(stream.surface, surface);
+        assert_eq!(
+            stream.encoder.lock().unwrap().as_ref().unwrap().ptr,
+            pointer
+        );
+        let pdus = graphics_pdus(events.try_recv().unwrap());
+        assert!(!pdus.iter().any(|pdu| matches!(
+            pdu,
+            GfxPdu::CreateSurface(_) | GfxPdu::DeleteSurface(_) | GfxPdu::ResetGraphics(_)
+        )));
+        let stream = pdus
+            .iter()
+            .find_map(|pdu| {
+                if let GfxPdu::WireToSurface1(wire) = pdu {
+                    Some(ironrdp_core::decode::<Avc420BitmapStream<'_>>(&wire.bitmap_data).unwrap())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(
+            stream
+                .data
+                .windows(4)
+                .any(|nal| nal[..3] == [0, 0, 1] && nal[3] & 0x1f == 5),
+            "refresh must deliver an IDR instead of the skipped pending P frame"
+        );
+        assert!(events.try_recv().is_err());
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn dropping_an_old_update_stream_cannot_start_concurrent_native_work() {
+        let (mut old, _) = updates(vec![]);
+        let gate = old.encode_gate.clone();
+        let permit = gate.0.clone().acquire_owned().await.unwrap();
+        let (release, wait) = tokio::sync::oneshot::channel();
+        old.pending = Some((
+            tokio::spawn(async move {
+                let _permit = permit;
+                wait.await.unwrap();
+                Err(anyhow::anyhow!("old native call completed"))
+            }),
+            64,
+            64,
+            0,
+        ));
+        drop(old);
+        let (mut stream, mut events) = updates(vec![]);
+        advertise(&stream.handle, true);
+        stream.known_generation = stream.generation.load(Ordering::SeqCst);
+        stream.encode_gate = gate.clone();
+        let fps = stream.rate.lock().unwrap().frame_rate();
+        *stream.encoder.lock().unwrap() =
+            Some(Encoder::new_rate(64, 64, true, false, fps, 12_000_000).unwrap());
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        stream.inner = Box::new(Channel(receiver));
+        sender.send(image()).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), stream.next_update())
+                .await
+                .is_err()
+        );
+        assert!(
+            stream.pending.is_none(),
+            "replacement must wait asynchronously before submitting native work"
+        );
+        assert!(events.try_recv().is_err());
+        assert_eq!(gate.0.available_permits(), 0);
+        release.send(()).unwrap();
+        tokio::task::yield_now().await;
+        sender.send(image()).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.next_update())
+                .await
+                .is_err()
+        );
+        assert!(events.try_recv().is_ok());
+        assert_eq!(gate.0.available_permits(), 1);
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn returning_from_gpu_capture_recreates_shm_encoder_and_sends_an_idr() {
+        use ironrdp_egfx::pdu::Avc420BitmapStream;
+        let (mut stream, mut events) = updates(vec![]);
+        advertise(&stream.handle, true);
+        stream.known_generation = stream.generation.load(Ordering::SeqCst);
+        let fps = stream.rate.lock().unwrap().frame_rate();
+        let mut encoder = Encoder::new_rate(64, 64, true, false, fps, 12_000_000).unwrap();
+        let DisplayUpdate::Bitmap(frame) = image() else {
+            unreachable!()
+        };
+        let first = encoder.encode_views(&frame, true).unwrap();
+        stream.submit_frame(&first, 64, 64).unwrap();
+        events.try_recv().unwrap();
+        // The opt-in C fixture validates that a real CUDA context rejects CPU
+        // input. Here exercise the wrapper's transition with a software context
+        // so the regression remains runnable without NVIDIA hardware.
+        encoder.gpu_active = true;
+        *stream.encoder.lock().unwrap() = Some(encoder);
+        let (sender, receiver) = tokio::sync::mpsc::channel(2);
+        stream.inner = Box::new(Channel(receiver));
+        let mut changed = frame;
+        changed.data = vec![128; changed.data.len()].into();
+        sender.send(DisplayUpdate::Bitmap(changed)).await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.next_update())
+                .await
+                .is_err()
+        );
+        assert!(!stream.encoder.lock().unwrap().as_ref().unwrap().gpu_active);
+        let pdus = graphics_pdus(events.try_recv().unwrap());
+        let stream = pdus
+            .iter()
+            .find_map(|pdu| {
+                if let GfxPdu::WireToSurface1(wire) = pdu {
+                    Some(ironrdp_core::decode::<Avc420BitmapStream<'_>>(&wire.bitmap_data).unwrap())
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        assert!(
+            stream
+                .data
+                .windows(4)
+                .any(|nal| nal[..3] == [0, 0, 1] && nal[3] & 0x1f == 5)
+        );
     }
     #[test]
     fn unchanged_desktop_skips_encoding_but_recovery_and_resize_require_a_frame() {
@@ -832,6 +1764,63 @@ mod tests {
         }
     }
     #[test]
+    fn replacing_an_update_stream_discards_old_ack_samples_and_retains_audio_pressure() {
+        use ironrdp_egfx::pdu::{FrameAcknowledgePdu, QueueDepth};
+        let (mut stream, mut events) = updates(vec![]);
+        advertise(&stream.handle, true);
+        let now = Instant::now();
+        *stream.rate.lock().unwrap() =
+            crate::performance::AdaptiveBitrate::new(12_000_000, now - Duration::from_secs(10));
+        stream
+            .rate
+            .lock()
+            .unwrap()
+            .audio_congested(now - Duration::from_secs(1));
+        stream.submit(&[0, 0, 0, 1, 0x65], 64, 64).unwrap();
+        let old_id = graphics_pdus(events.try_recv().unwrap())
+            .into_iter()
+            .find_map(|pdu| {
+                if let GfxPdu::StartFrame(frame) = pdu {
+                    Some(frame.frame_id)
+                } else {
+                    None
+                }
+            })
+            .unwrap();
+        stream
+            .rate
+            .lock()
+            .unwrap()
+            .sent(old_id, now - Duration::from_secs(5));
+        stream.surface = None;
+        stream.submit(&[0, 0, 0, 1, 0x65], 64, 64).unwrap();
+        let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+            frame_id: old_id,
+            queue_depth: QueueDepth::AvailableBytes(1_000_000),
+            total_frames_decoded: 1,
+        });
+        stream
+            .handle
+            .lock()
+            .unwrap()
+            .process(7, &ironrdp_core::encode_vec(&ack).unwrap())
+            .unwrap();
+        let mut rate = stream.rate.lock().unwrap();
+        rate.check_stall(now + Duration::from_millis(200));
+        assert_eq!(
+            rate.current(),
+            9_000_000,
+            "old-surface ACK and age cannot penalize the replacement"
+        );
+        let mut inherited = crate::performance::AdaptiveBitrate::new(12_000_000, now);
+        inherited.inherit_audio_congestion(&rate, now);
+        assert_eq!(
+            inherited.current(),
+            9_000_000,
+            "graphics reset must retain recent audio pressure"
+        );
+    }
+    #[test]
     fn dimension_changes_recreate_encoder_and_odd_sizes_are_padded() {
         let mut encoder = None;
         for (width, height) in [(64, 64), (63, 61), (80, 48), (1, 1), (1, 17), (17, 1)] {
@@ -882,7 +1871,7 @@ mod tests {
         assert!(events.try_recv().is_ok());
         let pending_generation = stream.known_generation;
         stream.pending = Some((
-            tokio::spawn(async { Ok(vec![0, 0, 0, 1, 0x41]) }),
+            tokio::spawn(async { Ok(vec![0, 0, 0, 1, 0x41].into()) }),
             64,
             64,
             pending_generation,
@@ -929,7 +1918,7 @@ mod tests {
         stream.known_generation = stream.generation.load(Ordering::SeqCst);
         stream.suppressed.store(true, Ordering::Relaxed);
         stream.pending = Some((
-            tokio::spawn(async { Ok(vec![0, 0, 0, 1, 0x65]) }),
+            tokio::spawn(async { Ok(vec![0, 0, 0, 1, 0x65].into()) }),
             64,
             64,
             stream.known_generation,
@@ -949,7 +1938,7 @@ mod tests {
         assert!(events.try_recv().is_ok());
         assert!(!stream.force_idr);
         stream.pending = Some((
-            tokio::spawn(async { Ok(vec![0, 0, 0, 1, 0x41]) }),
+            tokio::spawn(async { Ok(vec![0, 0, 0, 1, 0x41].into()) }),
             64,
             64,
             stream.known_generation,
@@ -970,6 +1959,148 @@ mod tests {
         for (w, h) in [(0, 2), (2, 0), (2, 4097), (4098, 2)] {
             assert!(Encoder::new(w, h, true).is_err());
         }
+    }
+    #[test]
+    fn avc444_sends_both_views_in_order_with_logical_region_masks() {
+        use ironrdp_egfx::pdu::{Avc444BitmapStream, Codec1Type, Encoding};
+        let (mut stream, mut events) = updates(vec![]);
+        advertise(&stream.handle, true);
+        assert!(stream.handle.lock().unwrap().supports_avc444());
+        let mut encoder = Encoder::new_mode(63, 61, true, true).unwrap();
+        let DisplayUpdate::Bitmap(image) = sized_image(63, 61) else {
+            unreachable!()
+        };
+        let encoded = encoder.encode_views(&image, true).unwrap();
+        assert!(encoded.auxiliary.is_some());
+        stream.submit_frame(&encoded, 63, 61).unwrap();
+        let wires: Vec<_> = graphics_pdus(events.try_recv().unwrap())
+            .into_iter()
+            .filter_map(|pdu| {
+                if let GfxPdu::WireToSurface1(wire) = pdu {
+                    Some(wire)
+                } else {
+                    None
+                }
+            })
+            .collect();
+        assert_eq!(wires.len(), 1);
+        assert_eq!(wires[0].codec_id, Codec1Type::Avc444);
+        let views: Avc444BitmapStream<'_> = ironrdp_core::decode(&wires[0].bitmap_data).unwrap();
+        assert_eq!(views.encoding, Encoding::LUMA_AND_CHROMA);
+        assert_eq!(views.stream1.data, &encoded.main);
+        let second = views.stream2.unwrap();
+        assert_eq!(second.data, encoded.auxiliary.as_ref().unwrap());
+        for view in [views.stream1, second] {
+            assert_eq!(view.rectangles.len(), 1);
+            let region = &view.rectangles[0];
+            assert_eq!(
+                (region.left, region.top, region.right, region.bottom),
+                (0, 0, 63, 61)
+            );
+        }
+    }
+    #[test]
+    fn cadence_changes_recreate_encoder_with_an_idr_and_matching_frame_budget() {
+        let mut encoder = Encoder::new_rate(64, 64, true, false, 60, 12_000_000).unwrap();
+        let DisplayUpdate::Bitmap(image) = image() else {
+            unreachable!()
+        };
+        encoder.encode_views(&image, true).unwrap();
+        assert!(encoder.set_rate(3_000_000, 15).unwrap());
+        assert_eq!((encoder.fps, encoder.bitrate), (15, 3_000_000));
+        let encoded = encoder.encode_views(&image, true).unwrap();
+        assert!(
+            encoded
+                .main
+                .windows(4)
+                .any(|nal| nal[..3] == [0, 0, 1] && nal[3] & 0x1f == 5)
+        );
+        assert!(
+            !encoder.set_rate(2_000_000, 15).unwrap(),
+            "bitrate-only changes retain reference context"
+        );
+    }
+    struct Channel(tokio::sync::mpsc::Receiver<DisplayUpdate>);
+    #[async_trait::async_trait]
+    impl RdpServerDisplayUpdates for Channel {
+        async fn next_update(&mut self) -> ServerResult<Option<DisplayUpdate>> {
+            Ok(self.0.recv().await)
+        }
+    }
+    #[tokio::test(flavor = "current_thread")]
+    async fn a_settled_image_refines_once_without_recreating_encoder_or_repeating_idrs() {
+        use ironrdp_egfx::pdu::{FrameAcknowledgePdu, QueueDepth};
+        let (mut stream, mut events) = updates(vec![]);
+        advertise(&stream.handle, true);
+        stream.known_generation = stream.generation.load(Ordering::SeqCst);
+        let DisplayUpdate::Bitmap(image) = image() else {
+            unreachable!()
+        };
+        let fps = stream.rate.lock().unwrap().frame_rate();
+        let mut encoder = Encoder::new_rate(64, 64, true, false, fps, 12_000_000).unwrap();
+        let first = encoder.encode_views(&image, true).unwrap();
+        let ptr = encoder.ptr;
+        *stream.encoder.lock().unwrap() = Some(encoder);
+        stream.submit_frame(&first, 64, 64).unwrap();
+        let ack = |stream: &mut VideoUpdates, event| {
+            let id = graphics_pdus(event)
+                .into_iter()
+                .find_map(|pdu| {
+                    if let GfxPdu::StartFrame(frame) = pdu {
+                        Some(frame.frame_id)
+                    } else {
+                        None
+                    }
+                })
+                .unwrap();
+            let ack = GfxPdu::FrameAcknowledge(FrameAcknowledgePdu {
+                frame_id: id,
+                queue_depth: QueueDepth::AvailableBytes(0),
+                total_frames_decoded: id + 1,
+            });
+            stream
+                .handle
+                .lock()
+                .unwrap()
+                .process(7, &ironrdp_core::encode_vec(&ack).unwrap())
+                .unwrap();
+        };
+        ack(&mut stream, events.try_recv().unwrap());
+        stream.last_image = Some(image.clone());
+        stream.refinement = Some((
+            Instant::now() + Duration::from_millis(10),
+            Instant::now() + Duration::from_secs(2),
+        ));
+        let (sender, receiver) = tokio::sync::mpsc::channel(8);
+        stream.inner = Box::new(Channel(receiver));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.next_update())
+                .await
+                .is_err()
+        );
+        let refined = events
+            .try_recv()
+            .expect("exactly one refinement reaches the client");
+        assert!(events.try_recv().is_err());
+        assert!(stream.refinement.is_none());
+        assert_eq!(stream.encoder.lock().unwrap().as_ref().unwrap().ptr, ptr);
+        ack(&mut stream, refined);
+        for _ in 0..8 {
+            sender
+                .send(DisplayUpdate::Bitmap(image.clone()))
+                .await
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), stream.next_update())
+                .await
+                .is_err()
+        );
+        assert!(
+            events.try_recv().is_err(),
+            "ordinary idle heartbeats cannot repeatedly refine"
+        );
+        assert_eq!(stream.encoder.lock().unwrap().as_ref().unwrap().ptr, ptr);
     }
     #[test]
     fn nonaligned_desktop_encodes_edge_padding_without_stretching() {
@@ -1183,6 +2314,7 @@ mod tests {
             match gfx {
                 GfxPdu::ResetGraphics(pdu) => {
                     assert_eq!((pdu.width, pdu.height), (62, 62));
+                    assert_eq!(pdu.monitors, primary_monitor(62, 62));
                     checked += 1;
                 }
                 GfxPdu::CreateSurface(pdu) => {
