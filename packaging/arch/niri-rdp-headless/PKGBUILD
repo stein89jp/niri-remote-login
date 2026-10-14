@@ -1,7 +1,7 @@
 # Standalone patched binary: does not replace the installed /usr/bin/niri.
 pkgname=niri-rdp-headless
 pkgver=26.04.remote1
-pkgrel=8
+pkgrel=9
 pkgdesc='Pinned PR3953 Niri headless compositor for isolated remote-login sessions'
 arch=('x86_64')
 license=('GPL-3.0-or-later')

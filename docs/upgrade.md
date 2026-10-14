@@ -43,6 +43,13 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+Version `1.5-1` publishes the performance, picture-quality, clipboard and smooth
+cursor improvements together. It retains the tested runtime source from
+`1.1.0-2`; the user confirmed that the mstsc cursor fix works after reinstall.
+Existing configurations and the accepted PCM audio controls remain applicable.
+When upgrading from an older release, start a fresh remote desktop so the
+frontend and headless compositor versions match.
+
 Version `1.1.0-2` fixes jumping Windows 10 mstsc cursors by stopping the separate
 cursor path from echoing ordinary mouse movement as client position updates.
 It also prevents shape/fallback changes from replaying stale positions, while

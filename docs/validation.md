@@ -36,7 +36,9 @@ the patch hash in `compositor/pins.json` is updated.
 The combined package release is `1.1.0-2`. Both frontend and compositor must be
 updated, and the retained compositor must exit before the corrected one starts.
 Installing the package alone does not replace an already-running compositor.
-Actual Windows 10 mstsc smoothness after deployment remains user acceptance.
+After the full reinstall, the user confirmed that the Windows 10 mstsc cursor
+fix works well. This records immediate smoothness acceptance; the detailed
+animation/grab/warp and long-running acceptance matrix remains separate.
 
 `artifacts/cursor-fix/package-build-checked.log` records successful package
 checks: the bridge/wire/controller suite above, nine compositor lifecycle/
@@ -49,8 +51,13 @@ release compositor. `package-gpu.json` and `package-gpu-evidence/` record the
 extracted package passing real NVIDIA EGL/DMA-BUF capture and AVC444 FreeRDP
 decode/input, live resize, reconnect, held-input release and compositor-crash
 cleanup. The package and its SHA-256 receipt are retained under
-`artifacts/cursor-fix/`. The user will deploy through the documented full
-uninstall/reinstall; the active host services and remote desktop were preserved.
+`artifacts/cursor-fix/`. The implementation session preserved the active host
+services and remote desktop; the user performed the documented full reinstall.
+
+GitHub release `v1.5` republishes this accepted runtime as package `1.5-1`, with
+matching source, dependency-source index, license notices and SHA-256 checksums.
+Release evidence is kept under `artifacts/releases/1.5-1/`. Version and release
+documentation changes preserve the runtime sources and accepted audio controls.
 
 ## Performance and desktop upgrades, 2026-10-14
 

@@ -16,10 +16,10 @@ From the directory containing the downloaded package, run:
 
 ```sh
 sudo pacman -Syu
-sudo pacman -U ./niri-remote-login-1.0.2-1-x86_64.pkg.tar.zst
+sudo pacman -U ./niri-remote-login-1.5-1-x86_64.pkg.tar.zst
 ```
 
-The example uses version `1.0.2-1`; replace the filename if you downloaded a
+The example uses version `1.5-1`; replace the filename if you downloaded a
 different release. Pacman installs the package and its required runtime
 dependencies. Continue with the account authorization and service setup below.
 
@@ -49,7 +49,8 @@ Use your Linux account name and password. The frontend listens directly on the
 network; no SSH tunnel is required. If the client omits password credentials,
 a login screen inside the RDP connection authenticates through PAM before
 starting the desktop. Windows policies requiring NLA are currently incompatible.
-Actual Windows interoperability still needs validation.
+The user has confirmed the Windows 10 mstsc desktop and smooth cursor movement;
+the detailed client acceptance checks are recorded separately.
 
 For a new remote account, replace the `usermod` command with
 `sudo niri-rdp-setup --create-user niri-remote`. **If using your current account,
@@ -75,6 +76,12 @@ optional host NVIDIA NVENC H.264 encoding is available, with a 60 fps capture
 budget, reusable capture buffers and unchanged-frame suppression. The compositor
 prefers hardware EGL rendering, including NVIDIA, with software fallback.
 
+Version 1.5 adds bidirectional Unicode text clipboard, client-local cursor motion,
+damage-aware capture and explicit remote DPI scaling. Optional GPU-resident
+capture/conversion/encoding and AVC444 improve performance and colored-text
+quality; see [performance controls](docs/performance.md). The accepted 48 kHz
+stereo PCM audio configuration is preserved.
+
 The remote desktop uses your existing Niri configuration, including its bindings,
 appearance and startup applications. It starts DankMaterialShell privately when
 installed, otherwise a Niri Waybar, if your startup commands have not started a
@@ -92,9 +99,10 @@ Existing Fcitx5, IBus, and other configured input methods keep their usual setup
 
 This remains **experimental**. Disposable Niri/RDP integration has demonstrated
 changing application frames, keyboard/pointer input, authentication rejection,
-reconnect, and cleanup. Real installed PAM/logind login, cold boot, Windows
-`mstsc`, and monitor-off acceptance remain pending. Installing the package does
-not establish those results.
+reconnect, and cleanup. The user confirmed improved picture quality, reduced CPU
+usage with GPU capture and smooth Windows 10 mstsc cursor movement after
+reinstalling. Detailed PAM/logind policy, cold boot, monitor-off and long-running
+playback acceptance remain in the [actual-machine checklist](docs/acceptance.md).
 
 - [Installation and optional NVIDIA encoding](docs/install.md)
 - [Actual-machine acceptance](docs/acceptance.md)

@@ -38,18 +38,18 @@ External drivers and the Windows RDP client remain subject to their own terms.
 
 ## Source for the published installer
 
-Release `v1.0.2` carries the `1.0.2-1` installer, built from the source tagged
-`v1.0.2`. It includes the README's author section and the MIT copyright notice
-for Rikard Stein. This release updates attribution and packaged documentation;
-runtime source is unchanged from the `1.0.0-1` installer.
+Release `v1.5` carries the `1.5-1` installer, built from the source tagged
+`v1.5`. It includes the performance and picture-quality improvements,
+bidirectional text clipboard and the confirmed mstsc cursor fix, along with the
+README's author section and MIT copyright notice for Rikard Stein.
 
-Download these files from the [release](https://github.com/stein89jp/niri-remote-login/releases/tag/v1.0.2):
+Download these files from the [release](https://github.com/stein89jp/niri-remote-login/releases/tag/v1.5):
 
-- [Matching source-build bundle](https://github.com/stein89jp/niri-remote-login/releases/download/v1.0.2/niri-remote-login-1.0.2-1.src.tar.gz).
-- [Dependency-source index](https://github.com/stein89jp/niri-remote-login/releases/download/v1.0.2/DEPENDENCY-SOURCES.json).
-- [License texts and third-party notices](https://github.com/stein89jp/niri-remote-login/releases/download/v1.0.2/THIRD-PARTY-NOTICES.txt).
-- [README with author attribution](https://github.com/stein89jp/niri-remote-login/releases/download/v1.0.2/README.md) and [MIT license](https://github.com/stein89jp/niri-remote-login/releases/download/v1.0.2/LICENSE), also included in the installer and source bundle.
-- [SHA256SUMS](https://github.com/stein89jp/niri-remote-login/releases/download/v1.0.2/SHA256SUMS), covering the installer and these source/notice assets.
+- [Matching source-build bundle](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5/niri-remote-login-1.5-1.src.tar.gz).
+- [Dependency-source index](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5/DEPENDENCY-SOURCES.json).
+- [License texts and third-party notices](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5/THIRD-PARTY-NOTICES.txt).
+- [README with author attribution](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5/README.md) and [MIT license](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5/LICENSE), also included in the installer and source bundle.
+- [SHA256SUMS](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5/SHA256SUMS), covering the installer and these source/notice assets.
 
 The source-build bundle is the preserved `makepkg --allsource` output. It contains
 the pinned Niri source archive, maintained patch, original integration source,
@@ -60,7 +60,7 @@ source index records that identity and the source archive's checksum.
 Extract the bundle and build as an unprivileged user on a prepared Arch builder:
 
 ```sh
-tar -xzf niri-remote-login-1.0.2-1.src.tar.gz
+tar -xzf niri-remote-login-1.5-1.src.tar.gz
 cd niri-remote-login
 makepkg
 ```

@@ -507,7 +507,7 @@ sudo systemctl restart niri-rdp-frontend.service
 
 ## Performance and desktop upgrades
 
-The combined 1.1.0 package includes damage-aware capture, input/resize coalescing,
+The combined 1.5 package includes damage-aware capture, input/resize coalescing,
 cached login rendering, stale-ACK recovery, separate negotiated cursor updates,
 private bidirectional Unicode text clipboard and deliberate DPI scaling. Clipboard
 payloads are text-only and limited to 1 MiB, with finite transfers. Enable
