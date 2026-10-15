@@ -16,7 +16,8 @@ Run from the repository root unless noted:
 - `cargo build --manifest-path bridge/Cargo.toml --release --locked`: build the frontend; requires Rust >=1.94, libxkbcommon, FFmpeg libraries, and pkg-config.
 - `make -C broker`: build the C broker against PAM and systemd.
 - `python3 -m unittest discover -s tests -v`: run Python regressions.
-- `make check`: run Python, Rust, PoC startup, and broker checks. Rust checks use locked dependencies offline; populate the Cargo cache first.
+- `make check`: run `make lint` (bridge `cargo fmt --check` and Clippy `-D warnings`), then the Python, broker, and bridge Rust checks. Rust checks use locked dependencies offline; run `make fetch` once, or rely on the makepkg cache in `packaging/arch/niri-rdp/src/cargo-home`.
+- `make check-poc`: run the historical `poc/` transport prototype tests and startup checks separately; `make check` no longer includes them.
 - `lab/run-isolated.sh python3 scripts/headless-integration.py`: exercise real compositor capture/input and RDP in private namespaces after preparing lab artifacts; see `compositor/README.md`.
 - `makepkg` from `packaging/arch/niri-rdp/`: build the combined Arch package as an unprivileged user.
 
