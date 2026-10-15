@@ -21,10 +21,10 @@ jobs:
         run: |
           pacman -Syu --noconfirm --needed base-devel git rust pkgconf cmake \
             ffmpeg libxkbcommon wayland mesa libglvnd pam systemd-libs \
-            python openssl
+            python python-gobject openssl
           useradd --create-home builder
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Hand the checkout to an unprivileged user
         run: chown -R builder:builder "$GITHUB_WORKSPACE"
