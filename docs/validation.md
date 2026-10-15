@@ -1,5 +1,10 @@
 # Validation record
 
+Release `1.5.5-1` (`v1.5.5`) packages the work recorded in the 2026-10-15
+entries below. Their results are automated, namespace, lab and package checks;
+the installed-host Windows 10 mstsc checks for this release are pending in
+[acceptance](acceptance.md), and no 1.5.5 listening result is recorded yet.
+
 ## Microphone redirection (MS-RDPEAI), 2026-10-15
 
 `PLAN3` added mstsc **Record from this computer**: the Windows microphone

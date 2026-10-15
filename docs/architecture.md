@@ -33,7 +33,7 @@ are absent; this does not require turning off or changing the local desktop.
 | Phase | Work | Acceptance gate | Current evidence |
 | --- | --- | --- | --- |
 | 0: isolated foundations | Synthetic RDP display using a reusable server library; private current-UID worker environment and cleanup | Compile and run automated frame/input/policy tests; no public bind or host configuration changes | See [validation](validation.md) for completed checks and remaining interop tests |
-| 1: Niri headless backend | Evaluate existing virtual-output PRs in an isolated checkout/VM; add explicit headless startup, default output, render clock and bounded resize | Niri starts without DISPLAY/WAYLAND_DISPLAY, VT, DRM master or physical outputs; capture a changing test app at a known resolution | Pinned patched PR3953 built; native client-selected initial size and repeated portrait/landscape resizing passed with SHM/input in disposable Arch namespace |
+| 1: Niri headless backend | Evaluate existing virtual-output PRs in an isolated checkout/VM; add explicit headless startup, default output, render clock and bounded resize | Niri starts without DISPLAY/WAYLAND_DISPLAY, VT, DRM master or physical outputs; capture a changing test app at a known resolution | PR3953 headless backend rebased onto upstream Niri `main` (`fc9e8c42`) as a 12-patch series and built; native client-selected initial size and repeated portrait/landscape resizing passed with SHM/input in disposable Arch namespace |
 | 2: desktop bridge | SHM capture into library bitmaps; virtual keyboard/pointer input with correct keymap, scancode, coordinates and disconnect release | `mstsc.exe` renders an app and its input changes that app; repeat with physical outputs absent and later powered off | Real FreeRDP/Niri application roundtrip passes; mstsc and physical-monitor gates pending |
 | 3: real remote login | Separate broker, dedicated test PAM policy, remote seatless logind session, account limits and rollback | Fresh VM boot, no local login: valid credentials create a remote Wayland Niri session; invalid credentials and launch/crash failures leave no resources | Native PAM/logind broker implemented/tested with fake PAM; actual system session and fresh-boot acceptance pending |
 | 4: desktop completion | Reconnect, resize, multiple distinct UIDs, session service integration, optional audio/clipboard, packaging | Windows compatibility matrix, power-off/unplug regression, resource limits and session teardown; explicit same-UID policy | Pending |
@@ -78,7 +78,8 @@ driven by a failing interoperability test, rather than recreating protocol code.
 
 Use one dedicated account for the first real desktop test and initially reject
 accounts with another graphical session. Broker-mode disconnect preserves the
-desktop for 45 seconds after broker-observed detachment; expiry fully logs out
+desktop for a grace window (`grace_seconds` in `/etc/niri-rdp/broker.conf`,
+default 45 seconds) after broker-observed detachment; expiry fully logs out
 and cleans up the session. Fresh PAM authentication/account checks and group authorization permit
 resume of that same desktop, excluding its own logind session from the check.
 Logout, compositor exit or broker shutdown ends it. Installed-host resume

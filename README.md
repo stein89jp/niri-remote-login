@@ -16,10 +16,10 @@ From the directory containing the downloaded package, run:
 
 ```sh
 sudo pacman -Syu
-sudo pacman -U ./niri-remote-login-1.5-1-x86_64.pkg.tar.zst
+sudo pacman -U ./niri-remote-login-1.5.5-1-x86_64.pkg.tar.zst
 ```
 
-The example uses version `1.5-1`; replace the filename if you downloaded a
+The example uses version `1.5.5-1`; replace the filename if you downloaded a
 different release. Pacman installs the package and its required runtime
 dependencies. Continue with the account authorization and service setup below.
 
@@ -81,12 +81,17 @@ optional host NVIDIA NVENC H.264 encoding is available, with a 60 fps capture
 budget, reusable capture buffers and unchanged-frame suppression. The compositor
 prefers hardware EGL rendering, including NVIDIA, with software fallback.
 
-Version 1.5 adds bidirectional Unicode text clipboard, client-local cursor motion,
-damage-aware capture and explicit remote DPI scaling. Optional GPU-resident
-capture/conversion/encoding and AVC444 improve performance and colored-text
-quality; see [performance controls](docs/performance.md). The accepted 48 kHz
-stereo PCM audio configuration is preserved; private audio-helper recovery and
-silent-loss detection improve its resilience.
+Version 1.5.5 rebases the compositor onto current upstream Niri and adds
+microphone redirection, image and HTML clipboard, login-screen time limits with
+per-address backoff, a failed-login lockout private to niri-rdp, automatic TLS
+certificate renewal, a hardened frontend service, a login audit journal and a
+per-connection summary line. NVENC sends fewer keyframes, steps its bitrate
+through fixed levels and uses GPU capture by default; capture copies less and
+repeated cursor shapes are cached. Earlier releases added client-local cursor
+motion, damage-aware capture, explicit remote DPI scaling and optional AVC444;
+see [performance controls](docs/performance.md). The accepted 48 kHz stereo PCM
+audio configuration is unchanged. Upgrading from 1.5 needs a fresh remote
+desktop and may need a `.pacnew` merge; see [upgrade](docs/upgrade.md#rebuild-the-installed-combined-package).
 
 The clipboard carries Unicode text, HTML and images in both directions. Files are
 not supported: copying files in Windows leaves the Linux clipboard unchanged.

@@ -10,9 +10,9 @@ arch=('x86_64')
 # Bridge source is MIT; the combined binary links Arch's GPL-licensed FFmpeg.
 license=('MIT' 'GPL-3.0-only')
 options=('!debug' '!lto')
-depends=('niri-rdp-headless>=26.04.remote2-1' 'pam' 'systemd' 'systemd-libs' 'dbus' 'wayland' 'libxkbcommon' 'xkeyboard-config' 'foot' 'fuzzel' 'waybar' 'ttf-dejavu' 'ffmpeg' 'libglvnd' 'mesa' 'openssl' 'python' 'python-gobject' 'glib2' 'pipewire' 'pipewire-pulse' 'wireplumber' 'libpulse')
+depends=('niri-rdp-headless>=26.04.remote2-1' 'pam' 'systemd' 'systemd-libs' 'dbus' 'wayland' 'libxkbcommon' 'xkeyboard-config' 'foot' 'fuzzel' 'waybar' 'ttf-dejavu' 'ffmpeg' 'libglvnd' 'mesa' 'openssl' 'python' 'python-gobject' 'glib2' 'pipewire' 'pipewire-audio' 'pipewire-pulse' 'wireplumber' 'libpulse')
 makedepends=('rust>=1.94' 'cargo' 'gcc' 'pkgconf' 'python')
-backup=('etc/niri-rdp/frontend.conf' 'etc/niri-rdp/headless.kdl' 'etc/niri-rdp/waybar.json' 'etc/niri-rdp/renderer.conf' 'etc/pam.d/niri-rdp')
+backup=('etc/niri-rdp/frontend.conf' 'etc/niri-rdp/headless.kdl' 'etc/niri-rdp/waybar.json' 'etc/niri-rdp/renderer.conf' 'etc/niri-rdp/broker.conf' 'etc/pam.d/niri-rdp')
 source=("niri-remote-login-$pkgver.tar.gz")
 sha256sums=('@SOURCE_SHA256@')
 
@@ -37,7 +37,7 @@ check() {
   export CARGO_HOME="$srcdir/cargo-home"
   env -u CFLAGS -u CXXFLAGS cargo test --locked --offline --manifest-path bridge/Cargo.toml
   make -C broker check
-  python -m unittest tests.test_host_setup tests.test_session_environment tests.test_native_video tests.test_audio tests.test_performance_harness -v
+  python -m unittest tests.test_host_setup tests.test_session_environment tests.test_native_video tests.test_audio tests.test_microphone tests.test_performance_harness -v
 }
 
 package() {
@@ -60,4 +60,7 @@ package() {
   install -Dm644 docs/uninstall.md "$pkgdir/usr/share/doc/$pkgname/uninstall.md"
   install -Dm644 docs/performance.md "$pkgdir/usr/share/doc/$pkgname/performance.md"
   install -Dm644 packaging/nvidia-frontend.conf "$pkgdir/usr/share/doc/$pkgname/nvidia-frontend.conf"
+  # fail2ban examples; the package never enables them.
+  install -Dm644 packaging/fail2ban/niri-rdp.conf "$pkgdir/usr/share/doc/$pkgname/fail2ban/niri-rdp.conf"
+  install -Dm644 packaging/fail2ban/niri-rdp.jail.example "$pkgdir/usr/share/doc/$pkgname/fail2ban/niri-rdp.jail.example"
 }

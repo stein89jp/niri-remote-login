@@ -36,13 +36,14 @@ If another package owns either file, resolve that package's ownership before
 removing the file.
 
 Pacman preserves changed configuration as `.pacsave`; inspect it before removal.
-This includes `/etc/niri-rdp/broker.conf` (left as
-`/etc/niri-rdp/broker.conf.pacsave` if you changed the grace period) and the
-other `/etc/niri-rdp` files. Remove the broker settings when discarding the
-experiment:
+The package configuration files are `/etc/niri-rdp/frontend.conf`,
+`headless.kdl`, `waybar.json`, `renderer.conf`, `broker.conf` (left as
+`/etc/niri-rdp/broker.conf.pacsave` if you changed the grace period) and
+`/etc/pam.d/niri-rdp`. Remove the leftovers when discarding the experiment:
 
 ```sh
-sudo rm -f -- /etc/niri-rdp/broker.conf /etc/niri-rdp/broker.conf.pacsave
+sudo rm -f -- /etc/niri-rdp/*.pacsave /etc/niri-rdp/*.pacnew \
+  /etc/pam.d/niri-rdp.pacsave /etc/pam.d/niri-rdp.pacnew
 ```
 
 If you copied the fail2ban example, `/etc/fail2ban/filter.d/niri-rdp.conf` and
@@ -52,7 +53,10 @@ If you copied the fail2ban example, `/etc/fail2ban/filter.d/niri-rdp.conf` and
 TLS identity files in `/etc/niri-rdp/tls`, including the `generated` marker that
 records a self-signed certificate for renewal, are generated on first start (or
 provided manually) and are not package-owned. Remove those files and the
-remaining project configuration only after deciding to discard the experiment. Keep backups if rollback is intended.
+remaining project configuration only after deciding to discard the experiment
+(`sudo rm -rf -- /etc/niri-rdp` removes the TLS identity and every remaining
+file there; a later install then creates a new certificate with a new
+fingerprint). Keep backups if rollback is intended.
 If you enabled NVIDIA encoding, its copied drop-in
 `/etc/systemd/system/niri-rdp-frontend.service.d/nvidia.conf` is also not
 package-owned. Remove that file when discarding the experiment, then run

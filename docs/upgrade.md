@@ -56,6 +56,13 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+Version `1.5.5-1`, published as `v1.5.5`, contains every change in this section
+and follows `1.5-1`. To upgrade from 1.5, use the clean [uninstall](uninstall.md)
+and [install](install.md) cycle (or stop both services and `pacman -U` the new
+package), merge `/etc/pam.d/niri-rdp.pacnew` if pacman created one, copy the
+NVIDIA drop-in again if you use NVENC, and start a fresh remote desktop. The
+details follow.
+
 The compositor is now rebased onto upstream Niri `main` `fc9e8c42` with a
 12-patch series (see [validation](validation.md#niri-rebase-onto-upstream-main-2026-10-15)).
 The custom `niri-rdp-cursor-v1` protocol is gone: the bridge reads the cursor
@@ -291,8 +298,8 @@ necessarily the build or install date, and several builds may share one commit.
 Releases 1–3 were split packages (`niri-remote-login` plus `niri-rdp-headless`);
 the combined `packaging/arch/niri-rdp` package starts at release 4.
 "Headless" is the `niri-rdp-headless` version built from the same commit.
-Only `v1.5` is documented as a published GitHub release; whether earlier
-versions were published is unknown.
+GitHub lists `v1.0.2`, `v1.5` and `v1.5.5` as published releases; tags `v1.0.0`
+and `v1.0.1` exist without a GitHub release.
 
 | Package | Release | Date | Commit | Headless | Headline change |
 | --- | --- | --- | --- | --- | --- |
@@ -317,15 +324,15 @@ versions were published is unknown.
 | `0.1.0-19` | 19 | 2026-10-12 | `b7e3995` | `26.04.remote1-6` | PCM preferred again: **accepted audio baseline** |
 | `0.1.0-20` | 20 | 2026-10-13 | `a5c1b66` | `26.04.remote1-6` | Fresh-completion backlog recovery (Firefox delay) |
 | `1.0.0-1` | — | 2026-10-13 | `31b47f2` | `26.04.remote1-6` | Version renumbering of the release 20 source; README |
-| `1.0.1` | — | unknown | — | — | Unknown: no `1.0.1` appears in Git history |
+| `1.0.1` | — | 2026-10-13 | `a6a2ebc` | `26.04.remote1-6` | No `1.0.1` package: tag `v1.0.1` still carries `pkgver=1.0.0` |
 | `1.0.2-1` | — | 2026-10-13 | `8c5471b` | `26.04.remote1-6` | Author attribution, licensing notes, packaged README |
 | `1.1.0-1` | — | 2026-10-14 | `7abfd65` | `26.04.remote1-8` | Performance/desktop upgrades and text clipboard |
 | `1.1.0-2` | — | 2026-10-15 | `a4e7b5e` | `26.04.remote1-8` | mstsc cursor-jumping fix, NVIDIA improvements |
 | `1.5-1` | — | 2026-10-15 | `bae6626` | `26.04.remote1-9` | Published `v1.5`: 1.1.0-2 runtime as a release |
-| `1.5.5-1` | — | 2026-10-15 | this release | `26.04.remote2-1` | Niri rebase, hardening, rich clipboard, microphone |
+| `1.5.5-1` | — | 2026-10-15 | this release | `26.04.remote2-1` | Published `v1.5.5`: Niri rebase, hardening, rich clipboard, microphone |
 
 `niri-rdp-headless` `26.04.remote1-7` does not appear in any commit. The
-PKGBUILDs carry `pkgver=1.5.5`/`pkgrel=1`. Bump the version again before
+PKGBUILDs and `scripts/prepare-release.py` carry `pkgver=1.5.5`/`pkgrel=1`. Bump the version again before
 building or publishing later changes, so packages with different contents never
 share a version.
 

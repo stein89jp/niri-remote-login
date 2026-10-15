@@ -47,7 +47,11 @@ PAM. A client omitting its password also receives a
 restricted login screen. No compositor or Linux login session starts until
 the screen submits credentials and the broker accepts them. Incorrect credentials
 clear the password; attempts have a two-second delay and the connection closes
-after five failures. The screen supports JP106 physical keys and Unicode character
+after five failures. The screen also closes after 60 seconds without a submitted
+attempt or 120 seconds in total (`NIRI_RDP_LOGIN_IDLE_SECS`,
+`NIRI_RDP_LOGIN_TIMEOUT_SECS`), and failed logins from one client address,
+including direct ClientInfo credentials, start a per-source backoff of up to
+60 seconds; see [installation](../docs/install.md#configuration-and-troubleshooting). The screen supports JP106 physical keys and Unicode character
 events, Tab, Backspace, Enter, and mouse focus/sign-in. Password pixels contain
 a fixed mask, never the secret or its length. Disconnect cancels access to a
 pending desktop binding and releases its lease; a desktop already created by the
@@ -65,7 +69,8 @@ suppression still pauses desktop output.
 
 Ordinary mstsc can negotiate TLS when the server offers no NLA. An explicit
 `enablecredsspsupport:i:0` profile remains a fallback; policies requiring NLA are
-incompatible. Actual mstsc verification remains pending.
+incompatible. The detailed mstsc negotiation checks remain in
+[acceptance](../docs/acceptance.md).
 
 For a disposable current-UID compositor only, `NIRI_RDP_MODE=disposable` uses
 library NLA with explicit disposable `NIRI_RDP_USERNAME` and
@@ -83,8 +88,10 @@ Capture uses `zwlr_screencopy_manager_v1` into bounded anonymous SHM files,
 accepting XRGB/ARGB/XBGR/ABGR8888, converting row padding and vertical inversion,
 and normalizing frames into the negotiated RDP desktop. The native headless
 output is resized to that same pixel size before capture. The worker retains only the
-latest frame and reuses a mapped SHM buffer until its layout changes. Native BGR
-frames need one owned snapshot copy; padded, inverted or RGB frames are normalized.
+latest frame. Native BGR frames share a small pool of mapped SHM buffers without
+copying, and a buffer still referenced is never handed back to the compositor;
+padded, inverted or RGB frames are normalized. Compositor damage limits pixel
+comparisons to damaged tiles (see [performance controls](../docs/performance.md)).
 `NIRI_RDP_FPS` bounds capture to 1..60 fps (default 60 with NVENC, 30 with bitmap).
 Capture time counts toward the frame budget. An eventfd wakes capture negotiation,
 readback and idle waits to service input. Adjacent motion and resize requests
@@ -102,13 +109,14 @@ FFmpeg's `h264_nvenc` and send H.264 AVC420 over the negotiated RDP graphics
 channel. Clients without the required graphics/codec capabilities receive bitmap
 updates. The patched headless compositor prefers hardware EGL devices, including
 NVIDIA, and advertises DMA-BUF formats for GPU applications. Its `auto` policy falls back to surfaceless rendering if hardware is unavailable;
-the session worker's `software` policy forces llvmpipe. SHM remains the default
-capture path; GPU capture is an explicit option.
+the session worker's `software` policy forces llvmpipe. With NVENC, supported
+DMA-BUF GPU capture is the default (`NIRI_RDP_GPU_CAPTURE=auto`) with SHM
+fallback; bitmap mode always uses SHM.
 NVENC accelerates the frontend's video encoding independently of compositor
 rendering. FFmpeg's software scaler converts the captured pixels to full-range
-BT.709 NV12 before NVENC encoding, as required by AVC420. This default path does not use NVDEC; the RDP client decodes the video. An opt-in
-DMA-BUF/EGL/CUDA path keeps supported capture and BT.709 conversion on the GPU,
-with SHM fallback. See [performance controls](../docs/performance.md).
+BT.709 NV12 before NVENC encoding on the SHM path, as required by AVC420. NVDEC is not used; the RDP client decodes the video. The
+default NVENC DMA-BUF/EGL/CUDA path keeps supported capture and BT.709 conversion
+on the GPU, with SHM fallback. See [performance controls](../docs/performance.md).
 
 Color conversion uses up to four FFmpeg workers for larger desktops. A padded
 BGR staging frame enables parallel conversion; small or single-core frames use
@@ -123,13 +131,17 @@ and graphics backpressure bounds unacknowledged frames. Set
 `NIRI_RDP_BITRATE_MBPS=1..100` sets the H.264 bitrate ceiling (default 12 Mbps).
 Each connection adapts bitrate toward a 1 Mbps floor when graphics ACK latency
 rises above its baseline, acknowledgements stall, or the client reports a
-decoding backlog. It recovers slowly after healthy delivery and updates the
-live NVENC rate control without recreating the encoder. Tracking stays bounded
+decoding backlog, moving between six quantized levels: at most one decrease per
+second, and an increase only after 10 seconds of healthy delivery, applied at
+the next due keyframe or within 30 seconds, because each NVENC rate change costs
+a keyframe. Periodic keyframes are a 30-second safety net
+(`NIRI_RDP_GOP_SECONDS`); recovery points still force them immediately. The
+encoder is not recreated for a rate change. Tracking stays bounded
 and resets for reconnects; the graphics acknowledgement-suspension sentinel is
 handled as a protocol mode. Bitmap fallback retains its existing transport.
 See [installation](../docs/install.md#optional-nvidia-encoding) for GPU access and
-renderer policy configuration. The default remains SHM capture with CPU color conversion. Select GPU capture
-explicitly only with the documented device access and a supported import path;
+renderer policy configuration. GPU capture needs the documented device access and
+a supported import path, otherwise it falls back to SHM;
 server/client decoding timings do not establish physical presentation latency.
 
 Explicit NVENC mode validates the hardware encoder at startup and fails with an
@@ -226,9 +238,12 @@ relative motion is bounded before mapping into the capture output. Click
 coordinates travel with the button event. Normal transform and the explicitly selected output scale are required; unsupported layouts fail closed. Unicode events commit exact text through a temporary one-level XKB map, including
 Japanese and UTF-16 surrogate pairs (emoji). Each character is a balanced tap; the
 physical keymap and held modifiers are restored afterward. Phone-side IME
-composition can submit committed text this way. Pause/E1 and lock-screen behavior remain work. Bidirectional Unicode text
-clipboard uses CLIPRDR and private-session Wayland data control, with bounded
-payloads/deadlines and reconnect cleanup; host-local clipboard access is excluded.
+composition can submit committed text this way. Pause/E1 and lock-screen behavior remain work. The bidirectional
+clipboard carries Unicode text, HTML and images (not files) over CLIPRDR and
+private-session Wayland data control, with bounded payloads/deadlines and
+reconnect cleanup; host-local clipboard access is excluded. Mouse wheel notches
+are sent as discrete steps, so Niri wheel bindings and clients' `axis_value120`
+work.
 
 ## Session audio
 
@@ -394,12 +409,13 @@ FreeRDP-decoded geometry, native/logical Niri output dimensions, application
 keyboard input and center-pointer click/release. Use the existing integration
 commands above with the current debug or release frontend and rebuilt compositor.
 
-Broker transport is bounded `NRB1 + BE16(username length) + BE16(password length)
-+ UTF-8 credentials`, no NUL; username 1..64, password 1..512 bytes. Reply is
-`NRB1 + status`: 0 plus two ordered CLOEXEC SCM_RIGHTS FDs (Wayland, PCM); the PCM
-socket starts capture after receiving one ASCII `A` readiness byte. Status 1 is auth/policy
-rejected; 2 startup/backend failure; 3 malformed/unauthorized request. The broker
-lease remains open until the authenticated backend drops. No filesystem access
+Broker transport is the bounded `NRB2` request (credentials plus the client
+address for `PAM_RHOST`); username 1..64, password 1..512 bytes. The reply is
+`NRB2 + status`: 0 plus one to three ordered CLOEXEC SCM_RIGHTS FDs (Wayland,
+PCM, microphone); the PCM socket starts capture after receiving one ASCII `A`
+readiness byte. Statuses 1–5 are listed in the
+[broker protocol](../broker/README.md). The broker lease remains open until the
+authenticated backend drops. No filesystem access
 to the target user's runtime is needed by the frontend. Broker receive supports
 fragmented replies and rejects truncated/excess FD transport.
 
@@ -411,7 +427,7 @@ exact commands. PAM/logind boot, Windows mstsc and physical-monitor tests remain
 pending actual separate machines.
 
 Production broker-mode TLS-only transport was also validated using a namespace
-NRB1 test broker handing a real Niri FD: actual ClientInfo credential delivery,
+test broker (then `NRB1`) handing a real Niri FD: actual ClientInfo credential delivery,
 auth rejection, desktop binding and all accepted lease EOF checks passed. This
 fixture is transport validation only and does not replace real PAM/logind boot
 testing. The FreeRDP client enables automatic logon to send TLS ClientInfo

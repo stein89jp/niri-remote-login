@@ -2,7 +2,8 @@
 
 Build on the **Arch Linux x86_64 machine that will host the remote desktop**.
 Use an up-to-date Arch installation and a normal, unprivileged build account.
-The repository is private, so cloning requires repository access. Rust 1.94 or
+Prebuilt packages are on [GitHub Releases](https://github.com/stein89jp/niri-remote-login/releases);
+see the [README](../README.md#install-a-binary-release). Rust 1.94 or
 newer is required; `makepkg -fsi` installs the declared build/runtime dependencies.
 The initial Rust/compositor build can take a while.
 
@@ -66,7 +67,8 @@ This single `niri-remote-login` package contains the patched headless compositor
 RDP frontend, PAM/logind broker, defaults, and systemd units. Arch's package hooks
 create the `niri-rdp` service account and `niri-rdp-users` authorization group.
 On first service start the root broker creates a self-signed TLS certificate
-and private key. Existing certificates are preserved and validated. No separate
+and private key, and renews that generated certificate shortly before it
+expires. Existing certificates are preserved and validated. No separate
 release-preparation command, build VM, certificate-generation commands, or SSH
 tunnel is required. Services start only when you enable/start them.
 
@@ -152,9 +154,9 @@ checks them directly. If it omits the password or sends remembered Windows domai
 login screen inside the remote connection accepts the Linux account name and
 password before starting Niri. Windows domain credentials are never sent to PAM.
 NLA/CredSSP authentication is not provided; Windows policies that require NLA
-remain incompatible. Actual `mstsc` interoperability is still an acceptance gate,
-not a demonstrated result. Protocol fallback and a login screen do not replace a
-Windows machine test.
+remain incompatible. The user has confirmed the Windows 10 `mstsc` desktop;
+detailed negotiation, login-screen, profile and certificate checks remain
+[acceptance](acceptance.md) gates.
 
 The default listens on `0.0.0.0:33991`, so clients connect directly over the
 network. If the host has a firewall, allow TCP 33991 from the intended client
@@ -199,7 +201,7 @@ and session; a subsequent login starts a fresh desktop after cleanup.
 Super+Shift+Q logs out and ends the desktop; compositor exit or stopping
 the broker also ends it. On logout the desktop's applications receive SIGTERM
 and have 2 seconds to save state before they are killed. A frontend restart preserves the desktop only if you reconnect
-within the same 45-second grace window. After a silent network
+within the same grace window. After a silent network
 failure, the frontend may temporarily reject a reconnect while it still considers
 the old connection active. Keepalive/write deadlines bound detection; private
 blackhole checks measured about 20–23 seconds, after which a retry can authenticate.
@@ -469,9 +471,10 @@ privacy or microphone indicator instead.
 The microphone path is separate from playback: its own dynamic RDP channel,
 socket, session helper and restart budget. A microphone failure never ends the
 connection or the desktop, and the accepted PCM playback configuration is
-unchanged. A failed session helper is restarted twice at most (then the
-microphone stays off until a fresh remote desktop); reconnect after a restart
-to use the microphone again. A frontend-side failure leaves it off until the
+unchanged. A failed session helper is restarted at most twice in a row (then
+the microphone stays off until a fresh remote desktop); a helper that ran ten
+healthy minutes earns a fresh budget. Reconnect after a restart to use the
+microphone again. A frontend-side failure leaves it off until the
 next connection. To troubleshoot:
 
 ```sh
@@ -731,7 +734,7 @@ sudo systemctl restart niri-rdp-frontend.service
 
 ## Performance and desktop upgrades
 
-The combined 1.5 package includes damage-aware capture, input/resize coalescing,
+The combined 1.5.5 package includes damage-aware capture, input/resize coalescing,
 cached login rendering, stale-ACK recovery, separate negotiated cursor updates,
 a private bidirectional clipboard and deliberate DPI scaling. The clipboard
 carries Unicode text (up to 1 MiB), HTML (up to 4 MiB) and images (up to 32 MiB
@@ -745,7 +748,9 @@ quality profiles, coordinated graphics cadence/window, total link budget and
 diagnostics. Existing speed/AVC420/SHM defaults and the accepted PCM audio controls
 remain the baseline. New audio framing and helper supervision are packaged with
 the frontend; a clean reinstall starts matching components. Audio failure permits
-a usable desktop; reconnect after helper recovery obtains fresh capture.
+a usable desktop; reconnect after helper recovery obtains fresh capture. The
+playback helper is restarted at most twice in a row; ten healthy minutes earn a
+fresh budget.
 
 After your clean reinstall, run the Windows and installed-machine checklist in
 [acceptance](acceptance.md), including thirty-minute playback. The recorded
