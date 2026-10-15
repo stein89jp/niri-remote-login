@@ -518,7 +518,7 @@ playback worked and now had minimal latency in the same Windows 10 native
 the PCM preference plus current latency controls together. Preserve this
 combination; successful decoding in FFmpeg, FreeRDP or FDK is not sufficient
 evidence to restore compressed-format preference. The baseline and change
-requirements are recorded in [AGENTS.md](../AGENTS.md#preserve-the-working-audio-combination).
+requirements are recorded in [CLAUDE.md](../CLAUDE.md#preserve-the-working-audio-combination).
 No precise latency measurement or 30-minute, constrained-bandwidth or repeated
 reconnect listening result was supplied; those remain separate
 [actual-client acceptance checks](acceptance.md).

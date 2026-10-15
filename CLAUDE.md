@@ -44,6 +44,12 @@ Any deliberate change to this baseline needs an explicit user request or approva
 
 History uses brief descriptions such as “Added remote audio support.” and “Fixed Firefox issues.” Keep commits focused. PRs should explain behavior changes, link relevant issues, list validation and limitations, and include screenshots for login/UI changes.
 
+The user handles all Git and GitHub operations (`git add`, `git commit`, `git push`, branches, PRs) themselves. Do not stage, commit, push or open PRs unless the user explicitly asks for that specific action; leave changes in the working tree and summarize them instead.
+
+## Change Validation on This Host
+
+The user develops on and connects to this same Arch/Niri host through Niri-RDP from Windows 10 `mstsc.exe`. After a change to the system, the user validates it with a clean reinstall: remove the current installation with [docs/uninstall.md](docs/uninstall.md), then install fresh with [docs/install.md](docs/install.md). Do not live-patch installed services or files under `/usr`, `/etc` or systemd as a shortcut. When a change affects installation, packaging, services or configuration, keep both documents accurate, and tell the user when a change needs that reinstall cycle before it can be tested. Restarting the installed services ends the user's current RDP session, so never do it on their behalf.
+
 ## Security & Configuration
 
 Develop with private display sockets and disposable sessions. Keep credentials and TLS keys out of Git. Stage broker installation with an absolute `DESTDIR`; validate packages before changing host services.
