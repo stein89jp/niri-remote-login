@@ -193,8 +193,14 @@ class HostSetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary) / "autostart"
             directory.mkdir()
+            # GIO rejects entries whose Exec program is missing, so provide a
+            # stand-in fcitx5 instead of depending on a host installation.
+            fcitx = Path(temporary) / "bin" / "fcitx5"
+            fcitx.parent.mkdir()
+            fcitx.write_text("#!/bin/sh\nexit 0\n")
+            fcitx.chmod(0o755)
             (directory / "org.fcitx.Fcitx5.desktop").write_text(
-                "[Desktop Entry]\nType=Application\nName=Fcitx\nExec=/usr/bin/fcitx5\nOnlyShowIn=niri;\n")
+                f"[Desktop Entry]\nType=Application\nName=Fcitx\nExec={fcitx}\nOnlyShowIn=niri;\n")
             environment = {"HOME": temporary, "XDG_CONFIG_HOME": temporary,
                            "XDG_CONFIG_DIRS": "/missing", "XDG_CURRENT_DESKTOP": "niri"}
             with patch.dict(os.environ, environment, clear=True), \
