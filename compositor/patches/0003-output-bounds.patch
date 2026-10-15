@@ -1,0 +1,118 @@
+From e8276d2513d7a71bb3f973b29e6c43aec7e65182 Mon Sep 17 00:00:00 2001
+From: Niri-RDP rebase <niri-rdp@localhost>
+Date: Thu, 15 Oct 2026 13:18:21 +0900
+Subject: [PATCH 03/12] headless: bound virtual output creation
+
+Virtual outputs are limited to 1-8192 px per side, at most four outputs and
+1-240 Hz, and the naming counter uses checked arithmetic. IPC or remotely
+controlled output creation can no longer allocate huge SHM captures, and a
+rejected request leaves no partial output behind.
+
+Niri-RDP feature F2. Test: backend::headless::remote_tests::
+virtual_output_rejection_is_atomic_and_capacity_recovers_after_removal.
+---
+ src/backend/headless.rs | 59 +++++++++++++++++++++++++++++++++++++++++
+ src/backend/mod.rs      | 17 +++++++++---
+ 2 files changed, 73 insertions(+), 3 deletions(-)
+
+diff --git a/src/backend/headless.rs b/src/backend/headless.rs
+index 02031095..8c2658c4 100644
+--- a/src/backend/headless.rs
++++ b/src/backend/headless.rs
+@@ -356,4 +356,63 @@ mod remote_tests {
+         drop(event_loop);
+         assert!(!runtime_dir().join("wayland-0").exists());
+     }
++
++    #[test]
++    fn virtual_output_rejection_is_atomic_and_capacity_recovers_after_removal() {
++        let (_event_loop, state) = headless_state(false);
++        let mut state = state.unwrap();
++        for (width, height, rate) in [
++            (0, 480, 60),
++            (640, 0, 60),
++            (8193, 480, 60),
++            (640, 8193, 60),
++            (640, 480, 0),
++            (640, 480, 241),
++        ] {
++            assert!(state
++                .backend
++                .create_virtual_output(&mut state.niri, width, height, rate)
++                .is_err());
++            assert_eq!(state.niri.global_space.outputs().count(), 0);
++            assert!(state.backend.ipc_outputs().lock().unwrap().is_empty());
++        }
++        let mut names = Vec::new();
++        for _ in 0..4 {
++            names.push(
++                state
++                    .backend
++                    .create_virtual_output(&mut state.niri, 640, 480, 60)
++                    .unwrap(),
++            );
++        }
++        assert_eq!(names[0], "HEADLESS-1");
++        assert!(state
++            .backend
++            .create_virtual_output(&mut state.niri, 640, 480, 60)
++            .is_err());
++        assert_eq!(state.niri.global_space.outputs().count(), 4);
++        state
++            .backend
++            .remove_virtual_output(&mut state.niri, &names[0])
++            .unwrap();
++        assert!(state
++            .backend
++            .remove_virtual_output(&mut state.niri, &names[0])
++            .is_err());
++        let replacement = state
++            .backend
++            .create_virtual_output(&mut state.niri, 640, 480, 60)
++            .unwrap();
++        assert_eq!(replacement, "HEADLESS-5");
++        names.remove(0);
++        names.push(replacement);
++        for name in names {
++            state
++                .backend
++                .remove_virtual_output(&mut state.niri, &name)
++                .unwrap();
++        }
++        assert_eq!(state.niri.global_space.outputs().count(), 0);
++        assert!(state.backend.ipc_outputs().lock().unwrap().is_empty());
++    }
+ }
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index 6e5a53b0..72f55710 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -83,14 +83,25 @@ impl VirtualOutputs {
+         height: u16,
+         refresh_rate: u32,
+     ) -> Result<String, String> {
++        // Bound allocations for remotely controlled output creation. u16 alone
++        // permits outputs large enough to exhaust memory during SHM capture.
++        if width == 0 || height == 0 || width > 8192 || height > 8192 {
++            return Err("virtual output dimensions must be in 1..=8192".into());
++        }
++        if self.outputs.len() >= 4 {
++            return Err("at most four virtual outputs are supported".into());
++        }
+         if refresh_rate == 0 {
+             return Err("refresh rate must be greater than 0".into());
+         }
+-        if refresh_rate > 1000 {
+-            return Err("refresh rate must be 1000 Hz or less".into());
++        if refresh_rate > 240 {
++            return Err("refresh rate must be 240 Hz or less".into());
+         }
+ 
+-        self.counter += 1;
++        self.counter = self
++            .counter
++            .checked_add(1)
++            .ok_or_else(|| "virtual output identifier exhausted".to_string())?;
+         let n = self.counter;
+ 
+         let connector = format!("HEADLESS-{n}");

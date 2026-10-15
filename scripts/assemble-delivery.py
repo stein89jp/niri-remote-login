@@ -47,9 +47,9 @@ def main():
     for filename in ("niri-remote-login-0.1.0.tar.gz",):
         copy(ARTIFACTS / "release/niri-remote-login" / filename, OUT / "niri-remote-login" / filename)
     headless = ARTIFACTS / "release/niri-rdp-headless"
-    for filename in ("0001-remote-headless-bounds-and-startup.patch", "collect-licenses.py"):
-        copy(headless / filename, OUT / "niri-rdp-headless" / filename)
     pins = json.loads((ROOT / "compositor/pins.json").read_text())["selected"]
+    for filename in [Path(patch).name for patch in pins["patches"]] + ["collect-licenses.py"]:
+        copy(headless / filename, OUT / "niri-rdp-headless" / filename)
     source = ROOT / "compositor" / f"niri-{pins['revision']}.tar.gz"
     if digest(source) != pins["archive_sha256"]:
         raise RuntimeError("Niri source archive hash differs from pin")

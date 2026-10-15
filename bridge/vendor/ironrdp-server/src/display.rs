@@ -334,6 +334,14 @@ pub trait RdpServerDisplay: Send {
     /// Negotiated New Pointer Update ceiling for this activation. Zero means
     /// unsupported; a display can retain its embedded cursor fallback.
     fn pointer_capabilities(&mut self, _max_size: u16) {}
+    /// [`Self::pointer_capabilities`] plus the client's advertised
+    /// `pointerCacheSize` (MS-RDPBCGR 2.2.7.1.5): New/Large/Cached Pointer
+    /// updates must use cache indices below it. The server calls this once
+    /// per activation; the default forwards only the size ceiling, so a
+    /// display that does not override it never learns a cache size.
+    fn pointer_cache_capabilities(&mut self, max_size: u16, _cache_size: u16) {
+        self.pointer_capabilities(max_size);
+    }
     /// Request a fresh current image, even when source pixels are unchanged.
     fn request_refresh(&mut self) {}
     /// Pause pixel delivery while retaining input, control and teardown.
@@ -357,6 +365,24 @@ pub trait RdpServerDisplay: Send {
     /// matching every existing implementation's current behavior.
     async fn monitor_count(&mut self) -> u32 {
         1
+    }
+
+    /// Whether to offer the Display Control Virtual Channel (MS-RDPEDISP) on
+    /// this connection.
+    ///
+    /// Called once per connection, before the dynamic channels are set up.
+    /// Return `false` when the display cannot honor a client layout request,
+    /// for example when it mirrors a fixed-size physical screen: MS-RDPEDISP
+    /// section 1.3 defines no reject message, so a client that sent a layout
+    /// the server cannot apply just waits for a reconfiguration that never
+    /// comes. Defaults to `true`, matching every existing implementation.
+    ///
+    /// A connection binder installs its own display during the capability
+    /// exchange, after this is asked. The display given to
+    /// `with_display_handler` therefore decides for every connection, and a
+    /// display installed by a binder can't withdraw the offer.
+    async fn offers_display_control(&mut self) -> bool {
+        true
     }
 }
 

@@ -16,6 +16,12 @@
 struct niri_gpu;
 static void video_gpu_free(struct niri_gpu *gpu);
 
+/* RDPGFX is reliable TCP and every recovery point (refresh, resume, dropped
+   frame, resize, caps change, rate change) already forces an IDR. A periodic
+   IDR is therefore only a rare safety net, not a loss-recovery mechanism. */
+#define NIRI_VIDEO_DEFAULT_GOP_SECONDS 30
+#define NIRI_VIDEO_MAX_GOP_SECONDS 3600
+
 struct niri_video {
     AVCodecContext *codec;
     AVFrame *frame;
@@ -33,6 +39,7 @@ struct niri_video {
     AVPacket *main_packet;
     double convert_ms, encode_ms;
     int preset, spatial_aq;
+    int fps, gop_seconds;
     struct niri_gpu *gpu;
 };
 
@@ -67,7 +74,7 @@ static void error_text(char *error, size_t length, const char *step, int code) {
    these public context fields change. Keep the context alive; FFmpeg requests
    an IDR as part of NVENC's rate reconfiguration for decoder continuity. */
 int niri_video_set_bitrate(struct niri_video *v, int bitrate) {
-    if (!v || bitrate < 1000000 || bitrate > 100000000) return -1;
+    if (!v || !v->codec || bitrate < 1000000 || bitrate > 100000000) return -1;
     v->codec->bit_rate = bitrate;
     v->codec->rc_max_rate = bitrate;
     v->codec->rc_buffer_size = bitrate / v->codec->framerate.num;
@@ -75,7 +82,7 @@ int niri_video_set_bitrate(struct niri_video *v, int bitrate) {
 }
 
 int niri_video_set_rate(struct niri_video *v, int bitrate, int fps) {
-    if (!v || fps < 1 || fps > 60 || bitrate < 1000000 || bitrate > 100000000) return -1;
+    if (!v || !v->codec || fps < 1 || fps > 60 || bitrate < 1000000 || bitrate > 100000000) return -1;
     /* FFmpeg's supported NVENC reconfigure updates bitrate/VBV, not the initial
        frameRateNum. A cadence change needs a fresh context and IDR, rather than
        merely changing an AVCodecContext field the driver never consumes. */
@@ -83,15 +90,71 @@ int niri_video_set_rate(struct niri_video *v, int bitrate, int fps) {
     return niri_video_set_bitrate(v, bitrate);
 }
 
+/* Codec fields shared by libx264 (tests), SHM NVENC and DMA-BUF NVENC. */
+static void video_configure_codec(const struct niri_video *v, AVCodecContext *c, int bitrate) {
+    /* MS-RDPEGFX 2.2.4.4 requires 16-aligned bitstreams. RDP regions crop
+       the padding; the SPS must not crop the coded dimensions instead. */
+    c->width = (v->width + 15) & ~15;
+    c->height = (v->height + 15) & ~15;
+    /* AVC444 submits main and auxiliary views as two codec frames. */
+    int rate = v->fps * (v->avc444 ? 2 : 1);
+    c->time_base = (AVRational){1, rate};
+    c->framerate = (AVRational){rate, 1};
+    c->bit_rate = bitrate;
+    /* Counted in codec frames. AVC444's even length keeps periodic IDRs on
+       main views; an auxiliary IDR would discard the main view reference. */
+    c->gop_size = v->gop_seconds * rate;
+    c->max_b_frames = 0;
+    /* Two reference pictures let the alternating RDP main/auxiliary views
+       refer to their own previous view instead of predicting only from the
+       unrelated immediately preceding one. This adds no reorder/lookahead. */
+    if (v->avc444) c->refs = 2;
+    c->thread_count = 1;
+    c->color_range = AVCOL_RANGE_JPEG;
+    c->colorspace = AVCOL_SPC_BT709;
+    c->color_primaries = AVCOL_PRI_BT709;
+    c->color_trc = AVCOL_TRC_BT709;
+    c->flags |= AV_CODEC_FLAG_LOW_DELAY;
+}
+
+/* One NVENC configuration for SHM and DMA-BUF contexts, so GPU promotion
+   reproduces the SHM encoder exactly, including an adapted bitrate. */
+static void nvenc_configure(const struct niri_video *v, AVCodecContext *c, int bitrate,
+                            AVDictionary **options) {
+    video_configure_codec(v, c, bitrate);
+    char preset_name[3] = {'p', (char)('0' + v->preset), '\0'};
+    av_dict_set(options, "preset", preset_name, 0);
+    av_dict_set(options, "tune", "ull", 0);
+    av_dict_set(options, "profile", "high", 0);
+    /* FFmpeg otherwise defaults to VBR with a two-second VBV and an
+       unspecified maximum rate. A one-frame VBV constrains interactive
+       transport bursts; bounded VBR saves bandwidth on simple frames. */
+    c->rc_max_rate = bitrate;
+    c->rc_buffer_size = bitrate / c->framerate.num;
+    av_dict_set(options, "rc", "vbr", 0);
+    av_dict_set(options, "multipass", "disabled", 0);
+    /* This interface submits and drains one frame at a time. */
+    av_dict_set(options, "surfaces", "2", 0);
+    av_dict_set(options, "zerolatency", "1", 0);
+    av_dict_set(options, "rc-lookahead", "0", 0);
+    av_dict_set(options, "delay", "0", 0);
+    av_dict_set(options, "forced-idr", "1", 0);
+    av_dict_set(options, "spatial-aq", v->spatial_aq ? "1" : "0", 0);
+    av_dict_set(options, "aq-strength", "8", 0);
+    if (v->avc444) av_dict_set(options, "dpb_size", "2", 0);
+}
+
 /* software is used by regression tests only; production always requests NVENC. */
-struct niri_video *niri_video_new_config(int width, int height, int software, int fps, int bitrate,
-                                        int preset, int spatial_aq, int avc444,
-                                        char *error, size_t length) {
+struct niri_video *niri_video_new_encoder(int width, int height, int software, int fps, int bitrate,
+                                         int preset, int spatial_aq, int avc444, int gop_seconds,
+                                         char *error, size_t length) {
+    if (length) error[0] = '\0';
     if (width < 1 || height < 1 || width > 4096 || height > 4096 ||
         fps < 1 || fps > 60 || bitrate < 1000000 || bitrate > 100000000 ||
         preset < 1 || preset > 7 || (spatial_aq != 0 && spatial_aq != 1) ||
-        (avc444 != 0 && avc444 != 1)) {
-        snprintf(error, length, "invalid H.264 dimensions, framerate or bitrate");
+        (avc444 != 0 && avc444 != 1) || gop_seconds < 1 ||
+        gop_seconds > NIRI_VIDEO_MAX_GOP_SECONDS) {
+        snprintf(error, length, "invalid H.264 dimensions, framerate, bitrate or GOP");
         return NULL;
     }
     const AVCodec *codec = avcodec_find_encoder_by_name(software ? "libx264" : "h264_nvenc");
@@ -100,61 +163,36 @@ struct niri_video *niri_video_new_config(int width, int height, int software, in
         return NULL;
     }
     struct niri_video *v = calloc(1, sizeof(*v));
-    if (!v) return NULL;
+    if (!v) {
+        snprintf(error, length, "allocate H.264 encoder state");
+        return NULL;
+    }
     v->codec = avcodec_alloc_context3(codec);
     v->frame = av_frame_alloc();
     v->packet = av_packet_alloc();
-    if (!v->codec || !v->frame || !v->packet) goto fail;
+    if (!v->codec || !v->frame || !v->packet) {
+        snprintf(error, length, "allocate H.264 encoder context");
+        goto fail;
+    }
     AVCodecContext *c = v->codec;
     v->width = width;
     v->height = height;
     v->avc444 = avc444;
     v->preset = preset;
     v->spatial_aq = spatial_aq;
-    /* MS-RDPEGFX 2.2.4.4 requires 16-aligned bitstreams. RDP regions crop
-       the padding; the SPS must not crop the coded dimensions instead. */
-    c->width = (width + 15) & ~15;
-    c->height = (height + 15) & ~15;
-    c->time_base = (AVRational){1, fps * (avc444 ? 2 : 1)};
-    c->framerate = (AVRational){fps * (avc444 ? 2 : 1), 1};
+    v->fps = fps;
+    v->gop_seconds = gop_seconds;
     /* NVENC's packed RGB conversion is fixed to limited-range BT.601.
        RDP AVC420 requires full-range BT.709, so convert explicitly first. */
     c->pix_fmt = software ? AV_PIX_FMT_YUV420P : AV_PIX_FMT_NV12;
-    c->bit_rate = bitrate;
-    c->gop_size = 2 * fps;
-    c->max_b_frames = 0;
-    /* Two reference pictures let the alternating RDP main/auxiliary views
-       refer to their own previous view instead of predicting only from the
-       unrelated immediately preceding one. This adds no reorder/lookahead. */
-    if (avc444) c->refs = 2;
-    c->thread_count = 1;
-    c->color_range = AVCOL_RANGE_JPEG;
-    c->colorspace = AVCOL_SPC_BT709;
-    c->color_primaries = AVCOL_PRI_BT709;
-    c->color_trc = AVCOL_TRC_BT709;
-    c->flags |= AV_CODEC_FLAG_LOW_DELAY;
     AVDictionary *options = NULL;
-    char preset_name[3] = {'p', (char)('0' + preset), '\0'};
-    av_dict_set(&options, "preset", software ? "ultrafast" : preset_name, 0);
-    av_dict_set(&options, "tune", software ? "zerolatency" : "ull", 0);
-    av_dict_set(&options, "profile", "high", 0);
-    if (!software) {
-        /* FFmpeg otherwise defaults to VBR with a two-second VBV and an
-           unspecified maximum rate. A one-frame VBV constrains interactive
-           transport bursts; bounded VBR saves bandwidth on simple frames. */
-        c->rc_max_rate = bitrate;
-        c->rc_buffer_size = bitrate / c->framerate.num;
-        av_dict_set(&options, "rc", "vbr", 0);
-        av_dict_set(&options, "multipass", "disabled", 0);
-        /* This interface submits and drains one frame at a time. */
-        av_dict_set(&options, "surfaces", "2", 0);
-        av_dict_set(&options, "zerolatency", "1", 0);
-        av_dict_set(&options, "rc-lookahead", "0", 0);
-        av_dict_set(&options, "delay", "0", 0);
-        av_dict_set(&options, "forced-idr", "1", 0);
-        av_dict_set(&options, "spatial-aq", spatial_aq ? "1" : "0", 0);
-        av_dict_set(&options, "aq-strength", "8", 0);
-        if (avc444) av_dict_set(&options, "dpb_size", "2", 0);
+    if (software) {
+        video_configure_codec(v, c, bitrate);
+        av_dict_set(&options, "preset", "ultrafast", 0);
+        av_dict_set(&options, "tune", "zerolatency", 0);
+        av_dict_set(&options, "profile", "high", 0);
+    } else {
+        nvenc_configure(v, c, bitrate, &options);
     }
     int result = avcodec_open2(c, codec, &options);
     av_dict_free(&options);
@@ -177,7 +215,10 @@ struct niri_video *niri_video_new_config(int width, int height, int software, in
         v->auxiliary = av_frame_alloc();
         v->main_packet = av_packet_alloc();
         v->rgb = av_frame_alloc();
-        if (!v->full_chroma || !v->auxiliary || !v->main_packet || !v->rgb) goto fail;
+        if (!v->full_chroma || !v->auxiliary || !v->main_packet || !v->rgb) {
+            snprintf(error, length, "allocate AVC444 frames");
+            goto fail;
+        }
         v->full_chroma->format = AV_PIX_FMT_YUV444P;
         v->full_chroma->width = c->width;
         v->full_chroma->height = c->height;
@@ -188,15 +229,24 @@ struct niri_video *niri_video_new_config(int width, int height, int software, in
         v->rgb->width = width;
         v->rgb->height = height;
         if (av_frame_get_buffer(v->full_chroma, 32) < 0 ||
-            av_frame_get_buffer(v->auxiliary, 32) < 0 || av_frame_get_buffer(v->rgb, 32) < 0) goto fail;
+            av_frame_get_buffer(v->auxiliary, 32) < 0 || av_frame_get_buffer(v->rgb, 32) < 0) {
+            snprintf(error, length, "allocate AVC444 frame buffers");
+            goto fail;
+        }
         v->scale = sws_getContext(width, height, AV_PIX_FMT_BGR0,
                                   width, height, AV_PIX_FMT_YUV444P,
                                   SWS_POINT | SWS_FULL_CHR_H_INP | SWS_ACCURATE_RND,
                                   NULL, NULL, NULL);
-        if (!v->scale) goto fail;
+        if (!v->scale) {
+            snprintf(error, length, "create AVC444 color conversion");
+            goto fail;
+        }
         const int *coefficients = sws_getCoefficients(SWS_CS_ITU709);
         if (sws_setColorspaceDetails(v->scale, coefficients, 1, coefficients, 1,
-                                     0, 1 << 16, 1 << 16) < 0) goto fail;
+                                     0, 1 << 16, 1 << 16) < 0) {
+            snprintf(error, length, "configure AVC444 BT.709 color conversion");
+            goto fail;
+        }
         return v;
     }
     {
@@ -208,7 +258,10 @@ struct niri_video *niri_video_new_config(int width, int height, int software, in
         if (threads > 4) threads = 4;
         if (width * height >= 640 * 480 && threads > 1) {
             v->scale = sws_alloc_context();
-            if (!v->scale) goto fail;
+            if (!v->scale) {
+                snprintf(error, length, "allocate parallel color conversion");
+                goto fail;
+            }
             if (av_opt_set_int(v->scale, "srcw", width, 0) < 0 ||
                 av_opt_set_int(v->scale, "srch", height, 0) < 0 ||
                 av_opt_set_int(v->scale, "dstw", width, 0) < 0 ||
@@ -227,7 +280,10 @@ struct niri_video *niri_video_new_config(int width, int height, int software, in
                     goto fail;
                 }
                 v->rgb = av_frame_alloc();
-                if (!v->rgb) goto fail;
+                if (!v->rgb) {
+                    snprintf(error, length, "allocate color conversion frame");
+                    goto fail;
+                }
                 v->rgb->format = AV_PIX_FMT_BGR0;
                 v->rgb->width = width;
                 v->rgb->height = height;
@@ -246,21 +302,38 @@ struct niri_video *niri_video_new_config(int width, int height, int software, in
             v->scale = sws_getContext(width, height, AV_PIX_FMT_BGR0,
                                       width, height, c->pix_fmt,
                                       SWS_FAST_BILINEAR, NULL, NULL, NULL);
-            if (!v->scale) goto fail;
+            if (!v->scale) {
+                snprintf(error, length, "create color conversion");
+                goto fail;
+            }
             v->tail_stride = width * 4 + 64;
             int tail_rows = 2 + (64 + width * 4 - 1) / (width * 4);
             v->direct_height = height > tail_rows ? (height - tail_rows) & ~1 : 0;
             v->tail = av_mallocz((size_t)v->tail_stride * (height - v->direct_height) + 64);
-            if (!v->tail) goto fail;
+            if (!v->tail) {
+                snprintf(error, length, "allocate color conversion tail rows");
+                goto fail;
+            }
         }
         const int *coefficients = sws_getCoefficients(SWS_CS_ITU709);
         if (sws_setColorspaceDetails(v->scale, coefficients, 1, coefficients, 1,
-                                     0, 1 << 16, 1 << 16) < 0) goto fail;
+                                     0, 1 << 16, 1 << 16) < 0) {
+            snprintf(error, length, "configure BT.709 color conversion");
+            goto fail;
+        }
     }
     return v;
 fail:
     niri_video_free(v);
     return NULL;
+}
+
+/* Stable entry points for fixtures and benchmarks using the default GOP. */
+struct niri_video *niri_video_new_config(int width, int height, int software, int fps, int bitrate,
+                                        int preset, int spatial_aq, int avc444,
+                                        char *error, size_t length) {
+    return niri_video_new_encoder(width, height, software, fps, bitrate, preset, spatial_aq,
+                                  avc444, NIRI_VIDEO_DEFAULT_GOP_SECONDS, error, length);
 }
 
 struct niri_video *niri_video_new(int width, int height, int software, int fps, int bitrate,
@@ -338,14 +411,29 @@ int niri_video_encode_pair(struct niri_video *v, const uint8_t *pixels, int stri
     if (!v || v->gpu || !v->avc444 || !pixels || stride < v->width * 4) {
         snprintf(error, length, "invalid AVC444 input"); return -1;
     }
+    if (!v->codec) {
+        snprintf(error, length, "H.264 encoder context released by failed GPU promotion");
+        return -1;
+    }
     double start = video_now_ms();
     v->encode_ms = 0;
-    if (av_frame_make_writable(v->rgb) < 0 || av_frame_make_writable(v->full_chroma) < 0 ||
-        av_frame_make_writable(v->frame) < 0 || av_frame_make_writable(v->auxiliary) < 0) return -1;
+    int result = av_frame_make_writable(v->rgb);
+    if (result >= 0) result = av_frame_make_writable(v->full_chroma);
+    if (result >= 0) result = av_frame_make_writable(v->frame);
+    if (result >= 0) result = av_frame_make_writable(v->auxiliary);
+    if (result < 0) {
+        error_text(error, length, "prepare AVC444 frames", result);
+        return -1;
+    }
     for (int y = 0; y < v->height; ++y)
         memcpy(v->rgb->data[0] + (size_t)y * v->rgb->linesize[0], pixels + (size_t)y * stride, v->width * 4);
-    if (sws_scale(v->scale, (const uint8_t *const *)v->rgb->data, v->rgb->linesize,
-                   0, v->height, v->full_chroma->data, v->full_chroma->linesize) != v->height) return -1;
+    result = sws_scale(v->scale, (const uint8_t *const *)v->rgb->data, v->rgb->linesize,
+                       0, v->height, v->full_chroma->data, v->full_chroma->linesize);
+    if (result != v->height) {
+        if (result < 0) error_text(error, length, "convert AVC444 RGB to YUV444", result);
+        else snprintf(error, length, "convert AVC444 RGB to YUV444: %d of %d rows", result, v->height);
+        return -1;
+    }
     for (int p = 0; p < 3; ++p)
         pad_plane(v->full_chroma->data[p], v->full_chroma->linesize[p], v->width, v->height,
                   v->codec->width, v->codec->height, 1);
@@ -354,7 +442,11 @@ int niri_video_encode_pair(struct niri_video *v, const uint8_t *pixels, int stri
     *main_size = encode_view(v, v->frame, force_idr, main_data, error, length);
     if (*main_size < 0) return -1;
     av_packet_unref(v->main_packet);
-    if (av_packet_ref(v->main_packet, v->packet) < 0) return -1;
+    result = av_packet_ref(v->main_packet, v->packet);
+    if (result < 0) {
+        error_text(error, length, "retain AVC444 main view", result);
+        return -1;
+    }
     *main_data = v->main_packet->data;
     /* An auxiliary IDR would erase the main decoder reference before combining.
        Recover the whole pair with an IDR main followed by its auxiliary P view. */
@@ -363,7 +455,7 @@ int niri_video_encode_pair(struct niri_video *v, const uint8_t *pixels, int stri
 }
 
 void niri_video_timings(const struct niri_video *v, double *conversion_ms, double *encode_ms) {
-    *conversion_ms = v->convert_ms; *encode_ms = v->encode_ms;
+    *conversion_ms = v ? v->convert_ms : 0; *encode_ms = v ? v->encode_ms : 0;
 }
 
 /* Returned packet memory remains owned by v until the next call or free. */
@@ -371,6 +463,10 @@ int niri_video_encode(struct niri_video *v, const uint8_t *pixels, int stride,
                       int force_idr, const uint8_t **data, char *error, size_t length) {
     if(!v || v->gpu || !pixels || stride<v->width*4) {
         snprintf(error,length,"CPU input requires a SHM encoder context");return -1;
+    }
+    if (!v->codec) {
+        snprintf(error, length, "H.264 encoder context released by failed GPU promotion");
+        return -1;
     }
     double start = video_now_ms();
     v->encode_ms = 0;

@@ -1,0 +1,63 @@
+From 16fcb2b3dfc9630ad6f488b9eb6ad9c79961f09b Mon Sep 17 00:00:00 2001
+From: Niri-RDP rebase <niri-rdp@localhost>
+Date: Thu, 15 Oct 2026 13:54:51 +0900
+Subject: [PATCH 09/12] keyboard: restore the seat keymap right after a
+ committed Unicode tap
+
+The Niri-RDP bridge commits Unicode text (phone and soft keyboards,
+emoji, CJK) through a second virtual keyboard: a one-key keymap whose
+keycodes section is "niri_rdp_unicode", key 247 pressed and released,
+then the physical keymap again. Upstream keeps a virtual keyboard's
+keymap on the seat until a key or modifiers request from another device.
+
+Without an input method the bridge's following modifiers request
+restores the seat. With Fcitx, the input method relays the keymap and
+key through its own virtual keyboard after the bridge has restored the
+seat, so the synthetic keymap stayed: other clients and IPC saw it, and
+a new bridge connection (which ignores "niri_rdp_unicode" seat keymaps)
+timed out waiting for the real one. Restore the configured keymap, with
+the saved layout and locks, after every key release from a device whose
+keymap is such a text keymap, including the input method's relayed copy.
+
+Niri-RDP feature F10. Tests: tests::remote_input::
+committed_unicode_through_an_input_method_restores_the_seat (next patch).
+---
+ src/handlers/virtual_keyboard.rs | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/src/handlers/virtual_keyboard.rs b/src/handlers/virtual_keyboard.rs
+index 08275286..fc661338 100644
+--- a/src/handlers/virtual_keyboard.rs
++++ b/src/handlers/virtual_keyboard.rs
+@@ -15,7 +15,7 @@
+ 
+ use std::sync::Arc;
+ 
+-use smithay::backend::input::{Event, InputEvent, KeyboardKeyEvent};
++use smithay::backend::input::{Event, InputEvent, KeyState, KeyboardKeyEvent};
+ use smithay::utils::SERIAL_COUNTER;
+ use smithay::wayland::input_method::InputMethodSeat;
+ use smithay::wayland::virtual_keyboard::{
+@@ -38,6 +38,7 @@ impl VirtualKeyboardHandler for State {
+         match event {
+             InputEvent::Keyboard { event } => {
+                 let device = event.device();
++                let released = event.state() == KeyState::Released;
+                 self.activate_virtual_keyboard_keymap(&device);
+                 if self.is_input_method_virtual_keyboard(&device) {
+                     // Do not forward passed-through events from a grab back to
+@@ -48,6 +49,14 @@ impl VirtualKeyboardHandler for State {
+                         event,
+                     });
+                 }
++
++                // niri-rdp commits Unicode text as a tap with a one-key keymap. Switch back
++                // right after it: an input method relays that keymap after the bridge has
++                // already restored the seat, which would otherwise keep it until the next key.
++                let text = |keymap: Arc<str>| keymap.contains("xkb_keycodes \"niri_rdp_unicode\"");
++                if released && device.keymap().is_some_and(text) {
++                    self.restore_configured_keymap();
++                }
+             }
+             InputEvent::Special(VirtualKeyboardSpecialEvent::Modifiers {
+                 device,

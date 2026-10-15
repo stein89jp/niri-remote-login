@@ -14,7 +14,7 @@ EXPECTED = {
     "niri-remote-login": {
         "usr/lib/niri-rdp/niri-rdp-bridge", "usr/lib/niri-rdp/niri-rdp-broker",
         "usr/lib/niri-rdp/encoder-probe",
-        "usr/lib/niri-rdp/session-worker", "usr/lib/niri-rdp/session-desktop", "usr/lib/niri-rdp/session-audio", "etc/pam.d/niri-rdp", "etc/niri-rdp/headless.kdl",
+        "usr/lib/niri-rdp/session-worker", "usr/lib/niri-rdp/session-desktop", "usr/lib/niri-rdp/session-audio", "usr/lib/niri-rdp/session-microphone", "etc/pam.d/niri-rdp", "etc/niri-rdp/headless.kdl",
         "usr/lib/niri-rdp/session-portals", "usr/share/xdg-desktop-portal/niri-rdp-portals.conf",
         "usr/lib/niri-rdp/session-environment", "usr/lib/niri-rdp/session-autostart",
         "usr/lib/niri-rdp/session-input-method",
@@ -25,6 +25,8 @@ EXPECTED = {
         "usr/share/doc/niri-remote-login/upgrade.md", "usr/share/doc/niri-remote-login/acceptance.md",
         "usr/share/doc/niri-remote-login/performance.md",
         "usr/share/doc/niri-remote-login/nvidia-frontend.conf",
+        "etc/niri-rdp/broker.conf", "usr/share/doc/niri-remote-login/fail2ban/niri-rdp.conf",
+        "usr/share/doc/niri-remote-login/fail2ban/niri-rdp.jail.example",
         "usr/share/licenses/niri-remote-login/LICENSE", "usr/share/licenses/niri-remote-login/THIRD-PARTY-NOTICES.txt",
     },
 }

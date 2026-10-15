@@ -1,6 +1,9 @@
 //! Probe the real NVENC path without a display or an RDP listener.
 use ironrdp_server::DesktopSize;
-use niri_rdp_bridge::{bitmap, video::Encoder};
+use niri_rdp_bridge::{
+    bitmap,
+    video::{Encoder, h264_has_idr},
+};
 use std::{
     io::Write,
     time::{Duration, Instant},
@@ -35,6 +38,8 @@ fn main() -> anyhow::Result<()> {
     let mut encoding_time = Duration::ZERO;
     let mut samples = Vec::with_capacity(frames as usize);
     let mut bytes = 0usize;
+    // Only frame 0 is forced; any other IDR comes from the encoder's GOP.
+    let mut idr_frames = Vec::new();
     let mut pixels = vec![0; (width * height * 4) as usize];
     for frame in 0..frames {
         for y in 0..height {
@@ -66,6 +71,9 @@ fn main() -> anyhow::Result<()> {
         encoding_time += elapsed;
         samples.push(elapsed);
         bytes += encoded.len();
+        if h264_has_idr(&encoded) {
+            idr_frames.push(frame);
+        }
         file.write_all(&encoded)?;
     }
     println!(
@@ -77,6 +85,11 @@ fn main() -> anyhow::Result<()> {
         "Synthetic encoding: {:.2} ms/frame ({:.1} frames/s); excludes capture and transport",
         encoding_time.as_secs_f64() * 1000.0 / f64::from(frames),
         f64::from(frames) / encoding_time.as_secs_f64()
+    );
+    println!(
+        "IDR frames: {} at {:?} (only frame 0 is forced)",
+        idr_frames.len(),
+        idr_frames
     );
     samples.sort_unstable();
     println!(

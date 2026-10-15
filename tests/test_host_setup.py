@@ -48,6 +48,28 @@ class HostSetupTests(unittest.TestCase):
         self.assertEqual(frontend["Service"]["NoNewPrivileges"], "yes")
         self.assertEqual(frontend["Service"]["PrivateDevices"], "yes")
 
+    def test_frontend_sandbox_stays_hardened_and_nvidia_drop_in_allows_only_gpu_groups(self):
+        frontend = configparser.ConfigParser(interpolation=None, strict=False)
+        frontend.read(ROOT / "packaging/systemd/niri-rdp-frontend.service")
+        service = frontend["Service"]
+        for key, value in {"CapabilityBoundingSet": "", "DevicePolicy": "closed",
+                           "PrivateIPC": "yes", "RemoveIPC": "yes", "ProtectProc": "invisible",
+                           "ProtectKernelLogs": "yes", "ProtectClock": "yes",
+                           "ProtectHostname": "yes", "RestrictNamespaces": "yes",
+                           "RestrictRealtime": "yes", "LockPersonality": "yes",
+                           "SystemCallArchitectures": "native",
+                           "SystemCallFilter": "@system-service",
+                           "SystemCallErrorNumber": "EPERM"}.items():
+            self.assertEqual(service.get(key), value, key)
+        # The NVIDIA driver reads /proc/driver/nvidia and may map executable memory.
+        self.assertNotIn("MemoryDenyWriteExecute", service)
+        self.assertNotIn("ProcSubset", service)
+        lines = (ROOT / "packaging/nvidia-frontend.conf").read_text().splitlines()
+        self.assertEqual([line.split("=", 1)[1] for line in lines if line.startswith("DeviceAllow=")],
+                         ["char-nvidia rw", "char-nvidiactl rw", "char-nvidia-modeset rw",
+                          "char-nvidia-uvm rw", "char-drm rw"])
+        self.assertIn("PrivateDevices=no", lines)
+
     def test_nvidia_preparation_requests_gpu_control_and_uvm_nodes_on_every_start(self):
         path = ROOT / "packaging/systemd/niri-rdp-nvidia-devices.service"
         helper = configparser.ConfigParser(interpolation=None, strict=False)
@@ -489,7 +511,8 @@ class HostSetupTests(unittest.TestCase):
             environment = dict(os.environ, NIRI_RDP_RUNTIME_DIR=str(directory),
                                HOME=str(directory),
                                DISPLAY=":0", WAYLAND_DISPLAY="local-wayland",
-                               LIBGL_ALWAYS_SOFTWARE="1", GALLIUM_DRIVER="llvmpipe")
+                               LIBGL_ALWAYS_SOFTWARE="1", GALLIUM_DRIVER="llvmpipe",
+                               __EGL_VENDOR_LIBRARY_FILENAMES="/usr/share/glvnd/egl_vendor.d/10_nvidia.json")
             environment.pop("XDG_CONFIG_HOME", None)
             for key in ("XMODIFIERS", "QT_IM_MODULE", "GTK_IM_MODULE"):
                 environment.pop(key, None)
@@ -565,7 +588,8 @@ class HostSetupTests(unittest.TestCase):
                 self.assertEqual(result.returncode, 0, result.stderr)
                 environment = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
                 self.assertEqual(environment["NIRI_RDP_RENDERER"], policy or "auto")
-                for key in ("LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER", "DISPLAY", "WAYLAND_DISPLAY"):
+                for key in ("LIBGL_ALWAYS_SOFTWARE", "GALLIUM_DRIVER", "__EGL_VENDOR_LIBRARY_FILENAMES",
+                            "DISPLAY", "WAYLAND_DISPLAY"):
                     self.assertNotIn(key, environment)
                 self.assertEqual(environment["XDG_RUNTIME_DIR"], environment["NIRI_RDP_RUNTIME_DIR"])
 
@@ -576,6 +600,16 @@ class HostSetupTests(unittest.TestCase):
         self.assertEqual(environment["LIBGL_ALWAYS_SOFTWARE"], "1")
         self.assertEqual(environment["GALLIUM_DRIVER"], "llvmpipe")
         self.assertEqual(environment["NIRI_RDP_RENDERER"], "software")
+
+    def test_worker_software_restricts_egl_to_mesa_vendor(self):
+        # glvnd lets NVIDIA's EGL serve the surfaceless platform unless only
+        # Mesa's vendor file is offered; an inherited vendor list is replaced.
+        result = self.run_worker("software")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        environment = dict(line.split("=", 1) for line in result.stdout.splitlines() if "=" in line)
+        self.assertEqual(environment["__EGL_VENDOR_LIBRARY_FILENAMES"],
+                         "/usr/share/glvnd/egl_vendor.d/50_mesa.json")
+        self.assertNotIn("nvidia", environment["__EGL_VENDOR_LIBRARY_FILENAMES"])
 
     def test_worker_rejects_invalid_policy_without_executing_shell_text(self):
         result = self.run_worker("auto; echo unsafe")

@@ -1,0 +1,111 @@
+From 84701b00bc9bce45dbab42dc29473fba00157ce9 Mon Sep 17 00:00:00 2001
+From: Niri-RDP rebase <niri-rdp@localhost>
+Date: Thu, 15 Oct 2026 13:42:41 +0900
+Subject: [PATCH 08/12] keyboard: keep niri's layout group during virtual
+ keyboard modifier sync
+
+The zwp_virtual_keyboard_v1 modifiers request now applies the depressed,
+latched and locked masks to the shared seat state with niri's current
+effective layout instead of the wire group. A remote desktop client (the
+Niri-RDP bridge) keeps its own XKB state and sends its masks with its own
+group after keys and on RDP Synchronize; it cannot see a layout switched by
+a niri bind (switch-layout), so the wire group would switch the layout back
+on the next key, and would also undo the layout restored after a committed
+Unicode keymap swap. CapsLock/NumLock from the masks still apply.
+
+Also adds the host keyboard defaults test: with no xkb section in the niri
+config, libxkbcommon's XKB_DEFAULT_* variables (exported by the broker from
+the host settings) choose the layout at startup and again after a reload,
+while an explicit layout takes priority.
+
+Niri-RDP feature F8. Tests: tests::remote_input::
+modifier_sync_keeps_the_layout_selected_by_a_niri_bind (next patch) and
+backend::headless::remote_tests::host_keyboard_defaults_survive_startup_and_reload.
+---
+ src/backend/headless.rs          | 43 ++++++++++++++++++++++++++++++++
+ src/handlers/virtual_keyboard.rs |  8 ++++--
+ 2 files changed, 49 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend/headless.rs b/src/backend/headless.rs
+index 518f0aab..e5d5fc5d 100644
+--- a/src/backend/headless.rs
++++ b/src/backend/headless.rs
+@@ -754,4 +754,47 @@ mod remote_tests {
+         assert!(err.to_string().contains("no usable hardware"), "{err}");
+         assert!(headless.with_primary_renderer(|_| ()).is_none());
+     }
++
++    #[test]
++    fn host_keyboard_defaults_survive_startup_and_reload() {
++        // Without an xkb section in the niri config, libxkbcommon's XKB_DEFAULT_* variables
++        // (exported by the niri-rdp broker from the host settings) choose the layout.
++        if rerun_in_child(
++            "backend::headless::remote_tests::host_keyboard_defaults_survive_startup_and_reload",
++            &[
++                ("XKB_DEFAULT_RULES", "evdev"),
++                ("XKB_DEFAULT_MODEL", "jp106"),
++                ("XKB_DEFAULT_LAYOUT", "jp"),
++                ("XKB_DEFAULT_VARIANT", ""),
++                ("XKB_DEFAULT_OPTIONS", ""),
++            ],
++        ) {
++            return;
++        }
++
++        fn text(state: &mut State, evdev: u32) -> String {
++            let keyboard = state.niri.seat.get_keyboard().unwrap();
++            keyboard.with_xkb_state(state, |context| {
++                let xkb = context.xkb().lock().unwrap();
++                // SAFETY: only owned text leaves the locked XKB context.
++                unsafe { xkb.state() }.key_get_utf8((evdev + 8).into())
++            })
++        }
++
++        let (_event_loop, state) = headless_state(false);
++        let mut state = state.unwrap();
++        assert_eq!(text(&mut state, 26), "@");
++        assert_eq!(text(&mut state, 89), "\\");
++        assert_eq!(text(&mut state, 124), "\\");
++
++        // An explicit desktop layout takes priority over the host fallback.
++        let mut config = Config::default();
++        config.input.keyboard.xkb.layout = "se".into();
++        state.reload_config(Ok(config));
++        assert_eq!(text(&mut state, 26), "å");
++
++        state.reload_config(Ok(Config::default()));
++        assert_eq!(text(&mut state, 26), "@");
++        assert_eq!(text(&mut state, 124), "\\");
++    }
+ }
+diff --git a/src/handlers/virtual_keyboard.rs b/src/handlers/virtual_keyboard.rs
+index 587a426d..08275286 100644
+--- a/src/handlers/virtual_keyboard.rs
++++ b/src/handlers/virtual_keyboard.rs
+@@ -11,7 +11,7 @@
+ //! - If a client grabs the keyboard, then forwards events through a virtual keyboard (e.g., fcitx),
+ //!   they are then forwarded bypassing the grab to avoid loops (sway special-cases this too).
+ //! - Modifiers set through the `modifiers` request apply to the shared xkb state (see
+-//!   `DeviceRemoved`).
++//!   `DeviceRemoved`), keeping niri's current layout group.
+ 
+ use std::sync::Arc;
+ 
+@@ -54,12 +54,16 @@ impl VirtualKeyboardHandler for State {
+                 mods_depressed,
+                 mods_latched,
+                 mods_locked,
+-                group,
++                group: _,
+             }) => {
+                 self.activate_virtual_keyboard_keymap(&device);
+ 
++                // Keep niri's layout instead of the wire group: a remote desktop client (e.g.
++                // niri-rdp) keeps its own XKB state, which cannot see a layout switched by a niri
++                // bind, so its next modifiers sync would switch the layout back.
+                 let keyboard = self.niri.seat.get_keyboard().unwrap();
+                 keyboard.with_xkb_state(self, |mut context| {
++                    let group = context.xkb().lock().unwrap().active_layout().0;
+                     context.set_modifier_mask(mods_depressed, mods_latched, mods_locked, group);
+                 });
+             }

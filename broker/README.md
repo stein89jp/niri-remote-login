@@ -81,42 +81,85 @@ runs the usual configured desktop entries. An explicitly configured Fcitx or IBu
 starts before user applications, with private writable profile/transport state.
 The remote display is never imported into the shared user manager.
 
-## Wire contract v1
+The worker also starts the session's private audio helpers as the account.
+`session-audio` owns the private PipeWire graph and serves playback on
+`audio-0`. `session-microphone` is a client of that graph: it serves `audio-in-0`
+and runs the **Remote microphone (RDP)** source (`niri-rdp-microphone`, the
+default source). It has its own finite restart budget (two worker restarts, five
+`pw-cat` attempts, reset after ten healthy minutes), separate from playback's;
+nothing waits for it, and its failure never delays or ends the desktop.
+
+## Wire contract v2
 
 Use an AF_UNIX SOCK_STREAM socket. Send exactly:
 
 | Field | Size | Value |
 |---|---:|---|
-| Magic | 4 bytes | `NRB1` |
+| Magic | 4 bytes | `NRB2` |
 | Username length | 2 bytes | Unsigned big endian, 1..64 |
 | Password length | 2 bytes | Unsigned big endian, 1..512 |
-| Username | Length bytes | Linux ASCII account name, no NUL |
+| Address family | 1 byte | 0 unknown, 4 IPv4, 6 IPv6 |
+| Client address | 0, 4 or 16 bytes | RDP client IP in network order; IPv4-mapped IPv6 is sent as IPv4 |
+| Username | Length bytes | Linux ASCII account name (`[A-Za-z0-9_.-]`), no NUL |
 | Password | Length bytes | UTF-8 password bytes, no NUL |
 
-The response is 5 bytes: `NRB1` and one status byte. Status 0 carries **two ordered**
-SCM_RIGHTS descriptors: a Wayland connection and a raw stereo 48 kHz S16LE PCM
-stream from the private session's sink monitor. The frontend also accepts the
-legacy single-Wayland-FD reply for transport fixtures, with audio unavailable.
-The PCM socket waits for one ASCII `A` byte before starting capture; the frontend
-sends it after sound-format negotiation and authenticated desktop binding.
-Status 1 means generic
-authentication/account/policy rejection; 2 means backend/session startup failed;
-3 means malformed/unauthorized request or connection capacity exceeded. No
-human-readable credentials/errors are returned. The frontend must use
+The broker sets the address as `PAM_RHOST` (left unset when unknown) and
+records it in its journal audit entries. Version 1 (`NRB1`) requests are
+rejected: the frontend and broker are upgraded together.
+
+The response is 5 bytes: `NRB2` and one status byte. Status 0 carries **one to
+three positional** SCM_RIGHTS descriptors, in this order:
+
+1. a Wayland connection to the desktop (always present);
+2. a raw stereo 48 kHz S16LE PCM playback stream from the private session's
+   sink monitor (`audio-0`);
+3. the remote microphone socket (`audio-in-0`, NRM1 framing), served by
+   `session-microphone`.
+
+Position alone identifies each descriptor. The microphone is sent only together
+with playback, so the reply is `[desktop, audio, microphone]`,
+`[desktop, audio]` or `[desktop]`; the 5-byte header and the `NRB2` magic are
+unchanged. Both audio descriptors are ancillary: an unavailable helper never
+rejects an authenticated login or resume, and a missing microphone never removes
+playback. Each reconnect receives fresh descriptors. The frontend rejects four or
+more descriptors. A single-descriptor reply leaves audio unavailable (also used
+by transport fixtures). The PCM socket waits for one ASCII `A` byte before
+starting capture; the frontend sends it after sound-format negotiation and
+authenticated desktop binding. The microphone socket starts with an NRM1 `HELLO`
+from the frontend; see the [bridge microphone contract](../bridge/README.md#microphone).
+
+An older frontend rejects the three-descriptor reply, so the frontend and broker
+must be upgraded together. The combined package does this; with split packages,
+install both at once and restart both services.
+
+| Status | Meaning |
+|---:|---|
+| 0 | Desktop opened (descriptors attached) |
+| 1 | Generic authentication/account/policy rejection |
+| 2 | Session startup failed, or the account's desktop is starting or ending: try again |
+| 3 | Malformed/unauthorized request or connection capacity exceeded |
+| 4 | The account's desktop is attached to another connection |
+| 5 | The account has a local graphical session, including one still closing |
+
+Statuses 2, 4 and 5 are sent only after PAM and the `niri-rdp-users` check
+accepted the account, so they reveal nothing to a password guesser; every
+earlier failure, including unknown users and non-members, is status 1.
+No human-readable credentials/errors are returned. The frontend must use
 `recvmsg`, preserve received FDs while finishing a fragmented 5-byte header,
 validate ancillary metadata, and reject missing/excess descriptors. The broker
-connects to the compositor and PCM socket as its target UID before passing the FDs; the
+connects to the compositor, PCM and microphone sockets as its target UID before passing the FDs; the
 frontend never connects to the user's local Wayland socket or filesystem.
 
 Keep the control stream open while attached to the desktop. EOF detaches the
-frontend and retains the desktop for a 45-second grace window measured from
+frontend and retains the desktop for a grace window (`grace_seconds` in
+`/etc/niri-rdp/broker.conf`, default 45 seconds) measured from
 broker-observed detachment. If no authorized reconnect completes before expiry,
 the holder fully logs out and cleans up the desktop. A subsequent login starts
-a fresh desktop after cleanup. An ordinary v1 login within the grace window with
+a fresh desktop after cleanup. An ordinary login within the grace window with
 the same account performs fresh authentication and authorization, then receives
 a new Wayland connection to that desktop. No client resume token or reconnect
 cookie bypasses authentication. Unexpected additional bytes detach the frontend
-and start the same 45-second grace window.
+and start the same grace window.
 Compositor exit, explicit compositor logout, or broker shutdown tears down the
 desktop. Close all frontend-held descriptors when detaching.
 

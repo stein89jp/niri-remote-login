@@ -46,10 +46,64 @@ fn monotonic_ns() -> u64 {
     value.tv_sec as u64 * 1_000_000_000 + value.tv_nsec as u64
 }
 
+/// Time source for capture, pacing, expiry and confirmation handling.
+/// Production always uses `SystemClock`; tests substitute a manual clock so
+/// timing assertions do not depend on scheduler latency.
+trait Clock: Send + Sync {
+    fn now(&self) -> Instant;
+    /// CLOCK_MONOTONIC nanoseconds, comparable with the capture helper's.
+    fn monotonic_ns(&self) -> u64;
+    /// poll(2) timeout in milliseconds that expires at `deadline`.
+    fn poll_timeout(&self, deadline: Instant) -> i32;
+}
+
+struct SystemClock;
+impl Clock for SystemClock {
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+    fn monotonic_ns(&self) -> u64 {
+        monotonic_ns()
+    }
+    fn poll_timeout(&self, deadline: Instant) -> i32 {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        // Round upward: sub-millisecond deadlines must not spin at zero.
+        remaining
+            .as_millis()
+            .saturating_add(u128::from(
+                !remaining.subsec_nanos().is_multiple_of(1_000_000),
+            ))
+            .min(i32::MAX as u128) as i32
+    }
+}
+
+#[derive(Clone)]
+struct AudioClock(Arc<dyn Clock>);
+impl Default for AudioClock {
+    fn default() -> Self {
+        Self(Arc::new(SystemClock))
+    }
+}
+impl std::ops::Deref for AudioClock {
+    type Target = dyn Clock;
+    fn deref(&self) -> &Self::Target {
+        &*self.0
+    }
+}
+
+/// Test-only record of the worker blocking with no pending input.
+#[cfg(test)]
+#[derive(Default)]
+struct Quiescence {
+    requested: u64,
+    /// Settle request observed, and poll timeout, of the current idle wait.
+    idle: Option<(u64, i32)>,
+}
+
 struct Wake {
     fd: OwnedFd,
     #[cfg(test)]
-    waits: std::sync::atomic::AtomicUsize,
+    quiescence: (Mutex<Quiescence>, std::sync::Condvar),
 }
 impl Default for Wake {
     fn default() -> Self {
@@ -58,8 +112,29 @@ impl Default for Wake {
         Self {
             fd: unsafe { OwnedFd::from_raw_fd(fd) },
             #[cfg(test)]
-            waits: std::sync::atomic::AtomicUsize::new(0),
+            quiescence: Default::default(),
         }
+    }
+}
+#[cfg(test)]
+impl Wake {
+    /// Wait until the worker has processed every input and wake supplied
+    /// before this call and blocks again. Returns that wait's poll timeout.
+    fn settle(&self) -> i32 {
+        let (state, changed) = &self.quiescence;
+        let mut state = state.lock().unwrap();
+        state.requested += 1;
+        let token = state.requested;
+        // Notify under the lock: a worker that observes this token also
+        // observes the wake, so it cannot report idle before consuming it.
+        self.notify();
+        let (state, wait) = changed
+            .wait_timeout_while(state, Duration::from_secs(20), |state| {
+                !state.idle.is_some_and(|(seen, _)| seen >= token)
+            })
+            .unwrap();
+        assert!(!wait.timed_out(), "audio worker did not become idle");
+        state.idle.unwrap().1
     }
 }
 impl Wake {
@@ -69,9 +144,12 @@ impl Wake {
         // this descriptor, and its owner remains live throughout the syscall.
         unsafe { libc::write(self.fd.as_raw_fd(), (&value as *const u64).cast(), 8) };
     }
-    fn wait(&self, socket: Option<&UnixStream>, deadline: Option<Instant>) -> bool {
-        #[cfg(test)]
-        self.waits.fetch_add(1, Ordering::Relaxed);
+    fn wait(
+        &self,
+        socket: Option<&UnixStream>,
+        deadline: Option<Instant>,
+        clock: &dyn Clock,
+    ) -> bool {
         let mut descriptors = [
             libc::pollfd {
                 fd: self.fd.as_raw_fd(),
@@ -84,15 +162,22 @@ impl Wake {
                 revents: 0,
             },
         ];
-        let timeout = deadline.map_or(-1, |at| {
-            let remaining = at.saturating_duration_since(Instant::now());
-            // Round upward: sub-millisecond deadlines must not spin at zero.
-            remaining
-                .as_millis()
-                .saturating_add(u128::from(remaining.subsec_nanos() % 1_000_000 != 0))
-                .min(i32::MAX as u128) as i32
-        });
+        let timeout = deadline.map_or(-1, |at| clock.poll_timeout(at));
+        #[cfg(test)]
+        if timeout != 0 {
+            let (state, changed) = &self.quiescence;
+            let mut state = state.lock().unwrap();
+            let mut ready = descriptors;
+            if unsafe { libc::poll(ready.as_mut_ptr(), 2, 0) } == 0 {
+                state.idle = Some((state.requested, timeout));
+                changed.notify_all();
+            }
+        }
         let result = unsafe { libc::poll(descriptors.as_mut_ptr(), 2, timeout) };
+        #[cfg(test)]
+        {
+            self.quiescence.0.lock().unwrap().idle = None;
+        }
         if result < 0 {
             return std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted;
         }
@@ -123,9 +208,10 @@ struct CaptureReader {
     discontinuity: bool,
     relay_age: Duration,
     socket_age: Duration,
+    clock: AudioClock,
 }
 impl CaptureReader {
-    fn new(socket: CaptureSocket) -> std::io::Result<Self> {
+    fn new(socket: CaptureSocket, clock: AudioClock) -> std::io::Result<Self> {
         let mut this = Self {
             socket,
             header: [0; CAPTURE_HEADER_BYTES],
@@ -138,6 +224,7 @@ impl CaptureReader {
             discontinuity: false,
             relay_age: Duration::ZERO,
             socket_age: Duration::ZERO,
+            clock,
         };
         this.socket.stream.write_all(if this.socket.framed {
             CAPTURE_MAGIC
@@ -153,7 +240,7 @@ impl CaptureReader {
                 .socket
                 .stream
                 .read(destination)
-                .map(|length| (length, Instant::now()));
+                .map(|length| (length, self.clock.now()));
         }
         while self.header_filled < CAPTURE_HEADER_BYTES {
             let n = self
@@ -161,7 +248,7 @@ impl CaptureReader {
                 .stream
                 .read(&mut self.header[self.header_filled..])?;
             if n == 0 {
-                return Ok((0, Instant::now()));
+                return Ok((0, self.clock.now()));
             }
             self.header_filled += n;
             if self.header_filled == CAPTURE_HEADER_BYTES {
@@ -172,7 +259,7 @@ impl CaptureReader {
                     || u32::from_be_bytes(self.header[4..8].try_into().unwrap()) as usize
                         != BLOCK_BYTES
                     || self.source_ns > relay_ns
-                    || relay_ns > monotonic_ns()
+                    || relay_ns > self.clock.monotonic_ns()
                 {
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::InvalidData,
@@ -184,7 +271,8 @@ impl CaptureReader {
                     .is_some_and(|expected| expected != sequence);
                 self.expected_sequence = Some(sequence.wrapping_add(1));
                 self.relay_age = Duration::from_nanos(relay_ns - self.source_ns);
-                self.socket_age = Duration::from_nanos(monotonic_ns().saturating_sub(relay_ns));
+                self.socket_age =
+                    Duration::from_nanos(self.clock.monotonic_ns().saturating_sub(relay_ns));
             }
         }
         while self.payload_filled < BLOCK_BYTES {
@@ -193,7 +281,7 @@ impl CaptureReader {
                 .stream
                 .read(&mut self.payload[self.payload_filled..])?;
             if n == 0 {
-                return Ok((0, Instant::now()));
+                return Ok((0, self.clock.now()));
             }
             self.payload_filled += n;
         }
@@ -201,8 +289,8 @@ impl CaptureReader {
         destination[..length]
             .copy_from_slice(&self.payload[self.payload_offset..self.payload_offset + length]);
         self.payload_offset += length;
-        let now = Instant::now();
-        let age = Duration::from_nanos(monotonic_ns().saturating_sub(self.source_ns));
+        let now = self.clock.now();
+        let age = Duration::from_nanos(self.clock.monotonic_ns().saturating_sub(self.source_ns));
         let captured_at = now.checked_sub(age).unwrap_or(now - CAPTURE_BUDGET * 2);
         if self.payload_offset == BLOCK_BYTES {
             self.header_filled = 0;
@@ -659,6 +747,7 @@ pub struct Audio {
     socket: Arc<Mutex<Option<CaptureSocket>>>,
     wake: Arc<Wake>,
     video: Option<crate::video::Video>,
+    clock: AudioClock,
 }
 impl std::fmt::Debug for Audio {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -819,6 +908,12 @@ impl RdpsndServerHandler for Backend {
             format.format().n_avg_bytes_per_sec * 8 / 1000,
             block_duration.as_secs_f64() * 1000.0,
         );
+        // Read-only record for the disconnect summary; selects nothing.
+        crate::performance::connection().set_audio_codec(match &encoder {
+            Codec::Aac(_) => crate::performance::AudioCodec::Aac,
+            Codec::Adpcm(_) => crate::performance::AudioCodec::Adpcm,
+            Codec::Pcm => crate::performance::AudioCodec::Pcm,
+        });
         let audio = self.audio.clone();
         let sender = self.sender.clone();
         let stopped = self.stopped.clone();
@@ -831,6 +926,7 @@ impl RdpsndServerHandler for Backend {
                     let _feedback_guard = FeedbackGuard(feedback.clone());
                     // Negotiation may precede submission of credentials on the login form.
                     let wake = &audio.wake;
+                    let clock = audio.clock.clone();
                     let socket = loop {
                         if stopped.load(Ordering::Acquire) {
                             return;
@@ -838,16 +934,16 @@ impl RdpsndServerHandler for Backend {
                         if let Some(socket) = audio.socket.lock().unwrap().take() {
                             break socket;
                         }
-                        if !wake.wait(None, None) { return; }
+                        if !wake.wait(None, None, &*clock) { return; }
                     };
-                    let mut socket = match CaptureReader::new(socket) {
+                    let mut socket = match CaptureReader::new(socket, clock.clone()) {
                         Ok(socket) => socket,
                         Err(error) => {
                             eprintln!("RDP audio capture unavailable: {error}; desktop continues, reconnect for a fresh descriptor");
                             return;
                         }
                     };
-                    let start = Instant::now();
+                    let start = clock.now();
                     let mut block = vec![0u8; block_bytes];
                     let mut captured = VecDeque::new();
                     let mut filled = 0;
@@ -888,7 +984,7 @@ impl RdpsndServerHandler for Backend {
                                     filled += n;
                                     block_at = Some(if socket.socket.framed { block_at.map_or(at, |old| old.min(at)) } else { at });
                                     telemetry.count("capture_reads", 1);
-                                    telemetry.sample("monitor_source_age", Instant::now().saturating_duration_since(at));
+                                    telemetry.sample("monitor_source_age", clock.now().saturating_duration_since(at));
                                     telemetry.sample("relay_age", socket.relay_age);
                                     telemetry.sample("socket_age", socket.socket_age);
                                 },
@@ -917,7 +1013,7 @@ impl RdpsndServerHandler for Backend {
                         if !drained {
                             continue;
                         }
-                        let now = Instant::now();
+                        let now = clock.now();
                         let mut queue = pending.lock().unwrap();
                         let pressure = queue.check_pressure(now);
                         let transport_pressure = queue.receipt_age(now) > queue.receipt_budget();
@@ -1006,6 +1102,7 @@ impl RdpsndServerHandler for Backend {
                             {
                                 break;
                             }
+                            telemetry.count("waves_sent", 1);
                         }
                         // Capture readiness, exact pacing/expiry, feedback, and
                         // stop are the only wake sources. No fixed idle polling.
@@ -1022,7 +1119,7 @@ impl RdpsndServerHandler for Backend {
                         }
                         drop(queue);
                         telemetry.report("audio", now);
-                        if !wake.wait(Some(&socket.socket.stream), deadline) { break; }
+                        if !wake.wait(Some(&socket.socket.stream), deadline, &*clock) { break; }
                         telemetry.count("readiness_wakes", 1);
                     }
                 })
@@ -1034,7 +1131,7 @@ impl RdpsndServerHandler for Backend {
         self.pending
             .lock()
             .unwrap()
-            .confirm(block_no, timestamp, Instant::now());
+            .confirm(block_no, timestamp, self.audio.clock.now());
         self.audio.wake.notify();
     }
     fn stop(&mut self) {
@@ -1063,13 +1160,124 @@ mod tests {
     use ironrdp_svc::SvcProcessor;
     use std::io::Write;
 
-    fn negotiate(
-        audio: &Audio,
-        formats: Vec<AudioFormat>,
-    ) -> (
-        RdpsndServer,
-        tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
-    ) {
+    type Events = tokio::sync::mpsc::UnboundedReceiver<ServerEvent>;
+
+    /// Virtual time for the capture worker. It moves only when a test
+    /// advances it, so scheduler load cannot expire capture or skip pacing.
+    struct ManualClock {
+        start: Instant,
+        start_ns: u64,
+        elapsed: Mutex<Duration>,
+    }
+    impl ManualClock {
+        fn new() -> Self {
+            Self {
+                start: Instant::now(),
+                start_ns: monotonic_ns(),
+                elapsed: Mutex::new(Duration::ZERO),
+            }
+        }
+    }
+    impl Clock for ManualClock {
+        fn now(&self) -> Instant {
+            self.start + *self.elapsed.lock().unwrap()
+        }
+        fn monotonic_ns(&self) -> u64 {
+            self.start_ns + self.elapsed.lock().unwrap().as_nanos() as u64
+        }
+        fn poll_timeout(&self, deadline: Instant) -> i32 {
+            // Future deadlines wait for the test to advance time (and wake).
+            if deadline <= self.now() { 0 } else { -1 }
+        }
+    }
+
+    /// Session audio driven by a manual clock. Every step lets the worker
+    /// finish all due work before time moves again.
+    struct Rig {
+        audio: Audio,
+        clock: Arc<ManualClock>,
+    }
+    impl Rig {
+        fn new() -> Self {
+            let clock = Arc::new(ManualClock::new());
+            let audio = Audio {
+                clock: AudioClock(clock.clone()),
+                ..Audio::default()
+            };
+            Self { audio, clock }
+        }
+        fn settle(&self) {
+            self.audio.wake.settle();
+        }
+        fn advance(&self, duration: Duration) {
+            self.advance_with(duration, || {});
+        }
+        /// Advance in 1 ms steps, running `each` after the worker settles at
+        /// the current time and again after every step.
+        fn advance_with(&self, duration: Duration, mut each: impl FnMut()) {
+            self.settle();
+            each();
+            let mut remaining = duration;
+            while !remaining.is_zero() {
+                let step = remaining.min(Duration::from_millis(1));
+                *self.clock.elapsed.lock().unwrap() += step;
+                remaining -= step;
+                self.settle();
+                each();
+            }
+        }
+        /// Attach unframed test capture and return its source end once the
+        /// worker has sent its readiness byte.
+        fn attach_pcm(&self) -> UnixStream {
+            let (mut source, capture) = UnixStream::pair().unwrap();
+            source
+                .set_read_timeout(Some(Duration::from_secs(10)))
+                .unwrap();
+            self.audio.attach_test_pcm(capture);
+            let mut ready = [0];
+            source.read_exact(&mut ready).unwrap();
+            assert_eq!(&ready, b"A");
+            source
+        }
+        /// The next wave, allowing at most one virtual second of pacing.
+        fn take_wave(&self, receiver: &mut Events) -> (Vec<u8>, u32) {
+            self.settle();
+            for _ in 0..1000 {
+                if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                    receiver.try_recv()
+                {
+                    return (data, timestamp);
+                }
+                self.advance(Duration::from_millis(1));
+            }
+            panic!("expected an audio wave within one virtual second");
+        }
+    }
+
+    fn confirm(server: &mut RdpsndServer, block_no: u8, timestamp: u16) {
+        server
+            .process(
+                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
+                    block_no,
+                    timestamp,
+                }))
+                .unwrap(),
+            )
+            .unwrap();
+    }
+
+    /// Dispatch a wave through the RDPSND server and return its Wave2 PDU.
+    fn wave2(server: &mut RdpsndServer, data: Vec<u8>, timestamp: u32) -> Wave2Pdu<'static> {
+        let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
+        let ServerAudioOutputPdu::Wave2(wave) =
+            decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
+        else {
+            panic!("expected Wave2");
+        };
+        wave
+    }
+
+    fn negotiate(audio: &Audio, formats: Vec<AudioFormat>) -> (RdpsndServer, Events) {
         negotiate_version(audio, formats, Version::V8)
     }
 
@@ -1077,10 +1285,7 @@ mod tests {
         audio: &Audio,
         formats: Vec<AudioFormat>,
         version: Version,
-    ) -> (
-        RdpsndServer,
-        tokio::sync::mpsc::UnboundedReceiver<ServerEvent>,
-    ) {
+    ) -> (RdpsndServer, Events) {
         let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut factory = audio.factory();
         factory.set_sender(sender);
@@ -1113,33 +1318,37 @@ mod tests {
         pcm_format()
     }
 
-    fn private_frame(sequence: u64, source_ns: u64, pcm: &[u8]) -> Vec<u8> {
+    fn private_frame(clock: &dyn Clock, sequence: u64, source_ns: u64, pcm: &[u8]) -> Vec<u8> {
         assert_eq!(pcm.len(), BLOCK_BYTES);
         let mut frame = CAPTURE_MAGIC.to_vec();
         frame.extend_from_slice(&(BLOCK_BYTES as u32).to_be_bytes());
         frame.extend_from_slice(&sequence.to_be_bytes());
         frame.extend_from_slice(&source_ns.to_be_bytes());
-        frame.extend_from_slice(&monotonic_ns().to_be_bytes());
+        frame.extend_from_slice(&clock.monotonic_ns().to_be_bytes());
         frame.extend_from_slice(pcm);
         frame
     }
 
     #[test]
     fn private_capture_metadata_survives_fragmentation_and_sequence_wrap() {
+        let clock = Arc::new(ManualClock::new());
         let (mut source, capture) = UnixStream::pair().unwrap();
-        let mut reader = CaptureReader::new(CaptureSocket {
-            stream: capture,
-            framed: true,
-        })
+        let mut reader = CaptureReader::new(
+            CaptureSocket {
+                stream: capture,
+                framed: true,
+            },
+            AudioClock(clock.clone()),
+        )
         .unwrap();
         let mut hello = [0; 4];
         source.read_exact(&mut hello).unwrap();
         assert_eq!(&hello, CAPTURE_MAGIC);
-        let at = monotonic_ns() - 35_000_000;
+        let at = clock.monotonic_ns() - 35_000_000;
         let pcm = (0..BLOCK_BYTES)
             .map(|index| index as u8)
             .collect::<Vec<_>>();
-        let frame = private_frame(u64::MAX, at, &pcm);
+        let frame = private_frame(&*clock, u64::MAX, at, &pcm);
         source.write_all(&frame[..7]).unwrap();
         let mut data = [0; BLOCK_BYTES];
         assert_eq!(
@@ -1159,15 +1368,19 @@ mod tests {
         let (length, observed) = reader.read(&mut data).unwrap();
         assert_eq!(length, BLOCK_BYTES);
         assert_eq!(data.as_slice(), pcm);
-        assert!(Instant::now().duration_since(observed) >= Duration::from_millis(35));
+        assert_eq!(
+            clock.now().duration_since(observed),
+            Duration::from_millis(35),
+            "capture time is the helper's source time, not receipt time"
+        );
         assert!(!reader.discontinuity);
         source
-            .write_all(&private_frame(0, monotonic_ns(), &pcm))
+            .write_all(&private_frame(&*clock, 0, clock.monotonic_ns(), &pcm))
             .unwrap();
         reader.read(&mut data).unwrap();
         assert!(!reader.discontinuity, "sequence wrap is healthy continuity");
         source
-            .write_all(&private_frame(5, monotonic_ns(), &pcm))
+            .write_all(&private_frame(&*clock, 5, clock.monotonic_ns(), &pcm))
             .unwrap();
         reader.read(&mut data).unwrap();
         assert!(
@@ -1180,12 +1393,16 @@ mod tests {
     fn malformed_private_metadata_cannot_be_decoded_as_pcm() {
         for field in [0, 4, 16] {
             let (mut source, capture) = UnixStream::pair().unwrap();
-            let mut reader = CaptureReader::new(CaptureSocket {
-                stream: capture,
-                framed: true,
-            })
+            let mut reader = CaptureReader::new(
+                CaptureSocket {
+                    stream: capture,
+                    framed: true,
+                },
+                AudioClock::default(),
+            )
             .unwrap();
-            let mut frame = private_frame(0, monotonic_ns(), &vec![0x33; BLOCK_BYTES]);
+            let mut frame =
+                private_frame(&SystemClock, 0, monotonic_ns(), &vec![0x33; BLOCK_BYTES]);
             frame[field..field + 4].fill(0xff);
             source.write_all(&frame).unwrap();
             let mut destination = [0; BLOCK_BYTES];
@@ -1199,94 +1416,86 @@ mod tests {
 
     #[test]
     fn whole_pipeline_expiry_discards_pcm_received_after_frontend_stall() {
-        let audio = Audio::default();
-        let (server, mut receiver) = negotiate(&audio, vec![pcm()]);
+        let rig = Rig::new();
+        let (server, mut receiver) = negotiate(&rig.audio, vec![pcm()]);
         let (mut source, capture) = UnixStream::pair().unwrap();
         source
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let stale = vec![0x22; BLOCK_BYTES];
         source
-            .write_all(&private_frame(0, monotonic_ns() - 100_000_000, &stale))
+            .write_all(&private_frame(
+                &*rig.clock,
+                0,
+                rig.clock.monotonic_ns() - 100_000_000,
+                &stale,
+            ))
             .unwrap();
-        audio.attach(Some(capture));
+        rig.audio.attach(Some(capture));
         source.read_exact(&mut [0; 4]).unwrap();
-        thread::sleep(Duration::from_millis(30));
+        rig.advance(Duration::from_millis(30));
         assert!(
             receiver.is_empty(),
             "receipt time must not renew stale source samples"
         );
         let fresh = vec![0x55; BLOCK_BYTES];
         source
-            .write_all(&private_frame(1, monotonic_ns(), &fresh))
+            .write_all(&private_frame(
+                &*rig.clock,
+                1,
+                rig.clock.monotonic_ns(),
+                &fresh,
+            ))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
-                receiver.try_recv()
-            {
-                assert_eq!(data, fresh);
-                assert_eq!(timestamp, 0);
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(1));
-        }
+        assert_eq!(rig.take_wave(&mut receiver), (fresh, 0));
         drop(server);
     }
 
     #[test]
     fn worker_stop_interrupts_indefinite_capture_and_attachment_waits() {
+        // Production clock: once idle, the worker must block without any
+        // timeout (no polling), and stopping must still interrupt that wait.
         for attach in [false, true] {
             let audio = Audio::default();
             let (server, _) = negotiate(&audio, vec![pcm()]);
-            let (mut source, capture) = UnixStream::pair().unwrap();
+            let mut source = None;
             if attach {
-                source
-                    .set_read_timeout(Some(Duration::from_secs(1)))
+                let (mut stream, capture) = UnixStream::pair().unwrap();
+                stream
+                    .set_read_timeout(Some(Duration::from_secs(10)))
                     .unwrap();
                 audio.attach(Some(capture));
-                source.read_exact(&mut [0; 4]).unwrap();
+                stream.read_exact(&mut [0; 4]).unwrap();
+                source = Some(stream);
             }
-            thread::sleep(Duration::from_millis(30));
-            let before = audio.wake.waits.load(Ordering::Relaxed);
-            thread::sleep(Duration::from_millis(150));
-            let idle_wakes = audio.wake.waits.load(Ordering::Relaxed) - before;
             assert_eq!(
-                idle_wakes, 0,
+                audio.wake.settle(),
+                -1,
                 "quiet capture and unauthenticated waits must not poll"
             );
-            let now = Instant::now();
+            let started = Instant::now();
             drop(server);
-            assert!(now.elapsed() < Duration::from_millis(200));
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "stop must interrupt an indefinite wait"
+            );
+            if let Some(mut source) = source {
+                assert_eq!(source.read(&mut [0]).unwrap(), 0);
+            }
         }
     }
 
     #[test]
     fn aac_fallback_uses_raw_packets_and_immediate_timestamps() {
         for version in [Version::V6, Version::V8] {
-            let audio = Audio::default();
+            let rig = Rig::new();
             let adpcm = Adpcm::new().unwrap().format.clone();
             let (mut server, mut receiver) =
-                negotiate_version(&audio, vec![adpcm, aac_format()], version);
+                negotiate_version(&rig.audio, vec![adpcm, aac_format()], version);
             assert!(server.is_ready());
-            let (mut source, capture) = UnixStream::pair().unwrap();
-            source
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            audio.attach_test_pcm(capture);
-            source.read_exact(&mut [0]).unwrap();
+            let mut source = rig.attach_pcm();
             source.write_all(&vec![0x35; BLOCK_BYTES * 3]).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let (data, timestamp) = loop {
-                if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
-                    receiver.try_recv()
-                {
-                    break (data, timestamp);
-                }
-                assert!(Instant::now() < deadline, "AAC startup must remain bounded");
-                thread::sleep(Duration::from_millis(1));
-            };
+            let (data, timestamp) = rig.take_wave(&mut receiver);
             assert!(
                 data.len() < BLOCK_BYTES / 3,
                 "AAC must reserve audio bandwidth"
@@ -1322,87 +1531,60 @@ mod tests {
 
     #[test]
     fn digital_silence_stops_idle_traffic_and_resumes_current_pcm() {
-        let audio = Audio::default();
-        let (mut server, mut receiver) = negotiate(&audio, vec![pcm()]);
-        let (mut source, capture) = UnixStream::pair().unwrap();
-        source
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        audio.attach_test_pcm(capture);
-        source.read_exact(&mut [0]).unwrap();
+        let rig = Rig::new();
+        let (mut server, mut receiver) = negotiate(&rig.audio, vec![pcm()]);
+        let mut source = rig.attach_pcm();
         let mut sent = 0usize;
         for _ in 0..SILENCE_TAIL_BLOCKS + 5 {
             source.write_all(&vec![0; BLOCK_BYTES]).unwrap();
-            thread::sleep(Duration::from_millis(25));
+            rig.advance(Duration::from_millis(25));
             while let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
                 receiver.try_recv()
             {
                 assert_eq!(data, vec![0; BLOCK_BYTES]);
-                let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
-                let ServerAudioOutputPdu::Wave2(wave) =
-                    decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
-                else {
-                    panic!("expected wave2");
-                };
-                server
-                    .process(
-                        &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                            block_no: wave.block_no,
-                            timestamp: 0,
-                        }))
-                        .unwrap(),
-                    )
-                    .unwrap();
+                let wave = wave2(&mut server, data, timestamp);
+                confirm(&mut server, wave.block_no, 0);
                 sent += 1;
             }
         }
         assert_eq!(sent, SILENCE_TAIL_BLOCKS);
+        rig.settle();
         assert!(
             receiver.is_empty(),
             "idle silence must not fill client playback buffers"
         );
         source.write_all(&vec![0x33; BLOCK_BYTES]).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) = receiver.try_recv()
-            {
-                assert_eq!(data, vec![0x33; BLOCK_BYTES]);
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "current sound must resume after silence"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
+        assert_eq!(
+            rig.take_wave(&mut receiver).0,
+            vec![0x33; BLOCK_BYTES],
+            "current sound must resume after silence"
+        );
         drop(server);
     }
 
     #[test]
     fn aac_transport_recovery_discards_codec_lookahead_before_fresh_sound() {
-        let audio = Audio::default();
-        let (mut server, mut receiver) = negotiate(&audio, vec![aac_format()]);
-        let (mut source, capture) = UnixStream::pair().unwrap();
-        source
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        audio.attach_test_pcm(capture);
-        source.read_exact(&mut [0]).unwrap();
+        let rig = Rig::new();
+        let (mut server, mut receiver) = negotiate(&rig.audio, vec![aac_format()]);
+        let mut source = rig.attach_pcm();
         // Withhold receipt credit until the transport queue is full. Continue
         // capturing so recovery must discard both old PCM and AAC lookahead.
         for _ in 0..12 {
             source.write_all(&vec![0x11; BLOCK_BYTES]).unwrap();
-            thread::sleep(Duration::from_millis(25));
+            rig.advance(Duration::from_millis(25));
         }
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while receiver.len() < MAX_PENDING {
-            assert!(
-                Instant::now() < deadline,
-                "AAC must fill bounded transport credit"
-            );
+        for _ in 0..80 {
+            if receiver.len() >= MAX_PENDING {
+                break;
+            }
             source.write_all(&vec![0x11; BLOCK_BYTES]).unwrap();
-            thread::sleep(Duration::from_millis(25));
+            rig.advance(Duration::from_millis(25));
         }
+        assert_eq!(
+            receiver.len(),
+            MAX_PENDING,
+            "AAC must fill bounded transport credit"
+        );
         let mut tail = 0;
         for _ in 0..MAX_PENDING {
             let ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp)) =
@@ -1410,51 +1592,26 @@ mod tests {
             else {
                 panic!("expected AAC wave")
             };
-            let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
-            let ServerAudioOutputPdu::Wave2(wave) =
-                decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
-            else {
-                panic!("expected Wave2")
-            };
-            tail = wave.block_no;
+            tail = wave2(&mut server, data, timestamp).block_no;
         }
         source.write_all(&vec![0x22; BLOCK_BYTES * 20]).unwrap();
-        thread::sleep(Duration::from_millis(80));
+        rig.advance(Duration::from_millis(80));
         assert!(
             receiver.is_empty(),
             "unconfirmed transport cannot queue more sound"
         );
-        server
-            .process(
-                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                    block_no: tail,
-                    timestamp: 0,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
+        confirm(&mut server, tail, 0);
         let fresh = vec![0x33; BLOCK_BYTES];
         let mut encoder = Aac::new().unwrap();
         let expected = (0..3)
             .find_map(|_| encoder.encode(&fresh).unwrap())
             .unwrap();
         source.write_all(&fresh.repeat(3)).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) = receiver.try_recv()
-            {
-                assert_eq!(
-                    data, expected,
-                    "recovery packet must contain only fresh codec state"
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "AAC must recover with fresh packets"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
+        assert_eq!(
+            rig.take_wave(&mut receiver).0,
+            expected,
+            "recovery packet must contain only fresh codec state"
+        );
         drop(server);
     }
 
@@ -1469,26 +1626,13 @@ mod tests {
     }
 
     fn aac_transport_credit_wait_preserves_codec_state(queued_capture: bool) {
-        let audio = Audio::default();
-        let (mut server, mut receiver) = negotiate(&audio, vec![aac_format()]);
-        let (mut source, capture) = UnixStream::pair().unwrap();
-        source
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        audio.attach_test_pcm(capture);
-        source.read_exact(&mut [0]).unwrap();
-        let take_wave = |receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>| {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
-                    receiver.try_recv()
-                {
-                    assert_eq!(timestamp, 0);
-                    return data;
-                }
-                assert!(Instant::now() < deadline, "expected consecutive AAC audio");
-                thread::sleep(Duration::from_millis(1));
-            }
+        let rig = Rig::new();
+        let (mut server, mut receiver) = negotiate(&rig.audio, vec![aac_format()]);
+        let mut source = rig.attach_pcm();
+        let take_wave = |receiver: &mut Events| {
+            let (data, timestamp) = rig.take_wave(receiver);
+            assert_eq!(timestamp, 0);
+            data
         };
         let initial = vec![0x11; BLOCK_BYTES];
         let mut reference = Aac::new().unwrap();
@@ -1501,20 +1645,14 @@ mod tests {
             if let Some(expected) = expected {
                 let data = take_wave(&mut receiver);
                 assert_eq!(data, expected);
-                let messages: Vec<_> = server.wave(data, 0).unwrap().into();
-                let ServerAudioOutputPdu::Wave2(wave) =
-                    decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
-                else {
-                    panic!("expected Wave2");
-                };
-                tail = wave.block_no;
+                tail = wave2(&mut server, data, 0).block_no;
                 sent += 1;
             }
-            thread::sleep(Duration::from_millis(25));
+            rig.advance(Duration::from_millis(25));
         }
         // Capture stays empty while the fourth receipt is pending. Waiting
         // for credit alone must not discard AAC's buffered samples/lookahead.
-        thread::sleep(Duration::from_millis(30));
+        rig.advance(Duration::from_millis(30));
         assert!(receiver.is_empty());
         let fresh = vec![0x33; BLOCK_BYTES];
         let mut expected = VecDeque::new();
@@ -1526,24 +1664,16 @@ mod tests {
                 expected.push_back(packet);
             }
             source.write_all(&queued).unwrap();
-            thread::sleep(Duration::from_millis(15));
+            rig.advance(Duration::from_millis(15));
             assert!(receiver.is_empty());
         }
-        server
-            .process(
-                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                    block_no: tail,
-                    timestamp: 0,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
+        confirm(&mut server, tail, 0);
         for _ in 0..3 {
             if let Some(packet) = reference.encode(&fresh).unwrap() {
                 expected.push_back(packet);
             }
             source.write_all(&fresh).unwrap();
-            thread::sleep(Duration::from_millis(25));
+            rig.advance(Duration::from_millis(25));
         }
         assert!(!expected.is_empty());
         for expected in expected {
@@ -1558,43 +1688,17 @@ mod tests {
 
     #[test]
     fn aac_idle_resume_keeps_audible_packets_after_missing_tail_feedback() {
-        let audio = Audio::default();
-        let (mut server, mut receiver) = negotiate(&audio, vec![aac_format()]);
-        let (mut source, capture) = UnixStream::pair().unwrap();
-        source
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        audio.attach_test_pcm(capture);
-        source.read_exact(&mut [0]).unwrap();
-        let take_wave = |receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>| {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
-                    receiver.try_recv()
-                {
-                    assert_eq!(timestamp, 0);
-                    return data;
-                }
-                assert!(Instant::now() < deadline, "AAC playback must resume");
-                thread::sleep(Duration::from_millis(1));
-            }
+        let rig = Rig::new();
+        let (mut server, mut receiver) = negotiate(&rig.audio, vec![aac_format()]);
+        let mut source = rig.attach_pcm();
+        let take_wave = |receiver: &mut Events| {
+            let (data, timestamp) = rig.take_wave(receiver);
+            assert_eq!(timestamp, 0);
+            data
         };
         let acknowledge = |server: &mut RdpsndServer, data: Vec<u8>| {
-            let messages: Vec<_> = server.wave(data, 0).unwrap().into();
-            let ServerAudioOutputPdu::Wave2(wave) =
-                decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
-            else {
-                panic!("expected Wave2");
-            };
-            server
-                .process(
-                    &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                        block_no: wave.block_no,
-                        timestamp: 0,
-                    }))
-                    .unwrap(),
-                )
-                .unwrap();
+            let wave = wave2(server, data, 0);
+            confirm(server, wave.block_no, 0);
             wave.block_no
         };
         let mut reference = Aac::new().unwrap();
@@ -1607,16 +1711,8 @@ mod tests {
         assert_eq!(first_data, first_expected);
         let first = acknowledge(&mut server, first_data);
         // Establish a client that sometimes sends a separate render echo.
-        thread::sleep(Duration::from_millis(20));
-        server
-            .process(
-                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                    block_no: first,
-                    timestamp: 0,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
+        rig.advance(Duration::from_millis(20));
+        confirm(&mut server, first, 0);
         let tail_expected = reference.encode(&initial).unwrap().unwrap();
         source.write_all(&initial).unwrap();
         let tail = take_wave(&mut receiver);
@@ -1634,7 +1730,7 @@ mod tests {
                 expected.push_back(packet);
             }
             source.write_all(&silence).unwrap();
-            thread::sleep(Duration::from_millis(25));
+            rig.advance(Duration::from_millis(25));
             while let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) =
                 receiver.try_recv()
             {
@@ -1647,7 +1743,7 @@ mod tests {
             assert_eq!(data, packet);
             acknowledge(&mut server, data);
         }
-        thread::sleep(Duration::from_millis(550));
+        rig.advance(Duration::from_millis(550));
         assert!(receiver.is_empty(), "idle capture must stay silent");
 
         let fresh = vec![0x33; BLOCK_BYTES];
@@ -1657,7 +1753,7 @@ mod tests {
                 expected.push_back(packet);
             }
             source.write_all(&fresh).unwrap();
-            thread::sleep(Duration::from_millis(25));
+            rig.advance(Duration::from_millis(25));
             while let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) =
                 receiver.try_recv()
             {
@@ -1685,40 +1781,13 @@ mod tests {
 
     #[test]
     fn aac_capture_overflow_discards_pre_gap_codec_state() {
-        let audio = Audio::default();
-        let (mut server, mut receiver) = negotiate(&audio, vec![aac_format()]);
-        let (mut source, capture) = UnixStream::pair().unwrap();
-        source
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        audio.attach_test_pcm(capture);
-        source.read_exact(&mut [0]).unwrap();
+        let rig = Rig::new();
+        let (mut server, mut receiver) = negotiate(&rig.audio, vec![aac_format()]);
+        let mut source = rig.attach_pcm();
         source.write_all(&vec![0x11; BLOCK_BYTES * 3]).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let (data, timestamp) = loop {
-            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
-                receiver.try_recv()
-            {
-                break (data, timestamp);
-            }
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(1));
-        };
-        let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
-        let ServerAudioOutputPdu::Wave2(wave) =
-            decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
-        else {
-            panic!("expected wave2");
-        };
-        server
-            .process(
-                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                    block_no: wave.block_no,
-                    timestamp: 0,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
+        let (data, timestamp) = rig.take_wave(&mut receiver);
+        let wave = wave2(&mut server, data, timestamp);
+        confirm(&mut server, wave.block_no, 0);
         let fresh = vec![0x33; BLOCK_BYTES];
         let mut encoder = Aac::new().unwrap();
         let expected = (0..3)
@@ -1727,41 +1796,28 @@ mod tests {
         source
             .write_all(&fresh.repeat(MAX_CAPTURE_BLOCKS + 5))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) = receiver.try_recv()
-            {
-                assert_eq!(
-                    data, expected,
-                    "dropping capture must also drop earlier codec lookahead"
-                );
-                break;
-            }
-            assert!(Instant::now() < deadline);
-            thread::sleep(Duration::from_millis(1));
-        }
+        assert_eq!(
+            rig.take_wave(&mut receiver).0,
+            expected,
+            "dropping capture must also drop earlier codec lookahead"
+        );
         drop(server);
     }
 
     #[test]
     fn pcm_preferred_over_aac_and_adpcm_preserves_signed_stereo_on_both_wave_versions() {
         for version in [Version::V6, Version::V8] {
-            let audio = Audio::default();
+            let rig = Rig::new();
             let adpcm = Adpcm::new().unwrap().format.clone();
             let mut unsupported = pcm();
             unsupported.n_samples_per_sec = 44100;
             let (mut server, mut receiver) = negotiate_version(
-                &audio,
+                &rig.audio,
                 vec![adpcm, unsupported, pcm(), aac_format()],
                 version,
             );
             assert!(server.is_ready());
-            let (mut source, capture) = UnixStream::pair().unwrap();
-            source
-                .set_read_timeout(Some(Duration::from_secs(2)))
-                .unwrap();
-            audio.attach_test_pcm(capture);
-            source.read_exact(&mut [0]).unwrap();
+            let mut source = rig.attach_pcm();
             // Distinct signed channels and nonzero first samples also check the
             // four-byte prefix split in the older WaveInfo/Wave wire format.
             let expected: Vec<u8> = (0..BLOCK_BYTES / 4)
@@ -1772,16 +1828,7 @@ mod tests {
                 })
                 .collect();
             source.write_all(&expected).unwrap();
-            let deadline = Instant::now() + Duration::from_secs(2);
-            let (data, timestamp) = loop {
-                if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
-                    receiver.try_recv()
-                {
-                    break (data, timestamp);
-                }
-                assert!(Instant::now() < deadline, "expected a 20 ms PCM block");
-                thread::sleep(Duration::from_millis(1));
-            };
+            let (data, timestamp) = rig.take_wave(&mut receiver);
             assert_eq!(
                 data, expected,
                 "PCM must be selected when the client also accepts AAC and ADPCM"
@@ -1816,31 +1863,14 @@ mod tests {
 
     #[test]
     fn negotiated_adpcm_used_when_pcm_not_accepted() {
-        let audio = Audio::default();
+        let rig = Rig::new();
         let format = Adpcm::new().unwrap().format.clone();
         let mut unsupported = pcm();
         unsupported.n_samples_per_sec = 44100;
-        let (mut server, mut receiver) = negotiate(&audio, vec![unsupported, format.clone()]);
-        let (mut source, capture) = UnixStream::pair().unwrap();
-        source
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        audio.attach_test_pcm(capture);
-        source.read_exact(&mut [0]).unwrap();
+        let (mut server, mut receiver) = negotiate(&rig.audio, vec![unsupported, format.clone()]);
+        let mut source = rig.attach_pcm();
         source.write_all(&vec![0x35; ADPCM_SAMPLES * 4]).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        let (data, timestamp) = loop {
-            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
-                receiver.try_recv()
-            {
-                break (data, timestamp);
-            }
-            assert!(
-                Instant::now() < deadline,
-                "capture must produce an ADPCM packet"
-            );
-            thread::sleep(Duration::from_millis(1));
-        };
+        let (data, timestamp) = rig.take_wave(&mut receiver);
         assert_eq!(data.len(), ADPCM_BLOCK_BYTES);
         assert!(
             data.len() * 3 < ADPCM_SAMPLES * 4,
@@ -1850,12 +1880,7 @@ mod tests {
             timestamp, 0,
             "ordinary graphics uses immediate audio playback"
         );
-        let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
-        let ServerAudioOutputPdu::Wave2(wave) =
-            decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
-        else {
-            panic!("expected wave2");
-        };
+        let wave = wave2(&mut server, data, timestamp);
         assert_eq!(
             wave.format_no, 1,
             "server preference must keep the client's index"
@@ -1869,7 +1894,7 @@ mod tests {
             "disconnect must release the encoder and capture FD"
         );
         // A client accepting only PCM must also remain usable.
-        let (server, receiver) = negotiate(&audio, vec![pcm()]);
+        let (server, receiver) = negotiate(&rig.audio, vec![pcm()]);
         assert!(server.is_ready() && receiver.is_empty());
         drop(server);
     }
@@ -1923,16 +1948,11 @@ mod tests {
 
     #[test]
     fn closed_event_receiver_stops_capture_and_releases_the_codec() {
-        let audio = Audio::default();
+        let rig = Rig::new();
         let format = Adpcm::new().unwrap().format.clone();
-        let (server, receiver) = negotiate(&audio, vec![format]);
+        let (server, receiver) = negotiate(&rig.audio, vec![format]);
         drop(receiver);
-        let (mut source, capture) = UnixStream::pair().unwrap();
-        source
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        audio.attach_test_pcm(capture);
-        source.read_exact(&mut [0]).unwrap();
+        let mut source = rig.attach_pcm();
         source.write_all(&vec![0x35; ADPCM_SAMPLES * 4]).unwrap();
         assert_eq!(
             source.read(&mut [0]).unwrap(),
@@ -1944,29 +1964,22 @@ mod tests {
 
     #[test]
     fn negotiated_pcm_reaches_wire_with_client_format_index_and_bounded_backpressure() {
-        let audio = Audio::default();
+        let rig = Rig::new();
         let mut unsupported = pcm();
         unsupported.n_samples_per_sec = 44100;
-        let (mut server, mut receiver) = negotiate(&audio, vec![unsupported, pcm()]);
+        let (mut server, mut receiver) = negotiate(&rig.audio, vec![unsupported, pcm()]);
         assert!(server.is_ready());
         assert!(
             receiver.try_recv().is_err(),
             "login screen must not produce sound"
         );
-        let (mut source, capture) = UnixStream::pair().unwrap();
-        audio.attach_test_pcm(capture);
-        source
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        let mut ready = [0];
-        source.read_exact(&mut ready).unwrap();
-        assert_eq!(&ready, b"A");
+        let mut source = rig.attach_pcm();
         let expected = vec![0x35; BLOCK_BYTES];
         for _ in 0..12 {
             source.write_all(&expected).unwrap();
-            thread::sleep(Duration::from_millis(25));
+            rig.advance(Duration::from_millis(25));
         }
-        thread::sleep(Duration::from_millis(100));
+        rig.advance(Duration::from_millis(100));
         assert_eq!(receiver.len(), MAX_PENDING);
         for number in 0..MAX_PENDING {
             let ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp)) =
@@ -1975,37 +1988,26 @@ mod tests {
                 panic!("expected PCM wave")
             };
             assert_eq!(data, expected);
-            let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
-            let bytes = messages[0].encode_unframed_pdu().unwrap();
-            let ServerAudioOutputPdu::Wave2(wave) = decode(&bytes).unwrap() else {
-                panic!("expected wave2")
-            };
+            let wave = wave2(&mut server, data, timestamp);
             assert_eq!(
                 wave.format_no, 1,
                 "format number must index the client's list"
             );
             assert_eq!(wave.block_no, number as u8);
             assert_eq!(wave.data.as_ref(), expected);
-            let confirm = ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                block_no: wave.block_no,
-                timestamp: wave.timestamp,
-            });
-            server.process(&encode_vec(&confirm).unwrap()).unwrap();
-            server.process(&encode_vec(&confirm).unwrap()).unwrap();
+            confirm(&mut server, wave.block_no, wave.timestamp);
+            confirm(&mut server, wave.block_no, wave.timestamp);
         }
         source.write_all(&expected).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        rig.advance(Duration::from_millis(50));
         assert_eq!(receiver.len(), 1, "confirmation must unblock current audio");
         drop(server);
-        source
-            .set_read_timeout(Some(Duration::from_millis(200)))
-            .unwrap();
         assert_eq!(
             source.read(&mut [0]).unwrap(),
             0,
             "disconnect closes capture FD"
         );
-        let (server, receiver) = negotiate(&audio, vec![pcm()]);
+        let (server, receiver) = negotiate(&rig.audio, vec![pcm()]);
         assert!(
             receiver.is_empty(),
             "reconnect must not replay previous audio"
@@ -2545,19 +2547,19 @@ mod tests {
 
     #[test]
     fn capture_bursts_keep_bounded_recent_blocks_and_preserve_fragments() {
-        let audio = Audio::default();
-        let (server, mut receiver) = negotiate(&audio, vec![pcm()]);
+        let rig = Rig::new();
+        let (server, mut receiver) = negotiate(&rig.audio, vec![pcm()]);
         let (mut source, capture) = UnixStream::pair().unwrap();
         source
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_secs(10)))
             .unwrap();
         let mut burst = vec![0x11; BLOCK_BYTES * 8];
         burst.extend(vec![0x22; BLOCK_BYTES]);
         burst.extend([0x33; 7]);
         source.write_all(&burst).unwrap();
-        audio.attach_test_pcm(capture);
+        rig.audio.attach_test_pcm(capture);
         source.read_exact(&mut [0]).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        rig.advance(Duration::from_millis(50));
         assert_eq!(
             receiver.len(),
             MAX_CAPTURE_BLOCKS,
@@ -2575,7 +2577,7 @@ mod tests {
         };
         assert_eq!(data, vec![0x22; BLOCK_BYTES]);
         source.write_all(&vec![0x33; BLOCK_BYTES - 7]).unwrap();
-        thread::sleep(Duration::from_millis(50));
+        rig.advance(Duration::from_millis(50));
         let ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _)) = receiver.try_recv().unwrap()
         else {
             panic!("expected wave");
@@ -2589,18 +2591,39 @@ mod tests {
     }
 
     #[test]
-    fn transport_backlog_drops_capture_and_resumes_with_fresh_pcm() {
-        let audio = Audio::default();
-        let (mut server, mut receiver) = negotiate(&audio, vec![pcm()]);
-        let (mut source, capture) = UnixStream::pair().unwrap();
+    fn queued_pcm_is_paced_at_one_twenty_millisecond_block_per_block_duration() {
+        let rig = Rig::new();
+        let (server, mut receiver) = negotiate(&rig.audio, vec![pcm()]);
+        let mut source = rig.attach_pcm();
         source
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .write_all(&vec![0x44; BLOCK_BYTES * MAX_CAPTURE_BLOCKS])
             .unwrap();
-        audio.attach_test_pcm(capture);
-        source.read_exact(&mut [0]).unwrap();
+        rig.settle();
+        let mut sent_at = Vec::new();
+        rig.advance_with(Duration::from_millis(59), || {
+            while let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                receiver.try_recv()
+            {
+                assert_eq!((data.len(), timestamp), (BLOCK_BYTES, 0));
+                sent_at.push(*rig.clock.elapsed.lock().unwrap());
+            }
+        });
+        assert_eq!(
+            sent_at,
+            [0, 20, 40].map(Duration::from_millis),
+            "a capture burst must leave at the 20 ms PCM block rate"
+        );
+        drop(server);
+    }
+
+    #[test]
+    fn transport_backlog_drops_capture_and_resumes_with_fresh_pcm() {
+        let rig = Rig::new();
+        let (mut server, mut receiver) = negotiate(&rig.audio, vec![pcm()]);
+        let mut source = rig.attach_pcm();
         for _ in 0..MAX_PENDING {
             source.write_all(&vec![0x11; BLOCK_BYTES]).unwrap();
-            thread::sleep(Duration::from_millis(25));
+            rig.advance(Duration::from_millis(25));
         }
         let mut tail = 0;
         for _ in 0..MAX_PENDING {
@@ -2609,106 +2632,46 @@ mod tests {
             else {
                 panic!("expected PCM wave")
             };
-            let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
-            let ServerAudioOutputPdu::Wave2(wave) =
-                decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
-            else {
-                panic!("expected Wave2")
-            };
-            tail = wave.block_no;
+            tail = wave2(&mut server, data, timestamp).block_no;
         }
         source.write_all(&vec![0x22; BLOCK_BYTES * 20]).unwrap();
-        thread::sleep(Duration::from_millis(80));
+        rig.advance(Duration::from_millis(80));
         assert!(
             receiver.is_empty(),
             "transport credit must bound queued sound"
         );
-        server
-            .process(
-                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                    block_no: tail,
-                    timestamp: 0,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
+        confirm(&mut server, tail, 0);
         source.write_all(&vec![0x33; BLOCK_BYTES]).unwrap();
-        let deadline = Instant::now() + Duration::from_secs(2);
-        loop {
-            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, _))) = receiver.try_recv()
-            {
-                assert_eq!(
-                    data,
-                    vec![0x33; BLOCK_BYTES],
-                    "recovery must not replay stale capture"
-                );
-                break;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "expected fresh PCM after receipt"
-            );
-            thread::sleep(Duration::from_millis(1));
-        }
+        assert_eq!(
+            rig.take_wave(&mut receiver).0,
+            vec![0x33; BLOCK_BYTES],
+            "recovery must not replay stale capture"
+        );
         drop(server);
     }
 
     #[test]
     fn missing_render_tail_and_clock_like_echo_do_not_block_current_pcm() {
-        let audio = Audio::default();
-        let (mut server, mut receiver) = negotiate(&audio, vec![pcm()]);
-        let (mut source, capture) = UnixStream::pair().unwrap();
-        source
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        audio.attach_test_pcm(capture);
-        source.read_exact(&mut [0]).unwrap();
-        let take_wave = |receiver: &mut tokio::sync::mpsc::UnboundedReceiver<ServerEvent>| {
-            let deadline = Instant::now() + Duration::from_secs(2);
-            loop {
-                if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
-                    receiver.try_recv()
-                {
-                    assert_eq!(timestamp, 0);
-                    return data;
-                }
-                assert!(Instant::now() < deadline, "expected current PCM");
-                thread::sleep(Duration::from_millis(1));
-            }
+        let rig = Rig::new();
+        let (mut server, mut receiver) = negotiate(&rig.audio, vec![pcm()]);
+        let mut source = rig.attach_pcm();
+        let take_wave = |receiver: &mut Events| {
+            let (data, timestamp) = rig.take_wave(receiver);
+            assert_eq!(timestamp, 0);
+            data
         };
         let dispatch = |server: &mut RdpsndServer, data: Vec<u8>| {
-            let messages: Vec<_> = server.wave(data, 0).unwrap().into();
-            let ServerAudioOutputPdu::Wave2(wave) =
-                decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
-            else {
-                panic!("expected Wave2")
-            };
-            server
-                .process(
-                    &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                        block_no: wave.block_no,
-                        timestamp: 0,
-                    }))
-                    .unwrap(),
-                )
-                .unwrap();
+            let wave = wave2(server, data, 0);
+            confirm(server, wave.block_no, 0);
             wave.block_no
         };
         source.write_all(&vec![0x11; BLOCK_BYTES]).unwrap();
         let first = dispatch(&mut server, take_wave(&mut receiver));
-        server
-            .process(
-                &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                    block_no: first,
-                    timestamp: 56301,
-                }))
-                .unwrap(),
-            )
-            .unwrap();
+        confirm(&mut server, first, 56301);
         source.write_all(&vec![0x22; BLOCK_BYTES]).unwrap();
         dispatch(&mut server, take_wave(&mut receiver));
         // No render echo arrives for the tail while the application pauses.
-        thread::sleep(Duration::from_millis(600));
+        rig.advance(Duration::from_millis(600));
         for _ in 0..6 {
             let fresh = vec![0x33; BLOCK_BYTES];
             source.write_all(&fresh).unwrap();
@@ -2748,20 +2711,15 @@ mod tests {
         block_bytes: usize,
         mut encoder: Option<Codec>,
     ) {
-        let audio = Audio::default();
-        let (mut server, mut receiver) = negotiate(&audio, vec![format]);
-        let (mut source, capture) = UnixStream::pair().unwrap();
-        source
-            .set_read_timeout(Some(Duration::from_secs(2)))
-            .unwrap();
-        audio.attach_test_pcm(capture);
-        source.read_exact(&mut [0]).unwrap();
+        let rig = Rig::new();
+        let (mut server, mut receiver) = negotiate(&rig.audio, vec![format]);
+        let mut source = rig.attach_pcm();
         const QUANTUM_BYTES: usize = 4096;
         let samples: Vec<u8> = (0..QUANTUM_BYTES * 32 / 4)
             .flat_map(|sample| (sample as u32).to_le_bytes())
             .collect();
         let complete = &samples[..samples.len() / block_bytes * block_bytes];
-        let expected = if let Some(encoder) = &mut encoder {
+        let expected: Vec<u8> = if let Some(encoder) = &mut encoder {
             complete
                 .chunks(block_bytes)
                 .filter_map(|pcm| encoder.encode(pcm.to_vec()).unwrap())
@@ -2770,44 +2728,26 @@ mod tests {
         } else {
             complete.to_vec()
         };
-        let producer = thread::spawn(move || {
-            let start = Instant::now();
-            for (number, chunk) in samples.chunks(QUANTUM_BYTES).enumerate() {
-                let deadline = start
-                    + Duration::from_secs_f64(number as f64 * QUANTUM_BYTES as f64 / 192000.0);
-                thread::sleep(deadline.saturating_duration_since(Instant::now()));
-                source.write_all(chunk).unwrap();
-            }
-            // Keep source open until the consumer verifies all complete blocks.
-            source
-        });
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // A healthy client confirms each wave as soon as it arrives.
         let mut received = Vec::new();
-        while received.len() < expected.len() && Instant::now() < deadline {
-            if let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+        let mut deliver = || {
+            while let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
                 receiver.try_recv()
             {
                 received.extend_from_slice(&data);
-                let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
-                let ServerAudioOutputPdu::Wave2(wave) =
-                    decode(&messages[0].encode_unframed_pdu().unwrap()).unwrap()
-                else {
-                    panic!("expected wave2");
-                };
-                server
-                    .process(
-                        &encode_vec(&ClientAudioOutputPdu::WaveConfirm(WaveConfirmPdu {
-                            block_no: wave.block_no,
-                            timestamp: wave.timestamp,
-                        }))
-                        .unwrap(),
-                    )
-                    .unwrap();
-            } else {
-                thread::sleep(Duration::from_millis(1));
+                let wave = wave2(&mut server, data, timestamp);
+                confirm(&mut server, wave.block_no, wave.timestamp);
             }
+        };
+        // PipeWire delivers fixed quanta at the real-time sample rate.
+        let start = rig.clock.now();
+        for (number, chunk) in samples.chunks(QUANTUM_BYTES).enumerate() {
+            let due =
+                start + Duration::from_secs_f64(number as f64 * QUANTUM_BYTES as f64 / 192000.0);
+            rig.advance_with(due.saturating_duration_since(rig.clock.now()), &mut deliver);
+            source.write_all(chunk).unwrap();
         }
-        let source = producer.join().unwrap();
+        rig.advance_with(Duration::from_millis(200), &mut deliver);
         assert_eq!(
             received, expected,
             "healthy quantum batching must preserve every PCM sample"

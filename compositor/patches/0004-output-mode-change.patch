@@ -1,0 +1,214 @@
+From 96f21da8ae53c9565d6674c0001f434f2b0a939a Mon Sep 17 00:00:00 2001
+From: Niri-RDP rebase <niri-rdp@localhost>
+Date: Thu, 15 Oct 2026 13:19:13 +0900
+Subject: [PATCH 04/12] headless: apply output-management mode changes in place
+
+Backend::on_output_config_changed now applies a configured custom mode to
+headless virtual outputs (as written by zwlr_output_manager_v1). The mode is
+validated against the creation bounds (1-8192 px, finite 1-240 Hz) before any
+mutation; the output keeps its identity and workspaces, holds only the
+current mode, gets a frame clock for the new refresh rate, and its IPC output
+(single mode, custom, logical size) is updated. The IPC output now reports
+its serial so output-management config entries match the virtual output.
+
+Niri-RDP feature F3. Test: backend::headless::remote_tests::
+resize_preserves_output_identity_and_rejects_invalid_modes.
+---
+ src/backend/headless.rs | 149 ++++++++++++++++++++++++++++++++++++++++
+ src/backend/mod.rs      |   4 +-
+ 2 files changed, 151 insertions(+), 2 deletions(-)
+
+diff --git a/src/backend/headless.rs b/src/backend/headless.rs
+index 8c2658c4..f8c31c96 100644
+--- a/src/backend/headless.rs
++++ b/src/backend/headless.rs
+@@ -26,6 +26,7 @@ use smithay::utils::Size;
+ use smithay::wayland::presentation::Refresh;
+ 
+ use super::{IpcOutputMap, OutputId, RenderResult};
++use crate::frame_clock::FrameClock;
+ use crate::niri::{Niri, RedrawState};
+ use crate::render_helpers::{resources, shaders};
+ use crate::utils::{get_monotonic_time, logical_output};
+@@ -144,6 +145,67 @@ impl Headless {
+         self.virtual_outputs.remove(niri, &self.ipc_outputs, name)
+     }
+ 
++    /// Apply client-selected modes without replacing the output or its workspaces.
++    pub fn on_output_config_changed(&mut self, niri: &mut Niri) {
++        for (output, output_id) in self.virtual_outputs.outputs.values() {
++            let configured = {
++                let config = niri.config.borrow();
++                let name = output.user_data().get::<OutputName>().unwrap();
++                config.outputs.find(name).and_then(|c| c.mode)
++            };
++            let Some(configured) = configured else {
++                continue;
++            };
++            let old_mode = output.current_mode().unwrap();
++            let requested = configured.mode;
++            let refresh = requested.refresh.unwrap_or(old_mode.refresh as f64 / 1000.);
++            // Apply the same allocation bounds as output creation before any mutation.
++            if requested.width == 0
++                || requested.height == 0
++                || requested.width > 8192
++                || requested.height > 8192
++                || !refresh.is_finite()
++                || !(1.0..=240.0).contains(&refresh)
++            {
++                warn!(
++                    "ignoring invalid headless output mode for {}",
++                    output.name()
++                );
++                continue;
++            }
++            let mode = Mode {
++                size: (i32::from(requested.width), i32::from(requested.height)).into(),
++                refresh: (refresh * 1000.).round() as i32,
++            };
++            if old_mode == mode {
++                continue;
++            }
++            // Keep only the current mode so repeated remote resizes do not grow state.
++            output.delete_mode(old_mode);
++            output.change_current_state(Some(mode), None, None, None);
++            output.set_preferred(mode);
++            niri.output_state.get_mut(output).unwrap().frame_clock = FrameClock::new(
++                Some(Duration::from_nanos(
++                    1_000_000_000_000 / mode.refresh as u64,
++                )),
++                false,
++            );
++            niri.output_resized(output);
++            let mut ipc_outputs = self.ipc_outputs.lock().unwrap();
++            let ipc_output = ipc_outputs.get_mut(output_id).unwrap();
++            ipc_output.modes = vec![niri_ipc::Mode {
++                width: requested.width,
++                height: requested.height,
++                refresh_rate: mode.refresh as u32,
++                is_preferred: true,
++            }];
++            ipc_output.current_mode = Some(0);
++            ipc_output.is_custom_mode = true;
++            ipc_output.logical = Some(logical_output(output));
++            niri.ipc_outputs_changed = true;
++        }
++    }
++
+     pub fn seat_name(&self) -> String {
+         "headless".to_owned()
+     }
+@@ -415,4 +477,91 @@ mod remote_tests {
+         assert_eq!(state.niri.global_space.outputs().count(), 0);
+         assert!(state.backend.ipc_outputs().lock().unwrap().is_empty());
+     }
++
++    #[test]
++    fn resize_preserves_output_identity_and_rejects_invalid_modes() {
++        let (_event_loop, state) = headless_state(false);
++        let mut state = state.unwrap();
++        let name = state
++            .backend
++            .create_virtual_output(&mut state.niri, 1920, 1080, 60)
++            .unwrap();
++        let output = state.niri.global_space.outputs().next().unwrap().clone();
++        let id = *state
++            .backend
++            .ipc_outputs()
++            .lock()
++            .unwrap()
++            .keys()
++            .next()
++            .unwrap();
++        let ipc_name = {
++            let outputs = state.backend.ipc_outputs();
++            let outputs = outputs.lock().unwrap();
++            niri_config::OutputName::from_ipc_output(&outputs[&id])
++                .format_make_model_serial_or_connector()
++        };
++        assert!(output
++            .user_data()
++            .get::<niri_config::OutputName>()
++            .unwrap()
++            .matches(&ipc_name));
++        for (width, height, refresh) in [(1280, 720, 60.), (2560, 1440, 120.), (800, 600, 60.)] {
++            state.modify_output_config(&name, |config| {
++                config.mode = Some(niri_config::output::Mode {
++                    custom: true,
++                    mode: niri_ipc::ConfiguredMode {
++                        width,
++                        height,
++                        refresh: Some(refresh),
++                    },
++                });
++            });
++            state.reload_output_config();
++            assert_eq!(state.niri.global_space.outputs().next(), Some(&output));
++            assert_eq!(
++                output.current_mode().unwrap().size,
++                (i32::from(width), i32::from(height)).into()
++            );
++            assert_eq!(output.modes().len(), 1);
++            let ipc = state.backend.ipc_outputs();
++            let ipc = ipc.lock().unwrap();
++            assert_eq!(ipc.len(), 1);
++            assert_eq!(ipc[&id].modes[0].width, width);
++            assert_eq!(ipc[&id].modes[0].height, height);
++            assert_eq!(ipc[&id].modes[0].refresh_rate, (refresh * 1000.) as u32);
++            assert_eq!(ipc[&id].logical.as_ref().unwrap().width, u32::from(width));
++            assert_eq!(ipc[&id].logical.as_ref().unwrap().height, u32::from(height));
++            assert!(state.niri.ipc_outputs_changed);
++        }
++        let old_mode = output.current_mode();
++        let old_ipc =
++            serde_json::to_value(state.backend.ipc_outputs().lock().unwrap().get(&id)).unwrap();
++        for (width, height, refresh) in [
++            (0, 600, 60.),
++            (800, 0, 60.),
++            (8193, 600, 60.),
++            (800, 8193, 60.),
++            (800, 600, 0.),
++            (800, 600, 241.),
++            (800, 600, f64::NAN),
++        ] {
++            state.modify_output_config(&name, |config| {
++                config.mode = Some(niri_config::output::Mode {
++                    custom: true,
++                    mode: niri_ipc::ConfiguredMode {
++                        width,
++                        height,
++                        refresh: Some(refresh),
++                    },
++                });
++            });
++            state.reload_output_config();
++            assert_eq!(output.current_mode(), old_mode);
++            assert_eq!(
++                serde_json::to_value(state.backend.ipc_outputs().lock().unwrap().get(&id)).unwrap(),
++                old_ipc
++            );
++        }
++    }
+ }
+diff --git a/src/backend/mod.rs b/src/backend/mod.rs
+index 72f55710..d848ab55 100644
+--- a/src/backend/mod.rs
++++ b/src/backend/mod.rs
+@@ -152,7 +152,7 @@ impl VirtualOutputs {
+                 name: output.name(),
+                 make: physical_properties.make,
+                 model: physical_properties.model,
+-                serial: None,
++                serial: Some(physical_properties.serial_number),
+                 physical_size: None,
+                 modes: vec![niri_ipc::Mode {
+                     width,
+@@ -355,7 +355,7 @@ impl Backend {
+         match self {
+             Backend::Tty(tty) => tty.on_output_config_changed(niri),
+             Backend::Winit(_) => (),
+-            Backend::Headless(_) => (),
++            Backend::Headless(headless) => headless.on_output_config_changed(niri),
+         }
+     }
+ 

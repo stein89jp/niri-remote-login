@@ -1,6 +1,6 @@
 # Real Wayland/RDP bridge
 
-IronRDP git revision `bf019ca502d1e52616853a5ded68c885cec1e322` owns RDP,
+IronRDP git revision `7b976a6965c96c76ff949313e174ea55dada8c44` owns RDP,
 TLS, optional CredSSP, bitmap codecs, graphics framing and negotiation. This exact revision includes
 `CredentialValidator` and `ConnectionBinder`, absent from crates.io 0.13.0.
 Rust >=1.94 is required. `Cargo.lock` pins every transitive crate and Git source.
@@ -250,7 +250,8 @@ can use GNOME Remote Login's AAC-LC format: `AAC_MS`, stereo 44.1 kHz at 96 kbit
 FFmpeg resamples capture with bounded buffers; encoder lookahead remains below
 two AAC frames. MS ADPCM is the last fallback. No
 additional audio configuration is required. A client must enable
-remote playback and accept one of these formats. No microphone redirection is provided. Audio starts after
+remote playback and accept one of these formats. Microphone redirection is a
+separate path; see [Microphone](#microphone). Audio starts after
 successful Linux authentication, including submission through the login form.
 Disconnect closes capture; authenticated reconnect opens a fresh monitor of the
 retained desktop. At most four waves await receipt confirmation. Optional later
@@ -299,6 +300,67 @@ WaveInfo/Wave and Wave2 PDUs, verify the client's format index, and check
 backpressure, long playback feedback, timestamp/block wrapping, healthy sample
 continuity and disconnect cleanup. Installed-service and Windows mstsc sound
 playback remain actual-machine acceptance checks.
+
+## Microphone
+
+`src/microphone.rs` implements mstsc **Record from this computer** (MS-RDPEAI,
+the `AUDIO_INPUT` dynamic channel) through the vendored server's
+`RdpeaiServerFactory`, using the `ironrdp-rdpeai` crate at the same pinned
+IronRDP revision. `NIRI_RDP_MICROPHONE=auto` (default) registers the factory;
+`off` registers nothing, so no `AUDIO_INPUT` channel is offered, and drops the
+broker's microphone descriptor. Any other value fails startup.
+
+The path shares nothing with playback except the TLS connection and the server
+event loop: its own dynamic channel (playback uses the `rdpsnd` static channel),
+its own `rdp-microphone` thread per helper connection, its own bounded queue,
+its own socket (`audio-in-0`, the optional third descriptor of the
+[broker reply](../broker/README.md#wire-contract-v2)), its own NRM1 framing,
+helper (`session-microphone`) and restart budget, and its own `mic_*` summary
+counters. `audio.rs` and the accepted RDPSND PCM baseline are unchanged.
+
+The server offers 16-bit PCM at 48 kHz mono, 48 kHz stereo, 44.1 kHz mono and
+44.1 kHz stereo, in that order, each as WAVE_FORMAT_EXTENSIBLE and plain PCM,
+and requests 20 ms packets. 48 kHz mono needs about 0.8 Mbit/s of upload before
+framing. Recording is server-initiated, and the bridge sends `Open` only when
+formats are negotiated, the session helper is attached and it reports a remote
+recorder (`IN_USE`). When the helper reports `IDLE` (after its own 5-second
+debounce), the bridge asks the server to recycle the channel: MS-RDPEAI has no
+stop PDU, so closing the channel is what releases the Windows microphone. A
+fresh channel is created at once, so the next recorder needs no reconnect.
+A refused open tries the next format; when all fail, the client is asked again
+only on a recorder start at least 30 seconds later. An unanswered Open is
+abandoned after 10 s, as a failed open.
+
+`on_audio_data` validates the length against the format and pushes whole
+frames to a drop-oldest queue of at most 100 ms without blocking the server
+loop. The writer thread sends NRM1 records (`!4sBBHIIIQ`: magic, kind,
+channels, flags, rate, sequence, length, CLOCK_MONOTONIC receive time) over a
+non-blocking socket with an 8 KiB send buffer and never sends audio older than
+100 ms. The helper answers with 8-byte `!4sBBH` records (`HELLO`, `IN_USE`,
+`IDLE`). A protocol error or helper exit is logged once
+(`RDP microphone ...` in the journal); the microphone is then unavailable until
+the next connection, while desktop and playback continue.
+
+The pinned upstream server cannot stop capture, and its DRDYNVC treats data for
+a removed channel as fatal. The vendored `ironrdp-server` therefore adds
+`ServerEvent::RdpeaiRecycle` (`src/rdpeai_recycle.rs`, recorded in
+`vendor/ironrdp-server/UPSTREAM`): it closes the open `AUDIO_INPUT` channel,
+which runs the backend's `on_close`, creates a fresh one from the factory, and
+drops capture data the client sent before it processed the Close (up to 8
+closed channel ids). RDPSND, EGFX and CLIPRDR handling is untouched. It is a
+candidate for upstreaming.
+
+`cargo test` covers format choice, Open only after negotiation and `IN_USE`,
+length validation, the queue bound and drop-oldest under a stalled writer, the
+Open timeout and retry window, and clean shutdown.
+`tests/microphone_wire.rs` runs negotiation, Open, Data and the recycle
+(including late data for a recycled channel) through the crate's client side
+offline. `python3 -m unittest tests.test_microphone -v` covers the session
+helper, including `ECONNRESET` when the frontend closes. The namespace check with real Niri, PipeWire and
+FreeRDP is `lab/run-isolated.sh env NIRI_RDP_LAB_BRIDGE=<bridge> python3
+scripts/microphone-integration.py`; see the
+[validation record](../docs/validation.md#microphone-redirection-ms-rdpeai-2026-10-15).
+Windows mstsc recording remains an actual-machine acceptance check.
 
 ## Dynamic resolution
 

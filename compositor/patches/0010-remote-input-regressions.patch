@@ -1,0 +1,815 @@
+From 4172d7dce396478609201c20ea346c824f72b163 Mon Sep 17 00:00:00 2001
+From: Niri-RDP rebase <niri-rdp@localhost>
+Date: Thu, 15 Oct 2026 13:54:51 +0900
+Subject: [PATCH 10/12] tests: remote input regressions for the Niri-RDP bridge
+ contract
+
+Client-server tests of the virtual keyboard and pointer behaviour the
+Niri-RDP bridge relies on. Most of it is now provided by upstream niri
+and Smithay (features F7, F9 and F11 of the old private patch); F8 and
+F10 are covered by the two previous patches:
+
+- a device that sends the seat keymap back reaches niri binds (Mod+D) and
+  the focused window without a keymap swap (F7);
+- a no_keymap device follows a layout reload;
+- the modifiers sync keeps a layout switched by a niri bind and applies
+  CapsLock (F8);
+- the committed Unicode device (keycodes "niri_rdp_unicode", key 247,
+  NUL-terminated file) commits the exact character and the seat keymap,
+  layout and CapsLock are restored afterwards (F10);
+- the same with an input method that relays the text keymap and keys
+  late: the focused client decodes the exact text and the seat returns
+  to the configured keymap (F10/F11);
+- destroying the devices releases held keys and restores the keymap (F9);
+- sealed and unsealed keymap files, with or without a trailing NUL, are
+  accepted;
+- keys an input method (Fcitx) forwards through its own virtual keyboard
+  bypass its grab and do not update XKB again (no double CapsLock, F11);
+- wheel notches sent as axis_discrete reach Mod+WheelScrollDown binds as
+  v120, partial notches do not.
+---
+ src/tests/mod.rs          |   1 +
+ src/tests/remote_input.rs | 762 ++++++++++++++++++++++++++++++++++++++
+ 2 files changed, 763 insertions(+)
+ create mode 100644 src/tests/remote_input.rs
+
+diff --git a/src/tests/mod.rs b/src/tests/mod.rs
+index ad66c822..a25d02f6 100644
+--- a/src/tests/mod.rs
++++ b/src/tests/mod.rs
+@@ -10,6 +10,7 @@ mod binds;
+ mod floating;
+ mod fullscreen;
+ mod layer_shell;
++mod remote_input;
+ mod remove_output;
+ mod transactions;
+ mod virtual_pointer;
+diff --git a/src/tests/remote_input.rs b/src/tests/remote_input.rs
+new file mode 100644
+index 00000000..31f5bd49
+--- /dev/null
++++ b/src/tests/remote_input.rs
+@@ -0,0 +1,762 @@
++//! Virtual keyboard and pointer behaviour that the niri-rdp remote desktop bridge relies on.
++//!
++//! The bridge injects remote keys through two virtual keyboards: one that sends the seat's own
++//! keymap back (physical keys) and one that temporarily installs a one-key `niri_rdp_unicode`
++//! keymap (committed Unicode text). After each key it also sends its own modifier masks. RDP
++//! wheel notches arrive as `axis_discrete` on a virtual pointer.
++
++use std::fs::File;
++use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
++use std::os::fd::{AsFd as _, OwnedFd};
++use std::sync::{Arc, Mutex};
++
++use niri_config::{Action, Config};
++use smithay::input::keyboard::{xkb, Layout};
++use smithay::reexports::rustix::fs::{fcntl_add_seals, memfd_create, MemfdFlags, SealFlags};
++use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_keyboard_grab_v2::{self, ZwpInputMethodKeyboardGrabV2};
++use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_manager_v2::ZwpInputMethodManagerV2;
++use smithay::reexports::wayland_protocols_misc::zwp_input_method_v2::client::zwp_input_method_v2::ZwpInputMethodV2;
++use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_manager_v1::ZwpVirtualKeyboardManagerV1;
++use smithay::reexports::wayland_protocols_misc::zwp_virtual_keyboard_v1::client::zwp_virtual_keyboard_v1::ZwpVirtualKeyboardV1;
++use wayland_client::protocol::wl_keyboard::{self, WlKeyboard};
++use wayland_client::protocol::wl_pointer;
++use wayland_client::protocol::wl_registry::{self, WlRegistry};
++use wayland_client::protocol::wl_surface::WlSurface;
++use wayland_client::{Connection, Dispatch, QueueHandle};
++
++use crate::tests::client::{self, ClientId};
++use crate::tests::fixture::Fixture;
++
++const CONFIG: &str = r#"
++input {
++    keyboard {
++        xkb {
++            layout "us,se"
++        }
++    }
++}
++
++binds {
++    Mod+D { spawn "true"; }
++    Mod+Space { switch-layout "next"; }
++    Mod+WheelScrollDown { spawn "true"; }
++}
++"#;
++
++// evdev key codes and XKB modifier masks of the us/se layouts.
++const KEY_A: u32 = 30;
++const KEY_D: u32 = 32;
++const KEY_LEFTBRACE: u32 = 26;
++const KEY_CAPSLOCK: u32 = 58;
++const KEY_LEFTCTRL: u32 = 29;
++const KEY_SPACE: u32 = 57;
++const KEY_LEFTMETA: u32 = 125;
++const KEY_TEXT: u32 = 247;
++const MOD_CTRL: u32 = 1 << 2;
++const MOD_LOCK: u32 = 1 << 1;
++const MOD_SUPER: u32 = 1 << 6;
++
++fn set_up() -> (Fixture, ClientId, WlSurface) {
++    let mut config = Config::parse_mem(CONFIG).unwrap();
++    for bind in &mut config.binds.0 {
++        if matches!(bind.action, Action::Spawn(_)) {
++            bind.action = Action::TestAction;
++        }
++    }
++
++    let mut f = Fixture::with_config(config);
++    f.add_output(1, (1920, 1080));
++
++    let id = f.add_client();
++    let window = f.client(id).create_window();
++    let surface = window.surface.clone();
++    window.commit();
++    f.roundtrip(id);
++
++    let window = f.client(id).window(&surface);
++    window.attach_new_buffer();
++    window.ack_last_and_commit();
++    f.roundtrip(id);
++
++    let _ = f.client(id).state.recent_keyboard_events(&surface);
++    (f, id, surface)
++}
++
++fn events(f: &mut Fixture, id: ClientId, surface: &WlSurface) -> Vec<String> {
++    f.client(id)
++        .state
++        .recent_keyboard_events(surface)
++        .map(ToString::to_string)
++        .collect()
++}
++
++fn keys(f: &mut Fixture, id: ClientId, surface: &WlSurface) -> Vec<String> {
++    let mut events = events(f, id, surface);
++    events.retain(|event| event.starts_with("key "));
++    events
++}
++
++/// Binds a global that the shared test client does not bind itself.
++fn bind<I: wayland_client::Proxy + 'static>(f: &mut Fixture, id: ClientId) -> I
++where
++    client::State: Dispatch<I, ()>,
++{
++    let client = f.client(id);
++    let global = client
++        .state
++        .globals
++        .iter()
++        .find(|global| global.interface == I::interface().name)
++        .unwrap();
++    let (name, version) = (global.name, global.version.min(I::interface().version));
++    let registry = client.display.get_registry(&client.qh, Registry);
++    registry.bind(name, version, &client.qh, ())
++}
++
++fn virtual_keyboard(f: &mut Fixture, id: ClientId) -> ZwpVirtualKeyboardV1 {
++    let manager: ZwpVirtualKeyboardManagerV1 = bind(f, id);
++    let client = f.client(id);
++    let seat = client.state.seats.keys().next().unwrap().clone();
++    manager.create_virtual_keyboard(&seat, &client.qh, ())
++}
++
++fn keymap_file(text: &str, nul: bool, sealed: bool) -> (OwnedFd, u32) {
++    let flags = if sealed {
++        MemfdFlags::CLOEXEC | MemfdFlags::ALLOW_SEALING
++    } else {
++        MemfdFlags::CLOEXEC
++    };
++    let mut file = File::from(memfd_create(c"niri-test-keymap", flags).unwrap());
++    let mut bytes = text.as_bytes().to_vec();
++    if nul {
++        bytes.push(0);
++    }
++    file.write_all(&bytes).unwrap();
++    if sealed {
++        let seals = SealFlags::SEAL | SealFlags::SHRINK | SealFlags::GROW | SealFlags::WRITE;
++        fcntl_add_seals(&file, seals).unwrap();
++    }
++    (file.into(), bytes.len() as u32)
++}
++
++/// Sends a keymap the way the bridge does: an unsealed file with a trailing NUL.
++fn send_keymap(keyboard: &ZwpVirtualKeyboardV1, text: &str) {
++    let (fd, size) = keymap_file(text, true, false);
++    keyboard.keymap(1, fd.as_fd(), size);
++}
++
++fn seat_keymap(f: &mut Fixture) -> String {
++    let state = f.niri_state();
++    let keyboard = state.niri.seat.get_keyboard().unwrap();
++    keyboard.with_xkb_state(state, |context| {
++        context.xkb().lock().unwrap().keymap_as_string()
++    })
++}
++
++fn active_layout(f: &mut Fixture) -> u32 {
++    let state = f.niri_state();
++    let keyboard = state.niri.seat.get_keyboard().unwrap();
++    keyboard.with_xkb_state(state, |context| {
++        context.xkb().lock().unwrap().active_layout().0
++    })
++}
++
++fn caps_lock(f: &mut Fixture) -> bool {
++    let keyboard = f.niri().seat.get_keyboard().unwrap();
++    keyboard.modifier_state().caps_lock
++}
++
++fn text(f: &mut Fixture, evdev: u32) -> String {
++    let state = f.niri_state();
++    let keyboard = state.niri.seat.get_keyboard().unwrap();
++    keyboard.with_xkb_state(state, |context| {
++        let xkb = context.xkb().lock().unwrap();
++        // SAFETY: only owned text leaves the locked XKB context.
++        unsafe { xkb.state() }.key_get_utf8((evdev + 8).into())
++    })
++}
++
++/// The bridge's committed-text keymap (`bridge/src/wayland/input.rs` `unicode_keymap`).
++fn unicode_keymap(character: char) -> String {
++    format!(
++        r#"xkb_keymap {{
++        xkb_keycodes "niri_rdp_unicode" {{ minimum = 8; maximum = 255; <TEXT> = 255; }};
++        xkb_types {{ type "ONE_LEVEL" {{ modifiers = None; level_name[Level1] = "Any"; }}; }};
++        xkb_compatibility {{ }};
++        xkb_symbols {{ key <TEXT> {{ type = "ONE_LEVEL", [ 0x{:08x} ] }}; }};
++    }};"#,
++        0x0100_0000 | character as u32
++    )
++}
++
++/// A remote key followed by the bridge's modifier sync, which carries the bridge's own (stale)
++/// layout group 0.
++fn bridge_key(keyboard: &ZwpVirtualKeyboardV1, key: u32, pressed: bool, depressed: u32) {
++    keyboard.key(0, key, u32::from(pressed));
++    keyboard.modifiers(depressed, 0, 0, 0);
++}
++
++#[test]
++fn seat_keymap_device_reaches_binds_and_focus_without_a_keymap_swap() {
++    let (mut f, id, surface) = set_up();
++    let bridge = f.add_client();
++    let keyboard = virtual_keyboard(&mut f, bridge);
++    let keymap = seat_keymap(&mut f);
++    send_keymap(&keyboard, &keymap);
++
++    bridge_key(&keyboard, KEY_LEFTMETA, true, MOD_SUPER);
++    bridge_key(&keyboard, KEY_D, true, MOD_SUPER);
++    bridge_key(&keyboard, KEY_D, false, MOD_SUPER);
++    bridge_key(&keyboard, KEY_LEFTMETA, false, 0);
++    bridge_key(&keyboard, KEY_A, true, 0);
++    bridge_key(&keyboard, KEY_A, false, 0);
++    f.roundtrip(bridge);
++    f.roundtrip(id);
++
++    // Mod+D runs the Niri bind and never reaches the window; plain keys do.
++    assert_eq!(f.niri().test_action_count, 1);
++    assert_eq!(
++        keys(&mut f, id, &surface),
++        [
++            "key pressed: 125",
++            "key released: 125",
++            "key pressed: 30",
++            "key released: 30",
++        ]
++    );
++    // The identical keymap uses the seat state directly.
++    assert!(f.niri().virtual_keyboard_keymap.is_none());
++    assert_eq!(seat_keymap(&mut f), keymap);
++}
++
++#[test]
++fn modifier_sync_keeps_the_layout_selected_by_a_niri_bind() {
++    let (mut f, id, surface) = set_up();
++    let bridge = f.add_client();
++    let keyboard = virtual_keyboard(&mut f, bridge);
++    send_keymap(&keyboard, &seat_keymap(&mut f));
++
++    // Mod+Space switches to the second layout. The remote client cannot see that and keeps
++    // sending group 0 with every modifier sync.
++    bridge_key(&keyboard, KEY_LEFTMETA, true, MOD_SUPER);
++    bridge_key(&keyboard, KEY_SPACE, true, MOD_SUPER);
++    bridge_key(&keyboard, KEY_SPACE, false, MOD_SUPER);
++    bridge_key(&keyboard, KEY_LEFTMETA, false, 0);
++    bridge_key(&keyboard, KEY_LEFTBRACE, true, 0);
++    f.roundtrip(bridge);
++    assert_eq!(active_layout(&mut f), 1);
++    assert_eq!(text(&mut f, KEY_LEFTBRACE), "å");
++
++    // RDP Synchronize locks and unlocks CapsLock through the masks.
++    keyboard.modifiers(0, 0, MOD_LOCK, 0);
++    f.roundtrip(bridge);
++    assert!(caps_lock(&mut f));
++    assert_eq!(active_layout(&mut f), 1);
++    assert_eq!(text(&mut f, KEY_LEFTBRACE), "Å");
++
++    keyboard.modifiers(0, 0, 0, 0);
++    bridge_key(&keyboard, KEY_LEFTBRACE, false, 0);
++    f.roundtrip(bridge);
++    f.roundtrip(id);
++    assert!(!caps_lock(&mut f));
++    assert_eq!(active_layout(&mut f), 1);
++
++    // The focused window was told about the switch and never told to switch back.
++    let modifiers: Vec<_> = events(&mut f, id, &surface)
++        .into_iter()
++        .filter(|event| event.starts_with("modifiers"))
++        .collect();
++    let switched = modifiers
++        .iter()
++        .position(|event| event.ends_with("group=1"));
++    assert!(switched.is_some(), "{modifiers:?}");
++    assert!(
++        modifiers[switched.unwrap()..]
++            .iter()
++            .all(|event| event.ends_with("group=1")),
++        "{modifiers:?}"
++    );
++}
++
++#[test]
++fn committed_unicode_uses_a_temporary_keymap_and_restores_the_seat() {
++    let (mut f, id, surface) = set_up();
++    let bridge = f.add_client();
++    let keyboard = virtual_keyboard(&mut f, bridge);
++    let text_keyboard = virtual_keyboard(&mut f, bridge);
++    let keymap = seat_keymap(&mut f);
++    send_keymap(&keyboard, &keymap);
++    keyboard.modifiers(0, 0, MOD_LOCK, 0);
++    f.roundtrip(bridge);
++    let state = f.niri_state();
++    let seat = state.niri.seat.get_keyboard().unwrap();
++    seat.with_xkb_state(state, |mut context| context.set_layout(Layout(1)));
++    let _ = events(&mut f, id, &surface);
++
++    // `Input::text`: the temporary map, zero masks, a tap of key 247...
++    send_keymap(&text_keyboard, &unicode_keymap('日'));
++    text_keyboard.modifiers(0, 0, 0, 0);
++    text_keyboard.key(0, KEY_TEXT, 1);
++    f.roundtrip(bridge);
++    assert!(seat_keymap(&mut f).contains("xkb_keycodes \"niri_rdp_unicode\""));
++    assert_eq!(text(&mut f, KEY_TEXT), "日");
++    text_keyboard.key(0, KEY_TEXT, 0);
++
++    // ...then the physical map back on the text device and the bridge's own masks.
++    send_keymap(&text_keyboard, &keymap);
++    keyboard.modifiers(0, 0, MOD_LOCK, 0);
++    f.roundtrip(bridge);
++    f.roundtrip(id);
++
++    assert_eq!(
++        keys(&mut f, id, &surface),
++        ["key pressed: 247", "key released: 247"]
++    );
++    assert!(f.niri().virtual_keyboard_keymap.is_none());
++    assert_eq!(seat_keymap(&mut f), keymap);
++    assert_eq!(active_layout(&mut f), 1);
++    assert!(caps_lock(&mut f));
++
++    // Ordinary keys keep working with the restored layout and CapsLock.
++    keyboard.key(0, KEY_LEFTBRACE, 1);
++    keyboard.modifiers(0, 0, MOD_LOCK, 0);
++    f.roundtrip(bridge);
++    assert_eq!(text(&mut f, KEY_LEFTBRACE), "Å");
++}
++
++#[test]
++fn destroyed_devices_release_held_keys_and_restore_the_keymap() {
++    let (mut f, id, surface) = set_up();
++    let bridge = f.add_client();
++    let keyboard = virtual_keyboard(&mut f, bridge);
++    let text_keyboard = virtual_keyboard(&mut f, bridge);
++    let keymap = seat_keymap(&mut f);
++    send_keymap(&keyboard, &keymap);
++    bridge_key(&keyboard, KEY_LEFTCTRL, true, MOD_CTRL);
++    bridge_key(&keyboard, KEY_A, true, MOD_CTRL);
++    send_keymap(&text_keyboard, &unicode_keymap('😀'));
++    text_keyboard.modifiers(0, 0, 0, 0);
++    text_keyboard.key(0, KEY_TEXT, 1);
++    f.roundtrip(bridge);
++    assert!(seat_keymap(&mut f).contains("niri_rdp_unicode"));
++
++    // A frontend crash or disconnect destroys both devices with keys still down.
++    text_keyboard.destroy();
++    keyboard.destroy();
++    f.roundtrip(bridge);
++    f.roundtrip(id);
++
++    let keys = keys(&mut f, id, &surface);
++    assert_eq!(
++        keys,
++        [
++            "key pressed: 29",
++            "key pressed: 30",
++            "key pressed: 247",
++            "key released: 247",
++            "key released: 30",
++            "key released: 29",
++        ]
++    );
++    let seat = f.niri().seat.get_keyboard().unwrap();
++    assert!(seat.pressed_keys().is_empty());
++    assert!(!seat.modifier_state().ctrl);
++    assert!(f.niri().virtual_keyboard_keymap.is_none());
++    assert_eq!(seat_keymap(&mut f), keymap);
++}
++
++#[test]
++fn no_keymap_device_follows_a_layout_reload() {
++    // A device that sent the seat keymap keeps that (now stale) keymap after a config reload
++    // and swaps it back in on its next key. A `no_keymap` device always uses the current one.
++    let (mut f, id, surface) = set_up();
++    let bridge = f.add_client();
++    let keyboard = virtual_keyboard(&mut f, bridge);
++    let (fd, _) = keymap_file("", false, false);
++    keyboard.keymap(0, fd.as_fd(), 0);
++    f.roundtrip(bridge);
++
++    let mut config = Config::parse_mem(CONFIG).unwrap();
++    config.input.keyboard.xkb.layout = "se".into();
++    f.niri_state().reload_config(Ok(config));
++    let reloaded = seat_keymap(&mut f);
++
++    keyboard.key(0, KEY_LEFTBRACE, 1);
++    f.roundtrip(bridge);
++    assert_eq!(text(&mut f, KEY_LEFTBRACE), "å");
++    keyboard.key(0, KEY_LEFTBRACE, 0);
++    f.roundtrip(bridge);
++    f.roundtrip(id);
++    assert!(f.niri().virtual_keyboard_keymap.is_none());
++    assert_eq!(seat_keymap(&mut f), reloaded);
++    assert_eq!(
++        keys(&mut f, id, &surface),
++        ["key pressed: 26", "key released: 26"]
++    );
++}
++
++#[test]
++fn sealed_and_unsealed_keymaps_are_accepted() {
++    let (mut f, id, surface) = set_up();
++    let keymap = seat_keymap(&mut f);
++    for (nul, sealed) in [(true, false), (true, true), (false, false), (false, true)] {
++        let bridge = f.add_client();
++        let keyboard = virtual_keyboard(&mut f, bridge);
++        let (fd, size) = keymap_file(&keymap, nul, sealed);
++        keyboard.keymap(1, fd.as_fd(), size);
++        keyboard.key(0, KEY_A, 1);
++        keyboard.key(0, KEY_A, 0);
++        // A rejected keymap makes the key a `no_keymap` protocol error, which panics here.
++        f.roundtrip(bridge);
++        f.roundtrip(id);
++        assert_eq!(
++            keys(&mut f, id, &surface),
++            ["key pressed: 30", "key released: 30"],
++            "nul={nul} sealed={sealed}"
++        );
++    }
++}
++
++#[test]
++fn wheel_notches_reach_wheel_binds_as_v120() {
++    let (mut f, _id, _surface) = set_up();
++    let bridge = f.add_client();
++    let keyboard = virtual_keyboard(&mut f, bridge);
++    send_keymap(&keyboard, &seat_keymap(&mut f));
++    bridge_key(&keyboard, KEY_LEFTMETA, true, MOD_SUPER);
++    let client = f.client(bridge);
++    let manager = client.state.virtual_pointer_manager.as_ref().unwrap();
++    let pointer = manager.create_virtual_pointer(None, &client.qh, ());
++    let vertical = wl_pointer::Axis::VerticalScroll;
++
++    // `Input::scroll`: a completed notch is `axis_discrete`, a partial one plain `axis`.
++    pointer.axis_source(wl_pointer::AxisSource::Wheel);
++    pointer.axis_discrete(0, vertical, 15., 1);
++    pointer.frame();
++    f.roundtrip(bridge);
++    assert_eq!(f.niri().test_action_count, 1);
++
++    pointer.axis_source(wl_pointer::AxisSource::Wheel);
++    pointer.axis(0, vertical, 7.5);
++    pointer.frame();
++    f.roundtrip(bridge);
++    assert_eq!(f.niri().test_action_count, 1);
++
++    pointer.axis_source(wl_pointer::AxisSource::Wheel);
++    pointer.axis_discrete(0, vertical, 30., 2);
++    pointer.frame();
++    f.roundtrip(bridge);
++    assert_eq!(f.niri().test_action_count, 3);
++}
++
++#[derive(Debug, Clone, PartialEq)]
++enum GrabEvent {
++    Keymap(String),
++    Modifiers([u32; 4]),
++    Key(u32, u32),
++}
++
++/// An input method like Fcitx: it grabs the keyboard and forwards the keys it does not consume
++/// through a virtual keyboard of its own, with the keymap and modifiers the grab gave it.
++struct InputMethod {
++    id: ClientId,
++    log: Arc<Mutex<Vec<GrabEvent>>>,
++    forward: ZwpVirtualKeyboardV1,
++    replayed: usize,
++}
++
++impl InputMethod {
++    fn new(f: &mut Fixture) -> Self {
++        let id = f.add_client();
++        let manager: ZwpInputMethodManagerV2 = bind(f, id);
++        let log = Arc::new(Mutex::new(Vec::new()));
++        let client = f.client(id);
++        let seat = client.state.seats.keys().next().unwrap().clone();
++        let input_method = manager.get_input_method(&seat, &client.qh, ());
++        let _grab = input_method.grab_keyboard(&client.qh, log.clone());
++        f.roundtrip(id);
++        f.roundtrip(id);
++        let forward = virtual_keyboard(f, id);
++        let mut ime = Self {
++            id,
++            log,
++            forward,
++            replayed: 0,
++        };
++        ime.forward_all(f);
++        ime
++    }
++
++    fn keys(&self) -> Vec<(u32, u32)> {
++        let log = self.log.lock().unwrap();
++        log.iter()
++            .filter_map(|event| match event {
++                GrabEvent::Key(key, state) => Some((*key, *state)),
++                _ => None,
++            })
++            .collect()
++    }
++
++    /// Forwards everything the grab received so far, as Fcitx does for unhandled keys.
++    fn forward_all(&mut self, f: &mut Fixture) {
++        f.roundtrip(self.id);
++        let events = self.log.lock().unwrap()[self.replayed..].to_vec();
++        self.replayed += events.len();
++        for event in events {
++            match event {
++                GrabEvent::Keymap(text) => {
++                    // Smithay hands the grab an unsealed file without a trailing NUL.
++                    let (fd, size) = keymap_file(&text, false, false);
++                    self.forward.keymap(1, fd.as_fd(), size);
++                }
++                GrabEvent::Modifiers([depressed, latched, locked, group]) => {
++                    self.forward.modifiers(depressed, latched, locked, group);
++                }
++                GrabEvent::Key(key, state) => self.forward.key(0, key, state),
++            }
++        }
++        f.roundtrip(self.id);
++    }
++}
++
++#[test]
++fn input_method_forwarded_keys_bypass_its_grab_without_updating_xkb() {
++    let (mut f, id, surface) = set_up();
++    let bridge = f.add_client();
++    let keyboard = virtual_keyboard(&mut f, bridge);
++    send_keymap(&keyboard, &seat_keymap(&mut f));
++    f.roundtrip(bridge);
++    let mut ime = InputMethod::new(&mut f);
++
++    // The bridge's own XKB state follows CapsLock, so its masks lock it too.
++    for key in [KEY_CAPSLOCK, KEY_A] {
++        keyboard.key(0, key, 1);
++        keyboard.modifiers(0, 0, MOD_LOCK, 0);
++        keyboard.key(0, key, 0);
++        keyboard.modifiers(0, 0, MOD_LOCK, 0);
++    }
++    f.roundtrip(bridge);
++    f.roundtrip(ime.id);
++    assert_eq!(
++        ime.keys(),
++        [(KEY_CAPSLOCK, 1), (KEY_CAPSLOCK, 0), (KEY_A, 1), (KEY_A, 0)]
++    );
++    assert!(keys(&mut f, id, &surface).is_empty());
++    assert!(caps_lock(&mut f));
++
++    ime.forward_all(&mut f);
++    f.roundtrip(bridge);
++    f.roundtrip(id);
++
++    // Forwarded keys reach the focus once, are not looped back into the grab, and do not apply
++    // CapsLock a second time.
++    assert_eq!(ime.keys().len(), 4);
++    assert_eq!(
++        keys(&mut f, id, &surface),
++        [
++            "key pressed: 58",
++            "key released: 58",
++            "key pressed: 30",
++            "key released: 30",
++        ]
++    );
++    assert!(caps_lock(&mut f));
++}
++
++/// What a focused client decodes from its keymap and key events (like `lab/dynamic-app`).
++#[derive(Default)]
++struct Typed {
++    keymap: Option<String>,
++    text: String,
++}
++
++/// A second `wl_keyboard` in the window's client that records the text it would type.
++fn typed(f: &mut Fixture, id: ClientId) -> Arc<Mutex<Typed>> {
++    let typed = Arc::new(Mutex::new(Typed::default()));
++    let client = f.client(id);
++    let seat = client.state.seats.keys().next().unwrap().clone();
++    let _keyboard = seat.get_keyboard(&client.qh, typed.clone());
++    f.roundtrip(id);
++    typed
++}
++
++#[test]
++fn committed_unicode_through_an_input_method_restores_the_seat() {
++    let (mut f, id, surface) = set_up();
++    let bridge = f.add_client();
++    let keyboard = virtual_keyboard(&mut f, bridge);
++    let text_keyboard = virtual_keyboard(&mut f, bridge);
++    let keymap = seat_keymap(&mut f);
++    send_keymap(&keyboard, &keymap);
++    keyboard.modifiers(0, 0, MOD_LOCK, 0);
++    f.roundtrip(bridge);
++    let state = f.niri_state();
++    let seat = state.niri.seat.get_keyboard().unwrap();
++    seat.with_xkb_state(state, |mut context| context.set_layout(Layout(1)));
++    let mut ime = InputMethod::new(&mut f);
++    let typed = typed(&mut f, id);
++    let _ = events(&mut f, id, &surface);
++
++    for (i, character) in "U@日本😀x".chars().enumerate() {
++        // `Input::text`.
++        send_keymap(&text_keyboard, &unicode_keymap(character));
++        text_keyboard.modifiers(0, 0, 0, 0);
++        text_keyboard.key(0, KEY_TEXT, 1);
++        text_keyboard.key(0, KEY_TEXT, 0);
++        send_keymap(&text_keyboard, &keymap);
++        keyboard.modifiers(0, 0, MOD_LOCK, 0);
++        f.roundtrip(bridge);
++        // The input method lags behind the bridge.
++        if i % 2 == 1 {
++            ime.forward_all(&mut f);
++        }
++    }
++    ime.forward_all(&mut f);
++    f.roundtrip(id);
++
++    assert_eq!(keys(&mut f, id, &surface).len(), 12);
++    assert_eq!(typed.lock().unwrap().text, "U@日本😀x");
++    // The input method's relayed copy of the text keymap must not stay on the seat: a new
++    // bridge connection would wait for a real keymap, and other clients would see this one.
++    assert!(f.niri().virtual_keyboard_keymap.is_none());
++    assert_eq!(seat_keymap(&mut f), keymap);
++    assert_eq!(active_layout(&mut f), 1);
++    assert!(caps_lock(&mut f));
++}
++
++struct Registry;
++
++impl Dispatch<WlRegistry, Registry> for client::State {
++    fn event(
++        _: &mut Self,
++        _: &WlRegistry,
++        _: wl_registry::Event,
++        _: &Registry,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++    }
++}
++
++impl Dispatch<ZwpVirtualKeyboardManagerV1, ()> for client::State {
++    fn event(
++        _: &mut Self,
++        _: &ZwpVirtualKeyboardManagerV1,
++        _: <ZwpVirtualKeyboardManagerV1 as wayland_client::Proxy>::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++    }
++}
++
++impl Dispatch<ZwpVirtualKeyboardV1, ()> for client::State {
++    fn event(
++        _: &mut Self,
++        _: &ZwpVirtualKeyboardV1,
++        _: <ZwpVirtualKeyboardV1 as wayland_client::Proxy>::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++    }
++}
++
++impl Dispatch<ZwpInputMethodManagerV2, ()> for client::State {
++    fn event(
++        _: &mut Self,
++        _: &ZwpInputMethodManagerV2,
++        _: <ZwpInputMethodManagerV2 as wayland_client::Proxy>::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++    }
++}
++
++impl Dispatch<ZwpInputMethodV2, ()> for client::State {
++    fn event(
++        _: &mut Self,
++        _: &ZwpInputMethodV2,
++        _: <ZwpInputMethodV2 as wayland_client::Proxy>::Event,
++        _: &(),
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++    }
++}
++
++impl Dispatch<ZwpInputMethodKeyboardGrabV2, Arc<Mutex<Vec<GrabEvent>>>> for client::State {
++    fn event(
++        _: &mut Self,
++        _: &ZwpInputMethodKeyboardGrabV2,
++        event: zwp_input_method_keyboard_grab_v2::Event,
++        log: &Arc<Mutex<Vec<GrabEvent>>>,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        let event = match event {
++            zwp_input_method_keyboard_grab_v2::Event::Keymap { fd, size, .. } => {
++                let mut file = File::from(fd);
++                file.seek(SeekFrom::Start(0)).unwrap();
++                let mut text = String::new();
++                file.take(u64::from(size))
++                    .read_to_string(&mut text)
++                    .unwrap();
++                GrabEvent::Keymap(text.trim_end_matches('\0').to_owned())
++            }
++            zwp_input_method_keyboard_grab_v2::Event::Modifiers {
++                mods_depressed,
++                mods_latched,
++                mods_locked,
++                group,
++                ..
++            } => GrabEvent::Modifiers([mods_depressed, mods_latched, mods_locked, group]),
++            zwp_input_method_keyboard_grab_v2::Event::Key { key, state, .. } => {
++                GrabEvent::Key(key, u32::from(state))
++            }
++            _ => return,
++        };
++        log.lock().unwrap().push(event);
++    }
++}
++
++impl Dispatch<WlKeyboard, Arc<Mutex<Typed>>> for client::State {
++    fn event(
++        _: &mut Self,
++        _: &WlKeyboard,
++        event: wl_keyboard::Event,
++        typed: &Arc<Mutex<Typed>>,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        let mut typed = typed.lock().unwrap();
++        match event {
++            wl_keyboard::Event::Keymap { fd, size, .. } => {
++                let mut text = String::new();
++                File::from(fd)
++                    .take(u64::from(size))
++                    .read_to_string(&mut text)
++                    .unwrap();
++                typed.keymap = Some(text.trim_end_matches('\0').to_owned());
++            }
++            wl_keyboard::Event::Key {
++                key,
++                state: wayland_client::WEnum::Value(wl_keyboard::KeyState::Pressed),
++                ..
++            } => {
++                let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
++                let keymap = xkb::Keymap::new_from_string(
++                    &context,
++                    typed.keymap.clone().unwrap(),
++                    xkb::KEYMAP_FORMAT_TEXT_V1,
++                    xkb::KEYMAP_COMPILE_NO_FLAGS,
++                )
++                .unwrap();
++                let text = xkb::State::new(&keymap).key_get_utf8((key + 8).into());
++                typed.text.push_str(&text);
++            }
++            _ => (),
++        }
++    }
++}

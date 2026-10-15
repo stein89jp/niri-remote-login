@@ -5,7 +5,16 @@ real-app capture/input evidence are now available under [compositor](../composit
 and [validation](validation.md). The research below describes the original stock
 baseline; its statements about unstarted compositor tests are historical.
 
-Research date: 2026-10-10. Baseline: Niri commit `2c82b77a7116a1241ea2fd41dd008ff00b609aae`, manifest version 26.4.0, Smithay commit `19c16d3e34172fcc8fb3d293bcae563b0a19ea70`. Selected source files are retained under `research/upstream/niri`; this is a research snapshot, not a complete buildable checkout. Findings below derive from that snapshot unless explicitly attributed to a PR. No compositor, capture client, input injector, or network listener was started.
+Implementation update (2026-10-15): the compositor is rebased onto upstream
+`main` `fc9e8c425e2267d877a65918f030c86f3c698179` (Smithay `8a270232`) with a
+12-patch feature series, 0001 being PR #3953's headless backend. The cursor now
+uses upstream's ext-image-copy-capture cursor sessions instead of a private
+protocol. Upstream now routes virtual keyboards through Niri's keybindings,
+releases held keys and supports input-method forwarded keys and v120 wheel
+values, so those local patches were dropped. See the
+[rebase record](validation.md#niri-rebase-onto-upstream-main-2026-10-15).
+
+Research date: 2026-10-10. Baseline: Niri commit `2c82b77a7116a1241ea2fd41dd008ff00b609aae`, manifest version 26.4.0, Smithay commit `19c16d3e34172fcc8fb3d293bcae563b0a19ea70`. Selected source files were inspected locally under `research/upstream/niri` (listed with URLs and SHA-256 digests in `research/upstream/manifest.json`; the copies are not tracked); this is a research snapshot, not a complete buildable checkout. Findings below derive from that snapshot unless explicitly attributed to a PR. No compositor, capture client, input injector, or network listener was started.
 
 ## Feasibility
 

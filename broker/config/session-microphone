@@ -1,0 +1,701 @@
+#!/usr/bin/python3
+"""Remote microphone: NRM1 frames from the frontend feed a private PipeWire source.
+
+This helper is only a client of the private graph that session-audio owns. It
+never touches the playback sink, its socket or its restart budget. The source
+is a pw-cat stream with media.class Audio/Source: it exists while pw-cat runs,
+outputs silence when no data arrives and holds at most one small pipe of audio.
+The helper tells the frontend when a recorder uses the source (IN_USE) and,
+after a debounce, when none does (IDLE); the frontend opens or closes the RDP
+AUDIO_INPUT channel accordingly.
+
+pw-cat must never wait for input: its stream is asynchronous, so a read that
+blocks past a graph cycle costs both a gap and lost samples (measured: 20-25%
+loss when 20 ms packets were written as they arrived). The helper therefore
+paces pw-cat on CLOCK_MONOTONIC, which also drives the headless graph, keeping
+LEAD of audio ahead of it. A small jitter buffer absorbs packet timing; an
+empty one is padded with silence, and one beyond JITTER_HIGH is cut back.
+"""
+from collections import namedtuple
+import ctypes
+import os
+from pathlib import Path
+import select
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import time
+
+
+MAGIC = b"NRM1"
+# Frontend -> helper: magic, kind, channels, flags, rate, sequence, length,
+# CLOCK_MONOTONIC nanoseconds when the frontend decoded the Data PDU.
+HEADER = struct.Struct("!4sBBHIIIQ")
+# Helper -> frontend: magic, kind and three reserved zero bytes.
+REPLY = struct.Struct("!4sBBH")
+HELLO, AVAILABLE, UNAVAILABLE, AUDIO = range(4)
+REPLY_HELLO, IN_USE, IDLE = range(3)
+RATES = frozenset({44100, 48000})
+MAX_AUDIO_BYTES = 19200  # 100 ms of 48 kHz stereo S16LE
+AGE_BUDGET_NS = 100_000_000
+PIPE_BYTES = 4096  # write size; writes up to PIPE_BUF are atomic
+# Capacity only: pacing keeps just LEAD plus one tick in flight, so this
+# bounds nothing stale. It fits that for 48 kHz stereo (about 85 ms).
+PIPE_CAPACITY = 16384
+LEAD_SECONDS = 0.03  # written ahead of pw-cat's reads; 20 ms underran under load
+PACE_SECONDS = 0.01
+JITTER_HIGH_SECONDS = 0.06  # a fuller jitter buffer is cut back to the target
+JITTER_TARGET_SECONDS = 0.02
+STALL_SECONDS = 0.1  # pacing that fell this far behind restarts instead of bursting
+IDLE_DEBOUNCE_SECONDS = 5
+# Recorder changes arrive as pactl subscribe events. Polling is only the
+# fallback while that subscriber is down: every new pactl client briefly
+# reconfigures the graph (measured: a 1 ms gap in the recorded source).
+STATE_POLL_SECONDS = 2
+QUERY_TIMEOUT_SECONDS = 2
+DEFAULT_SOURCE_TRIES = 10
+# Finite pw-cat restarts, separate from playback's GRAPH_ATTEMPTS. A run of
+# ten healthy minutes earns a fresh budget, as for the playback graph.
+PW_CAT_ATTEMPTS = 5
+PW_CAT_HEALTHY_SECONDS = 600
+OUTBOUND_LIMIT = 64 * REPLY.size
+SOURCE = "niri-rdp-microphone"
+SOCKET_NAME = "audio-in-0"
+PW_CAT = "/usr/bin/pw-cat"
+PACTL = "/usr/bin/pactl"
+SUPERVISOR_PID = os.getpid()
+
+COUNTERS = ("forwarded", "aged", "idle", "gaps", "skipped", "full", "silence_ms")
+Record = namedtuple("Record", "kind channels rate sequence payload received_ns")
+
+
+class ProtocolError(ValueError):
+    pass
+
+
+def parse_header(data):
+    """Validate one 28-byte header; return (kind, channels, rate, sequence, length, received_ns)."""
+    magic, kind, channels, flags, rate, sequence, length, received_ns = HEADER.unpack(data)
+    if magic != MAGIC:
+        raise ProtocolError("bad magic")
+    if flags:
+        raise ProtocolError("non-zero flags")
+    if kind in (HELLO, UNAVAILABLE):
+        if channels or length:
+            raise ProtocolError("control record carries a format or payload")
+    elif kind in (AVAILABLE, AUDIO):
+        if channels not in (1, 2):
+            raise ProtocolError("unsupported channel count")
+        if rate not in RATES:
+            raise ProtocolError("unsupported rate")
+        if kind == AVAILABLE and length:
+            raise ProtocolError("AVAILABLE carries a payload")
+        if length > MAX_AUDIO_BYTES:
+            raise ProtocolError("oversized audio")
+        if length % (2 * channels):
+            raise ProtocolError("misaligned audio")
+    else:
+        raise ProtocolError("unknown kind")
+    return kind, channels, rate, sequence, length, received_ns
+
+
+class Reader:
+    """Incremental NRM1 decoder; the first record must be HELLO, and only once."""
+
+    def __init__(self):
+        self.buffer = bytearray()
+        self.greeted = False
+
+    def feed(self, data):
+        self.buffer.extend(data)
+        records = []
+        while len(self.buffer) >= HEADER.size:
+            kind, channels, rate, sequence, length, received_ns = parse_header(
+                bytes(self.buffer[:HEADER.size]))
+            if (kind == HELLO) == self.greeted:
+                raise ProtocolError("HELLO must be the first record, and only once")
+            if len(self.buffer) < HEADER.size + length:
+                break
+            payload = bytes(self.buffer[HEADER.size:HEADER.size + length])
+            del self.buffer[:HEADER.size + length]
+            self.greeted = True
+            records.append(Record(kind, channels, rate, sequence, payload, received_ns))
+        return records
+
+
+def reply(kind):
+    return REPLY.pack(MAGIC, kind, 0, 0)
+
+
+class Debouncer:
+    """IN_USE at once when a recorder runs; IDLE only after a quiet period."""
+
+    def __init__(self, delay=IDLE_DEBOUNCE_SECONDS):
+        self.delay = delay
+        self.in_use = False
+        self.idle_since = None
+
+    def observe(self, running, now):
+        """Return True when the reported state changes."""
+        if running:
+            self.idle_since = None
+            if not self.in_use:
+                self.in_use = True
+                return True
+            return False
+        if not self.in_use:
+            return False
+        if self.idle_since is None:
+            self.idle_since = now
+        if now - self.idle_since >= self.delay:
+            self.in_use = False
+            self.idle_since = None
+            return True
+        return False
+
+    def deadline(self):
+        return None if self.idle_since is None else self.idle_since + self.delay
+
+
+class Budget:
+    """Consecutive pw-cat failures; a healthy run resets the count."""
+
+    def __init__(self, attempts=PW_CAT_ATTEMPTS, healthy_seconds=PW_CAT_HEALTHY_SECONDS):
+        self.attempts = attempts
+        self.healthy_seconds = healthy_seconds
+        self.failures = 0
+
+    def failed(self, run_seconds):
+        """Return the backoff before the next start, or None once exhausted."""
+        if run_seconds >= self.healthy_seconds:
+            self.failures = 0
+        self.failures += 1
+        if self.failures >= self.attempts:
+            return None
+        return min(0.5 * 2 ** (self.failures - 1), 2.0)
+
+
+def descendant_setup():
+    # Own process group, and parent death ends it even if this helper is SIGKILLed.
+    libc = ctypes.CDLL(None, use_errno=True)
+    if libc.prctl(1, signal.SIGTERM, 0, 0, 0) != 0 or os.getppid() != SUPERVISOR_PID:
+        os._exit(125)
+
+
+def stop_process(process):
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    try:
+        process.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        process.wait()
+
+
+def spawn(command, brief=False, **arguments):
+    # Brief pactl calls skip preexec_fn: that forces a full fork of this
+    # process, whose pause would starve paced pw-cat input. They are bounded by
+    # QUERY_TIMEOUT_SECONDS instead of the parent-death signal.
+    return subprocess.Popen(command, stdin=arguments.pop("stdin", subprocess.DEVNULL),
+                            start_new_session=True,
+                            preexec_fn=None if brief else descendant_setup, **arguments)
+
+
+class Feeder:
+    """One pw-cat process whose stream node is the remote microphone source."""
+
+    def __init__(self, rate, channels, clock):
+        self.format = (rate, channels)
+        self.started = clock()
+        properties = ("{ media.class=Audio/Source node.name=" + SOURCE +
+                      ' node.description="Remote microphone (RDP)"'
+                      " node.autoconnect=false node.virtual=true }")
+        self.process = spawn([PW_CAT, "--playback", "--raw", "--format=s16",
+                              "--rate=" + str(rate), "--channels=" + str(channels),
+                              "--latency=10ms", "-P", properties, "-"],
+                             stdin=subprocess.PIPE, stdout=subprocess.DEVNULL,
+                             bufsize=0, pipesize=PIPE_CAPACITY)
+        os.set_blocking(self.process.stdin.fileno(), False)
+        try:
+            self.pidfd = os.pidfd_open(self.process.pid)
+        except OSError:
+            self.pidfd = None
+        # A second, non-blocking read end of the same pipe (a new open file
+        # description, so pw-cat's blocking stdin is unaffected). pw-cat stops
+        # reading when its last recorder leaves; whatever the pacing put ahead
+        # of it then would otherwise be replayed at the next recording, and
+        # each stop and start would add that much delay.
+        try:
+            self.drain_fd = os.open(f"/proc/self/fd/{self.process.stdin.fileno()}",
+                                    os.O_RDONLY | os.O_NONBLOCK | os.O_CLOEXEC)
+        except OSError:
+            self.drain_fd = None
+
+    def write(self, payload):
+        """Write atomic, sample-aligned chunks; return the number of dropped chunks."""
+        step = PIPE_BYTES - PIPE_BYTES % (2 * self.format[1])
+        dropped = 0
+        for start in range(0, len(payload), step):
+            try:
+                os.write(self.process.stdin.fileno(), payload[start:start + step])
+            except (BlockingIOError, BrokenPipeError):
+                dropped += 1
+        return dropped
+
+    def discard(self):
+        """Drop the audio pw-cat has not read; return the number of bytes."""
+        dropped = 0
+        while self.drain_fd is not None:
+            try:
+                data = os.read(self.drain_fd, 65536)
+            except BlockingIOError:
+                break
+            if not data:
+                break
+            dropped += len(data)
+        return dropped
+
+    def exited(self):
+        return self.process.poll() is not None
+
+    def close(self):
+        if self.pidfd is not None:
+            os.close(self.pidfd)
+            self.pidfd = None
+        if self.drain_fd is not None:
+            os.close(self.drain_fd)
+            self.drain_fd = None
+        try:
+            self.process.stdin.close()
+        except OSError:
+            pass
+        stop_process(self.process)
+
+
+class Microphone:
+    def __init__(self, listener, clock=time.monotonic, now_ns=time.monotonic_ns, log=None):
+        self.listener = listener
+        self.clock = clock
+        self.now_ns = now_ns
+        self.log = log or (lambda message: print(message, file=sys.stderr, flush=True))
+        self.connection = None
+        self.reader = None
+        self.outbound = bytearray()
+        self.expected_sequence = None
+        self.counters = dict.fromkeys(COUNTERS, 0)
+        self.pending = bytearray()  # jitter buffer, whole frames of the feeder format
+        self.pace_start = None
+        self.paced_frames = 0
+        self.feeder = None
+        self.wanted = None  # (rate, channels) requested by AVAILABLE or AUDIO
+        self.restart_at = None
+        self.budget = Budget()
+        self.exhausted = False
+        self.debouncer = Debouncer()
+        self.running = False
+        self.subscriber = None
+        self.subscriber_buffer = bytearray()
+        self.query = None
+        self.query_output = bytearray()
+        self.query_started = None
+        self.query_wanted = False
+        self.next_poll = None
+        self.default = None
+        self.default_tries = 0
+        self.default_set = False
+
+    # Frontend connection -------------------------------------------------
+    def accept(self, connection):
+        # A reconnecting frontend must never queue behind a dead one.
+        self.drop_connection("superseded")
+        connection.setblocking(False)
+        self.connection = connection
+        self.reader = Reader()
+        self.outbound = bytearray(reply(REPLY_HELLO) + reply(IN_USE if self.debouncer.in_use else IDLE))
+        self.expected_sequence = None
+        self.counters = dict.fromkeys(COUNTERS, 0)
+        self.flush()
+
+    def drop_connection(self, reason):
+        if self.connection is None:
+            return
+        counts = self.counters
+        self.log(f"remote microphone frontend {reason}: " +
+                 " ".join(f"{name}={counts[name]}" for name in COUNTERS))
+        self.connection.close()
+        self.connection = None
+        self.reader = None
+        self.outbound = bytearray()
+
+    def flush(self):
+        while self.connection is not None and self.outbound:
+            try:
+                sent = self.connection.send(self.outbound)
+            except BlockingIOError:
+                break
+            except OSError:
+                self.drop_connection("closed")
+                return
+            del self.outbound[:sent]
+        if self.connection is not None and len(self.outbound) > OUTBOUND_LIMIT:
+            self.drop_connection("stopped reading")
+
+    def receive(self):
+        try:
+            data = self.connection.recv(65536)
+        except BlockingIOError:
+            return
+        except OSError:
+            data = b""
+        if not data:
+            self.drop_connection("closed")
+            return
+        try:
+            records = self.reader.feed(data)
+        except ProtocolError as error:
+            self.log("remote microphone protocol error (" + str(error) +
+                     "); microphone off until the next RDP connection")
+            self.drop_connection("rejected")
+            return
+        for record in records:
+            self.handle(record)
+
+    def handle(self, record):
+        if record.kind == AVAILABLE:
+            self.request((record.rate, record.channels))
+        elif record.kind == AUDIO:
+            self.forward(record)
+
+    def forward(self, record):
+        if self.expected_sequence is not None and record.sequence != self.expected_sequence:
+            self.counters["gaps"] += (record.sequence - self.expected_sequence) & 0xFFFFFFFF
+        self.expected_sequence = (record.sequence + 1) & 0xFFFFFFFF
+        if not record.payload:
+            return
+        if self.feeder is not None and self.feeder.format != (record.rate, record.channels):
+            self.request((record.rate, record.channels))
+        # Only an actually running source consumes audio. During the IDLE
+        # debounce nothing records, so queued audio would only turn stale.
+        if self.feeder is None or not self.running:
+            self.counters["idle"] += 1
+            return
+        if self.now_ns() - record.received_ns > AGE_BUDGET_NS:
+            self.counters["aged"] += 1
+            return
+        self.counters["forwarded"] += 1
+        self.pending.extend(record.payload)
+        rate, channels = self.feeder.format
+        frame = 2 * channels
+        if len(self.pending) > int(JITTER_HIGH_SECONDS * rate) * frame:
+            # A faster client clock or a burst: skip the oldest audio.
+            del self.pending[:len(self.pending) - int(JITTER_TARGET_SECONDS * rate) * frame]
+            self.counters["skipped"] += 1
+        self.pace()
+
+    def pace(self):
+        """Keep LEAD ahead of pw-cat, padding an empty jitter buffer with silence."""
+        if self.feeder is None or not self.running:
+            self.pace_start = None
+            self.pending.clear()
+            return
+        now = self.clock()
+        rate, channels = self.feeder.format
+        frame = 2 * channels
+        if self.pace_start is None or now - self.pace_start - self.paced_frames / rate > STALL_SECONDS:
+            self.pace_start = now
+            self.paced_frames = 0
+        due = int((now - self.pace_start + LEAD_SECONDS) * rate) - self.paced_frames
+        while due > 0:
+            frames = min(due, PIPE_BYTES // frame)
+            data = bytes(self.pending[:frames * frame])
+            del self.pending[:frames * frame]
+            if len(data) < frames * frame:
+                self.counters["silence_ms"] += (frames * frame - len(data)) * 1000 // (frame * rate)
+                data += bytes(frames * frame - len(data))
+            self.counters["full"] += self.feeder.write(data)
+            self.paced_frames += frames
+            due -= frames
+
+    def pace_deadline(self):
+        if self.feeder is None or not self.running or self.pace_start is None:
+            return None
+        return self.clock() + PACE_SECONDS
+
+    # pw-cat source --------------------------------------------------------
+    def request(self, wanted):
+        if self.exhausted:
+            return
+        if self.feeder is not None and self.feeder.format == wanted:
+            return
+        self.wanted = wanted
+        if self.feeder is not None:
+            # A deliberate format change is not a failure.
+            self.log(f"remote microphone format {wanted[0]} Hz, {wanted[1]} channel(s); recreating source")
+            self.stop_feeder()
+        if self.restart_at is None:
+            self.start_feeder()
+
+    def start_feeder(self):
+        self.restart_at = None
+        try:
+            self.feeder = Feeder(*self.wanted, self.clock)
+        except OSError as error:
+            self.log("remote microphone source unavailable: " + str(error))
+            self.feeder_failed(0)
+            return
+        self.default_set = False
+        self.default_tries = 0
+        self.start_subscriber()
+        self.schedule_query()
+
+    def stop_feeder(self):
+        if self.feeder is not None:
+            self.feeder.close()
+            self.feeder = None
+        self.running = False
+        self.pace()
+
+    def feeder_failed(self, run_seconds):
+        self.stop_feeder()
+        delay = self.budget.failed(run_seconds)
+        if delay is None:
+            self.exhausted = True
+            self.log("remote microphone source failed repeatedly; stopping the microphone helper")
+            raise SystemExit(1)
+        self.log(f"remote microphone source stopped; recreating in {delay:g} s")
+        self.restart_at = self.clock() + delay
+
+    def check_feeder(self):
+        if self.feeder is not None and self.feeder.exited():
+            self.feeder_failed(self.clock() - self.feeder.started)
+
+    # Recorder detection ---------------------------------------------------
+    def start_subscriber(self):
+        if self.subscriber is not None and self.subscriber.poll() is None:
+            return
+        self.stop_subscriber()
+        try:
+            self.subscriber = spawn([PACTL, "subscribe"], stdout=subprocess.PIPE,
+                                    stderr=subprocess.DEVNULL, bufsize=0)
+            os.set_blocking(self.subscriber.stdout.fileno(), False)
+        except OSError:
+            self.subscriber = None
+
+    def stop_subscriber(self):
+        if self.subscriber is not None:
+            self.subscriber.stdout.close()
+            stop_process(self.subscriber)
+            self.subscriber = None
+            self.subscriber_buffer = bytearray()
+
+    def read_subscriber(self):
+        try:
+            data = os.read(self.subscriber.stdout.fileno(), 4096)
+        except BlockingIOError:
+            return
+        if not data:
+            # pipewire-pulse restarted: the poll timer covers the gap.
+            self.stop_subscriber()
+            return
+        self.subscriber_buffer.extend(data)
+        *lines, rest = self.subscriber_buffer.split(b"\n")
+        self.subscriber_buffer = bytearray(rest[-4096:])
+        if any(b" source" in line for line in lines):
+            self.schedule_query()
+
+    def schedule_query(self):
+        self.query_wanted = True
+
+    def start_query(self, now):
+        self.query_wanted = False
+        self.next_poll = now + STATE_POLL_SECONDS
+        try:
+            self.query = spawn([PACTL, "list", "short", "sources"], brief=True, stdout=subprocess.PIPE,
+                               stderr=subprocess.DEVNULL, bufsize=0)
+            os.set_blocking(self.query.stdout.fileno(), False)
+        except OSError:
+            self.query = None
+            return
+        self.query_output = bytearray()
+        self.query_started = now
+
+    def read_query(self):
+        try:
+            data = os.read(self.query.stdout.fileno(), 65536)
+        except BlockingIOError:
+            return
+        if data:
+            self.query_output.extend(data)
+            return
+        self.finish_query(True)
+
+    def finish_query(self, complete):
+        process, self.query = self.query, None
+        process.stdout.close()
+        stop_process(process)
+        if complete and process.returncode == 0:
+            self.sources(bytes(self.query_output))
+
+    def sources(self, listing):
+        present = running = False
+        for line in listing.splitlines():
+            fields = line.split(b"\t")
+            if len(fields) > 1 and fields[1] == SOURCE.encode():
+                present = True
+                running = fields[-1].strip() == b"RUNNING"
+        was_running = self.running
+        self.running = running and self.feeder is not None
+        if was_running and not self.running and self.feeder is not None:
+            # The last recorder left: nothing reads the pipe now, so its
+            # contents could only be replayed late. Start the next one fresh.
+            self.feeder.discard()
+        self.observe()
+        self.pace()
+        if present and self.feeder is not None and not self.default_set:
+            self.set_default()
+
+    def set_default(self):
+        if self.default is not None or self.default_tries >= DEFAULT_SOURCE_TRIES:
+            return
+        self.default_tries += 1
+        try:
+            self.default = spawn([PACTL, "set-default-source", SOURCE], brief=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        except OSError:
+            self.default = None
+
+    def check_default(self):
+        if self.default is None or self.default.poll() is None:
+            return
+        if self.default.returncode == 0:
+            self.default_set = True
+        elif self.default_tries >= DEFAULT_SOURCE_TRIES:
+            self.log("remote microphone could not become the default source")
+        else:
+            self.schedule_query()  # retry through a fresh look at the source
+        self.default = None
+
+    def observe(self):
+        if self.debouncer.observe(self.running, self.clock()):
+            in_use = self.debouncer.in_use
+            self.log("remote microphone " + ("in use" if in_use else "idle"))
+            if self.connection is not None:
+                self.outbound.extend(reply(IN_USE if in_use else IDLE))
+                self.flush()
+
+    # Event loop -----------------------------------------------------------
+    def timers(self):
+        now = self.clock()
+        if self.restart_at is not None and now >= self.restart_at:
+            self.start_feeder()
+        if self.query is not None and now - self.query_started > QUERY_TIMEOUT_SECONDS:
+            self.finish_query(False)
+        if self.feeder is not None and self.query is None and (
+                self.query_wanted or self.next_poll is None or
+                (now >= self.next_poll and self.subscriber is None)):
+            if self.subscriber is None:
+                self.start_subscriber()
+            self.start_query(now)
+        self.check_default()
+        self.observe()
+        self.pace()
+
+    def timeout(self):
+        now = self.clock()
+        deadlines = [now + 0.5]
+        for deadline in (self.restart_at, self.debouncer.deadline(), self.pace_deadline(),
+                         self.next_poll if self.feeder is not None and self.subscriber is None else None):
+            if deadline is not None:
+                deadlines.append(deadline)
+        return max(0, min(deadlines) - now)
+
+    def run(self):
+        # A fresh poll set each round: descriptor numbers are reused after a
+        # close, so no registration may outlive the object it was made for.
+        while True:
+            poller = select.poll()
+            handlers = {}
+
+            def watch(fd, events, handler):
+                poller.register(fd, events)
+                handlers[fd] = handler
+            watch(self.listener.fileno(), select.POLLIN, self.accept_ready)
+            connection = self.connection
+            if connection is not None:
+                watch(connection.fileno(), select.POLLIN | (select.POLLOUT if self.outbound else 0),
+                      lambda events: self.connection_ready(connection, events))
+            subscriber = self.subscriber
+            if subscriber is not None:
+                watch(subscriber.stdout.fileno(), select.POLLIN,
+                      lambda _: self.subscriber is subscriber and self.read_subscriber())
+            query = self.query
+            if query is not None:
+                watch(query.stdout.fileno(), select.POLLIN,
+                      lambda _: self.query is query and self.read_query())
+            feeder = self.feeder
+            if feeder is not None and feeder.pidfd is not None:
+                watch(feeder.pidfd, select.POLLIN, lambda _: None)
+            for fd, events in poller.poll(int(self.timeout() * 1000) + 1):
+                handlers[fd](events)
+            self.check_feeder()
+            self.timers()
+
+    def accept_ready(self, _events):
+        try:
+            connection, _ = self.listener.accept()
+        except BlockingIOError:
+            return
+        self.accept(connection)
+
+    def connection_ready(self, connection, events):
+        if self.connection is connection and events & select.POLLOUT:
+            self.flush()
+        if self.connection is connection and events & (select.POLLIN | select.POLLHUP | select.POLLERR):
+            self.receive()
+
+    def close(self):
+        self.drop_connection("closed")
+        self.stop_feeder()
+        self.stop_subscriber()
+        if self.query is not None:
+            self.finish_query(False)
+        if self.default is not None:
+            stop_process(self.default)
+            self.default = None
+
+
+def main():
+    runtime = Path(os.environ["NIRI_RDP_RUNTIME_DIR"])
+    os.umask(0o077)
+
+    def shutdown(*_):
+        raise SystemExit(0)
+    signal.signal(signal.SIGTERM, shutdown)
+    signal.signal(signal.SIGINT, shutdown)
+    path = runtime / SOCKET_NAME
+    with socket.socket(socket.AF_UNIX) as listener:
+        try:
+            path.unlink(missing_ok=True)
+            listener.bind(str(path))
+            listener.listen(4)
+            listener.setblocking(False)
+        except OSError as error:
+            print("remote microphone socket unavailable: " + str(error), file=sys.stderr, flush=True)
+            raise SystemExit(1)
+        microphone = Microphone(listener)
+        try:
+            microphone.run()
+        finally:
+            microphone.close()
+            path.unlink(missing_ok=True)
+
+
+if __name__ == "__main__":
+    main()

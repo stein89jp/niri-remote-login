@@ -78,6 +78,26 @@ class NativeVideoTests(unittest.TestCase):
             self.assertEqual(decoded.stderr, b"", "decoder reference continuity failed")
             self.assertEqual(len(decoded.stdout), 640 * 368 * 4 * 180)
 
+    def test_gop_configuration_and_descriptive_native_errors(self):
+        if not shutil.which("cc") or not shutil.which("pkg-config"):
+            self.skipTest("C compiler and FFmpeg development libraries required")
+        flags = subprocess.run(
+            ["pkg-config", "--cflags", "--libs", "libavcodec", "libavutil", "libswscale"],
+            capture_output=True, text=True,
+        )
+        if flags.returncode:
+            self.skipTest("FFmpeg development libraries required")
+        with tempfile.TemporaryDirectory() as directory:
+            executable = str(Path(directory) / "video-config")
+            subprocess.run(
+                ["cc", "-O2", "-Wall", "-Wextra", "-Werror", str(ROOT / "tests/video_config.c"),
+                 "-o", executable, *shlex.split(flags.stdout)],
+                check=True, capture_output=True, text=True,
+            )
+            result = subprocess.run([executable], capture_output=True, text=True, timeout=20)
+            self.assertEqual(result.returncode, 0, result.stderr + result.stdout)
+            self.assertIn("PASS:", result.stdout)
+
     def test_tightly_packed_input_and_yuv_edge_padding(self):
         if not shutil.which("cc") or not shutil.which("pkg-config"):
             self.skipTest("C compiler and FFmpeg development libraries required")

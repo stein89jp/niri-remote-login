@@ -4,16 +4,23 @@ Treat the bridge, broker and headless compositor as one tested release. Preserve
 the old combined package (or both split package files), source bundles, checksums, configuration, checkpoint
 and machine acceptance record before upgrading the **separate test machine**.
 
-Current maintained base: Niri PR #3953 at
-`0be60b742762905b7bee1ea67bb5a2fb00859bf0`, Smithay
-`ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef`, and the patch under
-`compositor/patches/`. `compositor/pins.json` records source/lock hashes and the
-comparison with PR #3800. IronRDP is pinned to
-`bf019ca502d1e52616853a5ded68c885cec1e322` by `bridge/Cargo.toml` and its lockfile.
+Current maintained base: upstream Niri `main` at
+`fc9e8c425e2267d877a65918f030c86f3c698179`, Smithay
+`8a270232f1bfc416c781273c98a3f52a812a0bba`, with the 12-patch feature series in
+`compositor/patches/` (0001 is the headless backend of PR #3953, rebased; see
+the [compositor patch table](../compositor/README.md)). `compositor/pins.json`
+records source/lock/patch hashes, the previous pin and the comparison with
+PR #3800. The compositor and bridge must be upgraded together
+(`niri-rdp-headless>=26.04.remote2-1`): the bridge's cursor relies on patch
+0011. IronRDP is pinned to
+`7b976a6965c96c76ff949313e174ea55dada8c44` by `bridge/Cargo.toml` and its lockfile.
 No floating PR branch, git `main` or implicit dependency update is a release.
+The [release history](#release-history) maps the "release N" names used in
+older notes to package versions.
 
 For a new compositor base, download its exact revision in an isolated checkout,
-review the upstream diff and reapply the local patch. Reevaluate startup backend,
+review the upstream diff and rebase the patch series one feature at a time,
+dropping any patch whose behavior upstream now provides. Reevaluate startup backend,
 render clock, output bounds/lifecycle, SHM capture, rejected buffers and privileged
 virtual input. Regenerate the lockfile intentionally, record the new source and
 patch hashes, then run the retained tests and disposable real-desktop integration.
@@ -33,15 +40,85 @@ Rollback: stop both services, reinstall the retained combined package (or both s
 matching configuration, reload units and rerun the smoke checks. Rolling back
 only a binary after an ABI-changing Arch upgrade is not guaranteed to work;
 retain a disposable VM snapshot as the stronger recovery method.
+To rebuild the old compositor pin instead, restore from git history
+`compositor/patches/0001-remote-headless-bounds-and-startup.patch`,
+`0002-remote-cursor-capture.patch`, `compositor/protocols/niri-rdp-cursor-v1.xml`,
+the old `0be60b74` source tarball and the matching old bridge, and make the
+`previous` block of `compositor/pins.json` the `selected` one. The old bridge
+and old compositor also belong together.
 
 When upstream Niri provides all required behavior, create a new tested headless
-package from the upstream revision without the now-unnecessary patch. Keep the
+package from the upstream revision without the now-unnecessary patches. Keep the
 private binary path and broker contract until the whole boot/capture/input/
 cleanup matrix passes. Then a separately reviewed release can depend on stock
 Niri and change the fixed worker path. No package performs this migration or
 replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
+
+The compositor is now rebased onto upstream Niri `main` `fc9e8c42` with a
+12-patch series (see [validation](validation.md#niri-rebase-onto-upstream-main-2026-10-15)).
+The custom `niri-rdp-cursor-v1` protocol is gone: the bridge reads the cursor
+through standard ext-image-copy-capture cursor sessions, and the compositor
+carries a small no-echo patch (0011) and a drag-and-drop icon patch (0012).
+A new bridge against an older compositor, or the reverse, loses the separate
+cursor or makes it snap back while moving, so upgrade both together. The
+combined package does this. A separate split build must install
+`niri-rdp-headless` `26.04.remote2-1` together with `niri-remote-login`, which
+now requires it. End any retained remote desktop and start a fresh one, so the
+new compositor runs; reconnecting to a retained desktop keeps the old one.
+Building in a reused `packaging/arch/niri-rdp` directory is safe: `prepare()` now
+clears the copied source tree in `src/` (except the bridge's Cargo `target/`)
+before copying, so files deleted from the checkout, such as the old compositor
+patches or `bridge/src/wayland.rs`, no longer break the build. Your Niri
+configuration, keyboard layouts and input-method setup need no changes.
+
+The authentication, TLS and frontend-hardening changes after `1.5-1` need two
+manual steps on an existing installation. `/etc/pam.d/niri-rdp` is a pacman
+`backup` file: if you edited it, pacman installs the new policy as
+`/etc/pam.d/niri-rdp.pacnew`. Merge that file, keeping its private faillock
+directory, and do not keep an include of `system-remote-login`. If you use NVENC,
+copy the packaged `nvidia-frontend.conf` over
+`/etc/systemd/system/niri-rdp-frontend.service.d/nvidia.conf` again; older copies
+have no `DeviceAllow` lines, and the hardened frontend then fails NVENC with a
+device permission error. Existing generated certificates are adopted and renewed
+automatically near expiry, which changes their fingerprint; see
+[install](install.md#connect-with-windows-remote-desktop).
+
+The frontend-to-broker protocol is now version 2 (`NRB2`), which carries the
+client address for `PAM_RHOST` and the audit journal. The broker rejects
+version 1 requests, so the frontend and broker must be upgraded together; the
+combined package does this. With split packages, install both at once and
+restart both services; a new frontend against an old broker (or the reverse)
+rejects every login. Restarting the broker ends retained desktops, so start
+fresh remote logins afterwards. `/etc/niri-rdp/broker.conf` is a new pacman
+`backup` file holding `grace_seconds` (default 45, as before); see
+[broker settings](install.md#broker-settings). The broker unit no longer uses
+`PrivateTmp`, so new desktops share `/tmp` with the account's other logins and
+use the PAM umask (022 by default); merge `pam_umask` from
+`/etc/pam.d/niri-rdp.pacnew` if pacman created one. Optional fail2ban examples
+are installed under `/usr/share/doc/niri-remote-login/fail2ban/` and are not
+enabled; see [install](install.md#login-audit-log-and-fail2ban).
+
+The clipboard now exchanges HTML and images as well as text, in both
+directions. Files remain unsupported. The frontend provides this, so it applies
+to connections made after the frontend restarts; no settings change is needed.
+
+Microphone redirection (mstsc **Record from this computer**) adds a new session
+helper, `/usr/lib/niri-rdp/session-microphone`, and a new package dependency,
+`pipewire-audio`, which pacman installs with the package. The broker's `NRB2`
+success reply may now carry a third descriptor for the microphone, which an
+older frontend rejects, so the frontend and broker must be upgraded together;
+the combined package does this, and split packages need both installed and both
+services restarted. The feature is on by default (`NIRI_RDP_MICROPHONE=auto`);
+if you edited `/etc/niri-rdp/frontend.conf`, pacman keeps your file and the new
+commented setting appears only in `frontend.conf.pacnew`, which you need not
+merge unless you want `off`. If you edited `/etc/niri-rdp/waybar.json`, merge the
+new `privacy` microphone indicator from `waybar.json.pacnew`. End any retained
+remote desktop and start a fresh one, so the session starts the new helper;
+reconnecting to a retained desktop keeps playback but has no microphone. The
+playback path and its accepted PCM configuration are unchanged. See
+[remote microphone](install.md#remote-microphone).
 
 Version `1.5-1` publishes the performance, picture-quality, clipboard and smooth
 cursor improvements together. It retains the tested runtime source from
@@ -203,3 +280,56 @@ ordinary XDG autostart on the private display and bus. The configured input
 framework also starts before user applications. The bridge inherits Niri's keyboard map instead of supplying a fixed
 Japanese layout. Existing language profiles and startup configuration are reused.
 Log out and start a fresh remote login to receive the new startup environment.
+
+## Release history
+
+Older notes, [acceptance](acceptance.md) and `CLAUDE.md` say "release N". That
+is the `pkgrel` of version `0.1.0`: release 19 is `niri-remote-login 0.1.0-19`.
+Versions from `1.0.0` restart `pkgrel` at 1. The table is reconstructed from Git
+history: the date is that of the first commit carrying the version, not
+necessarily the build or install date, and several builds may share one commit.
+Releases 1–3 were split packages (`niri-remote-login` plus `niri-rdp-headless`);
+the combined `packaging/arch/niri-rdp` package starts at release 4.
+"Headless" is the `niri-rdp-headless` version built from the same commit.
+Only `v1.5` is documented as a published GitHub release; whether earlier
+versions were published is unknown.
+
+| Package | Release | Date | Commit | Headless | Headline change |
+| --- | --- | --- | --- | --- | --- |
+| `0.1.0-1` | 1 | 2026-10-10 | `1a7b4b8` | `26.04.remote1-1` | Initial import: split packages, bridge, broker, patched Niri |
+| `0.1.0-2` | 2 | 2026-10-10 | `9c93819` | `26.04.remote1-1` | Optional NVENC H.264 host encoding |
+| `0.1.0-3` | 3 | 2026-10-10 | `1ee22b7` | `26.04.remote1-2` | Client-selected resolution and live resize |
+| `0.1.0-4` | 4 | 2026-10-10 | `231646e` | `26.04.remote1-2` | Combined package, direct listening, first-start TLS, RDP login screen |
+| `0.1.0-5` | 5 | 2026-10-10 | `9b97832` | `26.04.remote1-3` | NVIDIA-first EGL rendering, 60 fps NVENC budget |
+| `0.1.0-6` | 6 | 2026-10-11 | `79ac410` | `26.04.remote1-4` | Login screen fixes; two later commits at this pkgrel add reconnect grace and phone/Unicode keyboard |
+| `0.1.0-7` | 7 | 2026-10-11 | `d0a9ee2` | `26.04.remote1-4` | Remote audio playback |
+| `0.1.0-8` | 8 | 2026-10-12 | `d5144eb` | `26.04.remote1-4` | Flatpak permission fixes |
+| `0.1.0-9` | 9 | 2026-10-12 | `7240a83` | `26.04.remote1-4` | Audio pacing and adaptive NVENC bitrate |
+| `0.1.0-10` | 10 | 2026-10-12 | `7169481` | `26.04.remote1-4` | Private file portals (Firefox downloads) |
+| `0.1.0-11` | 11 | 2026-10-12 | `43b45d8` | `26.04.remote1-5` | Host keyboard layout and input-method inheritance |
+| `0.1.0-12` | 12 | 2026-10-12 | `f73167a` | `26.04.remote1-5` | Keyboard inheritance with an empty Niri `xkb` section |
+| `0.1.0-13` | 13 | 2026-10-12 | `7e2d191` | `26.04.remote1-5` | NVIDIA device-preparation service |
+| `0.1.0-14` | 14 | 2026-10-12 | `dd602fd` | `26.04.remote1-5` | NVIDIA control/UVM nodes, WirePlumber wait, login error split |
+| `0.1.0-15` | 15 | 2026-10-12 | `c0414ee` | `26.04.remote1-6` | Playback feedback fix, MS ADPCM, Fcitx5 fixes |
+| `0.1.0-16` | 16 | 2026-10-12 | `ffb60d3` | `26.04.remote1-6` | PCM preferred over MS ADPCM (static) |
+| `0.1.0-17` | 17 | 2026-10-12 | `a5f7df6` | `26.04.remote1-6` | AAC-LC, zero RDPSND timestamps, capture limits |
+| `0.1.0-18` | 18 | 2026-10-12 | `49ca7f6` | `26.04.remote1-6` | Bounded audio recovery; AAC crackled in mstsc |
+| `0.1.0-19` | 19 | 2026-10-12 | `b7e3995` | `26.04.remote1-6` | PCM preferred again: **accepted audio baseline** |
+| `0.1.0-20` | 20 | 2026-10-13 | `a5c1b66` | `26.04.remote1-6` | Fresh-completion backlog recovery (Firefox delay) |
+| `1.0.0-1` | — | 2026-10-13 | `31b47f2` | `26.04.remote1-6` | Version renumbering of the release 20 source; README |
+| `1.0.1` | — | unknown | — | — | Unknown: no `1.0.1` appears in Git history |
+| `1.0.2-1` | — | 2026-10-13 | `8c5471b` | `26.04.remote1-6` | Author attribution, licensing notes, packaged README |
+| `1.1.0-1` | — | 2026-10-14 | `7abfd65` | `26.04.remote1-8` | Performance/desktop upgrades and text clipboard |
+| `1.1.0-2` | — | 2026-10-15 | `a4e7b5e` | `26.04.remote1-8` | mstsc cursor-jumping fix, NVIDIA improvements |
+| `1.5-1` | — | 2026-10-15 | `bae6626` | `26.04.remote1-9` | Published `v1.5`: 1.1.0-2 runtime as a release |
+| `1.5.5-1` | — | 2026-10-15 | this release | `26.04.remote2-1` | Niri rebase, hardening, rich clipboard, microphone |
+
+`niri-rdp-headless` `26.04.remote1-7` does not appear in any commit. The
+PKGBUILDs carry `pkgver=1.5.5`/`pkgrel=1`. Bump the version again before
+building or publishing later changes, so packages with different contents never
+share a version.
+
+The bridge crate (`bridge/Cargo.toml`) keeps version `0.1.0` on purpose. It is
+not published (`publish = false`), nothing reads `CARGO_PKG_VERSION`, and the
+package `pkgver`-`pkgrel` is the release identity. Keeping the crate version
+fixed avoids changing `Cargo.lock` with every release.

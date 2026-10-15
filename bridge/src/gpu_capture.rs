@@ -124,6 +124,9 @@ impl Drop for Device {
 pub(crate) struct Buffer {
     device: Arc<Device>,
     raw: *mut libc::c_void,
+    /// Exported once: every frame ticket duplicates this descriptor, so the
+    /// encoder sees one stable DMA-BUF identity per slot.
+    fd: OwnedFd,
     pub stride: u32,
     pub modifier: u64,
     pub offset: u32,
@@ -140,10 +143,7 @@ impl Drop for Buffer {
 }
 impl Buffer {
     pub fn fd(&self) -> anyhow::Result<OwnedFd> {
-        let _guard = self.device.lock.lock().unwrap();
-        let fd = unsafe { (self.device.api.bo_fd)(self.raw) };
-        anyhow::ensure!(fd >= 0, "exporting capture DMA-BUF failed");
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
+        Ok(self.fd.try_clone()?)
     }
     pub fn device(&self) -> u64 {
         self.device.identity
@@ -254,9 +254,16 @@ impl Allocator {
         }
         anyhow::ensure!(!raw.is_null(), "GPU capture allocation failed");
         let planes = unsafe { (self.device.api.bo_plane_count)(raw) };
+        let fd = unsafe { (self.device.api.bo_fd)(raw) };
+        if fd < 0 {
+            unsafe { (self.device.api.bo_destroy)(raw) };
+            anyhow::bail!("exporting capture DMA-BUF failed");
+        }
         let buffer = Buffer {
             device: self.device.clone(),
             raw,
+            // SAFETY: gbm_bo_get_fd returned a new descriptor owned by the caller.
+            fd: unsafe { OwnedFd::from_raw_fd(fd) },
             stride: unsafe { (self.device.api.bo_stride)(raw) },
             modifier: unsafe { (self.device.api.bo_modifier)(raw) },
             offset: unsafe { (self.device.api.bo_offset)(raw, 0) },

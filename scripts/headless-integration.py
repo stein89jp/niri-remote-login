@@ -306,6 +306,9 @@ def main():
                     print(f"test broker counters: rejected={fixture.rejected}, accepted={fixture.accepted}, closed={fixture.closed}")
                 raise RuntimeError(f"wrong-password rejection failed: rc={bad.returncode} {bad.stderr}")
             results["wrong_disposable_credentials"] = "passed"
+            # FreeRDP retries the rejected login once; wait out the frontend's
+            # per-source backoff so the next good client is not throttled.
+            time.sleep(1.5)
             if login_screen:
                 client_env["NIRI_RDP_TEST_LOGIN_SCREEN"] = "1"
             for i in range(2):

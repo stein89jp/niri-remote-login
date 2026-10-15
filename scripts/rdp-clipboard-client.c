@@ -1,5 +1,5 @@
 #define _POSIX_C_SOURCE 200809L
-/* A real CLIPRDR client restricted to known disposable test strings. */
+/* A real CLIPRDR client restricted to known disposable test strings and images. */
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -18,11 +18,88 @@ typedef struct {
     rdpContext context;
     CliprdrClientContext *clip;
     BOOL received, sent, failed, initialized;
+    UINT32 requested;
+    int rich_step; /* 0: awaiting the native image, 1: its HTML, 2: done. */
 } Probe;
 static const UINT16 native_text[] = {'W','a','y','l','a','n','d',' ',0x65e5,0x672c,0xd83d,0xde00,'\r','\n','l','i','n','e',' ', '2',0};
 static const UINT16 remote_text[] = {'R','D','P',' ',0x65e5,0x672c,0xd83d,0xde00,'\r','\n','l','i','n','e',' ', '2',0};
 static const UINT16 empty_text[] = {0};
 static const UINT16 intermediate_text[] = {'s','t','a','l','e',0};
+/* Rich mode: fixed images and HTML matching scripts/clipboard-integration.py. */
+#define CLIENT_HTML_ID 0xC0F3u
+static const BYTE native_rgba[6][4] = {{255, 0, 0, 255}, {0, 255, 0, 255}, {0, 0, 255, 128},
+                                       {10, 20, 30, 255}, {40, 50, 60, 0}, {200, 100, 50, 255}};
+static const char native_fragment[] = "<p>Wayland <i>rich</i> \xe6\x97\xa5\xe6\x9c\xac</p>";
+static const char remote_document[] =
+    "<html><body>\r\n<!--StartFragment--><b>RDP rich</b><!--EndFragment-->\r\n</body>\r\n</html>";
+static const BYTE remote_rgb[6][3] = {{1, 2, 3}, {4, 5, 6}, {7, 8, 9}, {250, 251, 252}, {128, 64, 32}, {0, 0, 0}};
+static BOOL rich(void) { return getenv("NIRI_RDP_TEST_CLIPBOARD_RICH") != NULL; }
+static UINT32 le32(const BYTE *p) { return p[0] | (UINT32)p[1] << 8 | (UINT32)p[2] << 16 | (UINT32)p[3] << 24; }
+static void put32(BYTE *p, UINT32 v) { for (int i = 0; i < 4; i++) p[i] = (BYTE)(v >> (8 * i)); }
+/* The bridge converts the native PNG to a bottom-up 32-bit BI_RGB CF_DIB. */
+static BOOL native_dib_ok(const BYTE *data, UINT32 length) {
+    if (length != 40 + 24 || le32(data) != 40 || le32(data + 4) != 3 || le32(data + 8) != 2 ||
+        data[12] != 1 || data[14] != 32 || le32(data + 16) != 0) return FALSE;
+    for (int y = 0; y < 2; y++) for (int x = 0; x < 3; x++) {
+        const BYTE *p = data + 40 + ((1 - y) * 3 + x) * 4, *e = native_rgba[y * 3 + x];
+        if (p[0] != e[2] || p[1] != e[1] || p[2] != e[0] || p[3] != e[3]) return FALSE;
+    }
+    return TRUE;
+}
+static BOOL native_html_ok(const BYTE *data, UINT32 length) {
+    char *text = calloc(1, (size_t)length + 1);
+    if (!text) return FALSE;
+    memcpy(text, data, length);
+    const char *start = strstr(text, "StartFragment:"), *end = strstr(text, "EndFragment:");
+    BOOL ok = FALSE;
+    if (start && end) {
+        unsigned long from = strtoul(start + 14, NULL, 10), to = strtoul(end + 12, NULL, 10);
+        size_t expected = strlen(native_fragment);
+        ok = from <= to && to <= length && to - from == expected && !memcmp(data + from, native_fragment, expected);
+    }
+    free(text);
+    return ok;
+}
+static UINT advertise_rich(CliprdrClientContext *clip) {
+    CLIPRDR_FORMAT formats[] = {{.formatId = CLIENT_HTML_ID, .formatName = (char *)"HTML Format"},
+                                {.formatId = CF_DIB, .formatName = NULL}};
+    CLIPRDR_FORMAT_LIST list = {.common = {.msgType = CB_FORMAT_LIST}, .numFormats = 2, .formats = formats};
+    return clip->ClientFormatList(clip, &list);
+}
+static UINT send_rich(CliprdrClientContext *clip, UINT32 format) {
+    Probe *probe = clip->custom;
+    BYTE buffer[512];
+    UINT32 length;
+    if (format == CLIENT_HTML_ID) {
+        const char *layout = "Version:0.9\r\nStartHTML:%010u\r\nEndHTML:%010u\r\nStartFragment:%010u\r\nEndFragment:%010u\r\n";
+        unsigned base = (unsigned)snprintf(NULL, 0, layout, 0u, 0u, 0u, 0u);
+        unsigned size = (unsigned)strlen(remote_document);
+        unsigned from = (unsigned)(strstr(remote_document, "<b>") - remote_document);
+        unsigned to = (unsigned)(strstr(remote_document, "<!--EndFragment") - remote_document);
+        int header = snprintf((char *)buffer, sizeof(buffer), layout, base, base + size, base + from, base + to);
+        if (header != (int)base || base + size + 1 > sizeof(buffer)) return CHANNEL_RC_BAD_CHANNEL;
+        memcpy(buffer + base, remote_document, size + 1);
+        length = base + size + 1;
+    } else if (format == CF_DIB) {
+        /* 24-bit bottom-up rows of nine bytes plus three bytes of padding. */
+        memset(buffer, 0, 40 + 24);
+        put32(buffer, 40); put32(buffer + 4, 3); put32(buffer + 8, 2);
+        buffer[12] = 1; buffer[14] = 24; put32(buffer + 20, 24);
+        for (int row = 0; row < 2; row++) for (int x = 0; x < 3; x++) {
+            const BYTE *c = remote_rgb[(1 - row) * 3 + x];
+            BYTE *p = buffer + 40 + row * 12 + x * 3;
+            p[0] = c[2]; p[1] = c[1]; p[2] = c[0];
+        }
+        length = 40 + 24;
+    } else {
+        return CHANNEL_RC_BAD_CHANNEL;
+    }
+    CLIPRDR_FORMAT_DATA_RESPONSE response = {.common = {.msgType = CB_FORMAT_DATA_RESPONSE,
+        .msgFlags = CB_RESPONSE_OK, .dataLen = length}, .requestedFormatData = buffer};
+    UINT result = clip->ClientFormatDataResponse(clip, &response);
+    if (result == CHANNEL_RC_OK && format == CF_DIB) { probe->sent = TRUE; puts("NIRI_RDP_CLIPBOARD_RDP_DATA_SENT"); }
+    return result;
+}
 static UINT advertise(CliprdrClientContext *clip) {
     CLIPRDR_FORMAT format = {.formatId = 13, .formatName = NULL};
     CLIPRDR_FORMAT_LIST list = {.common = {.msgType = CB_FORMAT_LIST}, .numFormats = 1, .formats = &format};
@@ -51,6 +128,23 @@ static UINT format_list(CliprdrClientContext *clip, const CLIPRDR_FORMAT_LIST *l
     CLIPRDR_FORMAT_LIST_RESPONSE ack = {.common = {.msgType = CB_FORMAT_LIST_RESPONSE, .msgFlags = CB_RESPONSE_OK}};
     UINT result = clip->ClientFormatListResponse(clip, &ack);
     if (result != CHANNEL_RC_OK) return result;
+    Probe *probe = clip->custom;
+    if (rich()) {
+        UINT32 wanted = 0;
+        BOOL png = FALSE;
+        for (UINT32 i = 0; i < list->numFormats; i++) {
+            const CLIPRDR_FORMAT *format = &list->formats[i];
+            BOOL html = format->formatName && !strcmp(format->formatName, "HTML Format");
+            png |= format->formatName && !strcmp(format->formatName, "PNG");
+            if ((probe->rich_step == 0 && format->formatId == CF_DIB) || (probe->rich_step == 1 && html))
+                wanted = format->formatId;
+        }
+        if (!wanted) return CHANNEL_RC_OK;
+        if (probe->rich_step == 0 && !png) { probe->failed = TRUE; return CHANNEL_RC_BAD_CHANNEL; }
+        probe->requested = wanted;
+        CLIPRDR_FORMAT_DATA_REQUEST request = {.common = {.msgType = CB_FORMAT_DATA_REQUEST}, .requestedFormatId = wanted};
+        return clip->ClientFormatDataRequest(clip, &request);
+    }
     for (UINT32 i = 0; i < list->numFormats; i++) if (list->formats[i].formatId == 13) {
         CLIPRDR_FORMAT_DATA_REQUEST request = {.common = {.msgType = CB_FORMAT_DATA_REQUEST}, .requestedFormatId = 13};
         return clip->ClientFormatDataRequest(clip, &request);
@@ -59,6 +153,23 @@ static UINT format_list(CliprdrClientContext *clip, const CLIPRDR_FORMAT_LIST *l
 }
 static UINT format_data(CliprdrClientContext *clip, const CLIPRDR_FORMAT_DATA_RESPONSE *response) {
     Probe *probe = clip->custom;
+    if (rich()) {
+        BOOL ok = (response->common.msgFlags & CB_RESPONSE_OK) != 0;
+        if (ok && probe->rich_step == 0 && probe->requested == CF_DIB &&
+            native_dib_ok(response->requestedFormatData, response->common.dataLen)) {
+            probe->rich_step = 1;
+            puts("NIRI_RDP_CLIPBOARD_IMAGE_OK");
+            return CHANNEL_RC_OK;
+        }
+        if (ok && probe->rich_step == 1 && native_html_ok(response->requestedFormatData, response->common.dataLen)) {
+            probe->rich_step = 2;
+            probe->received = TRUE;
+            puts("NIRI_RDP_CLIPBOARD_NATIVE_TO_RDP_OK");
+            return advertise_rich(clip);
+        }
+        probe->failed = TRUE;
+        return CHANNEL_RC_BAD_CHANNEL;
+    }
     const void *expected = getenv("NIRI_RDP_TEST_CLIPBOARD_EMPTY") ? empty_text : native_text;
     size_t length = getenv("NIRI_RDP_TEST_CLIPBOARD_EMPTY") ? sizeof(empty_text) : sizeof(native_text);
     if (!(response->common.msgFlags & CB_RESPONSE_OK) || response->common.dataLen != length ||
@@ -76,6 +187,7 @@ static UINT format_data(CliprdrClientContext *clip, const CLIPRDR_FORMAT_DATA_RE
 }
 static UINT data_request(CliprdrClientContext *clip, const CLIPRDR_FORMAT_DATA_REQUEST *request) {
     Probe *probe = clip->custom;
+    if (rich()) return probe->rich_step == 2 ? send_rich(clip, request->requestedFormatId) : CHANNEL_RC_BAD_CHANNEL;
     if (request->requestedFormatId != 13) return CHANNEL_RC_BAD_CHANNEL;
     const void *data = getenv("NIRI_RDP_TEST_CLIPBOARD_EMPTY") ? empty_text : remote_text;
     size_t length = getenv("NIRI_RDP_TEST_CLIPBOARD_EMPTY") ? sizeof(empty_text) : sizeof(remote_text);

@@ -1,9 +1,17 @@
 # Functionality and NVIDIA review — 2026-10-10
 
+> **Historical record.** This review describes the `0.1.0-4`/`0.1.0-5` source of
+> 2026-10-10 and is kept for its failure/fix evidence only. It is not a
+> description of the current release; "current" below means that 2026-10-10
+> source. For the present state see the [README](../README.md),
+> [performance controls](performance.md), the
+> [validation record](validation.md) and the
+> [release history](upgrade.md#release-history).
+
 The functionality review below records the earlier fixes and NVIDIA host
 encoding work. The combined `niri-remote-login-0.1.0-4` package also added
 direct network listening, first-start TLS setup, and an RDP login screen; see
-[the latest validation](validation.md#simplified-arch-host-installation-2026-10-10). The existing 0.1.0 binary archives are unchanged; rebuild the frontend
+[its validation record](archive/validation-0.1.md#simplified-arch-host-installation-2026-10-10). The existing 0.1.0 binary archives are unchanged; rebuild the frontend
 package from this source to use the fixes. The current build folder installs the compositor and frontend together. Installation steps are in
 [install.md](install.md#optional-nvidia-encoding).
 

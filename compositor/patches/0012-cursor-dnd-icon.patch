@@ -1,0 +1,356 @@
+From cfaad5f1ca3a4e2739a1a9ac13df7571522c1e13 Mon Sep 17 00:00:00 2001
+From: Niri-RDP rebase <niri-rdp@localhost>
+Date: Thu, 15 Oct 2026 14:16:52 +0900
+Subject: [PATCH 12/12] image-copy-capture: include the drag-and-drop icon in
+ cursor captures
+
+render_pointer() draws the drag-and-drop icon at its offset from the
+pointer together with the cursor, so screencopy with overlay_cursor and
+screen output show it. Cursor capture sessions only rendered the cursor
+image, so a client that draws the cursor itself from a cursor session and
+captures the output without it (the Niri-RDP bridge) lost drag icons.
+
+While a drag is active, the cursor capture now covers the union of the
+cursor image and the icon's surface tree (plus the pointer pixel, so the
+hotspot stays inside the buffer when the cursor is hidden). The buffer
+size and hotspot follow that area, and the icon is rendered below the
+cursor like in render_pointer(). Without a drag nothing changes. Icon
+appearance, movement and removal go through the existing size-change
+(buffer_constraints) and damage paths.
+
+This keeps the drag icon that the former niri-rdp-cursor-v1 protocol
+included in its cursor shape.
+---
+ src/handlers/image_copy_capture.rs |  70 ++++++++++++++----
+ src/niri.rs                        |  37 +++++++++-
+ src/tests/cursor_capture.rs        | 115 ++++++++++++++++++++++++++++-
+ 3 files changed, 200 insertions(+), 22 deletions(-)
+
+diff --git a/src/handlers/image_copy_capture.rs b/src/handlers/image_copy_capture.rs
+index 2037ef52..dfdd817b 100644
+--- a/src/handlers/image_copy_capture.rs
++++ b/src/handlers/image_copy_capture.rs
+@@ -178,8 +178,8 @@ pub fn cursor_capture_constraints(niri: &Niri, output: &Output) -> BufferConstra
+     }
+ }
+ 
+-/// Size the cursor renders at on this output.
+-fn cursor_capture_size(niri: &Niri, output: &Output) -> Size<i32, BufferCoords> {
++/// Size the cursor image renders at on this output, empty when hidden.
++fn cursor_image_size(niri: &Niri, output: &Output) -> Size<i32, Physical> {
+     let int_scale = output.current_scale().integer_scale();
+     let scale = Scale::from(output.current_scale().fractional_scale());
+ 
+@@ -207,25 +207,18 @@ fn cursor_capture_size(niri: &Niri, output: &Output) -> Size<i32, BufferCoords>
+         }
+     };
+ 
+-    // Fall back to the nominal cursor size when the cursor is currently hidden or has no
+-    // buffer, so that the session always has valid constraints.
+-    if size.is_empty() {
+-        let fallback = i32::from(niri.config.borrow().cursor.xcursor_size) * int_scale;
+-        return Size::from((fallback, fallback));
+-    }
+-
+-    Size::from((size.w, size.h))
++    size
+ }
+ 
+-/// Cursor hotspot in capture buffer coordinates.
+-pub fn cursor_capture_hotspot(niri: &Niri, output: &Output) -> Point<i32, BufferCoords> {
++/// Hotspot within the cursor image.
++pub fn cursor_image_hotspot(niri: &Niri, output: &Output) -> Point<i32, Physical> {
+     let int_scale = output.current_scale().integer_scale();
+     let scale = Scale::from(output.current_scale().fractional_scale());
+ 
+     let hotspot: Point<i32, Physical> = match niri.cursor_manager.get_render_cursor(int_scale) {
+         RenderCursor::Hidden => Point::from((0, 0)),
+         RenderCursor::Surface { surface, hotspot } => {
+-            // The tree is shifted to put its bounding box at the origin in
++            // The tree is shifted to put its bounding box at the image origin in
+             // render_cursor_for_capture(), so shift the hotspot too.
+             let bbox = smithay::desktop::utils::bbox_from_surface_tree(&surface, (0, 0));
+             (hotspot - bbox.loc)
+@@ -238,7 +231,7 @@ pub fn cursor_capture_hotspot(niri: &Niri, output: &Output) -> Point<i32, Buffer
+             ..
+         } => {
+             let (_idx, frame) = cursor.frame(niri.start_time.elapsed().as_millis() as u32);
+-            // Same rescaling as in cursor_capture_size().
++            // Same rescaling as in cursor_image_size().
+             XCursor::hotspot(frame)
+                 .to_logical(buffer_scale)
+                 .to_f64()
+@@ -246,7 +239,54 @@ pub fn cursor_capture_hotspot(niri: &Niri, output: &Output) -> Point<i32, Buffer
+         }
+     };
+ 
+-    Point::from((hotspot.x, hotspot.y))
++    hotspot
++}
++
++/// Drag-and-drop icon relative to the pointer, where `render_pointer()` draws it.
++///
++/// Includes the pointer pixel, so that the hotspot stays inside the capture even when the icon
++/// is away from the pointer and the cursor is hidden.
++pub fn dnd_icon_capture_rect(niri: &Niri, output: &Output) -> Option<Rectangle<i32, Physical>> {
++    let icon = niri.dnd_icon.as_ref()?;
++    let scale = Scale::from(output.current_scale().fractional_scale());
++    let bbox = smithay::desktop::utils::bbox_from_surface_tree(&icon.surface, icon.offset);
++    let rect = bbox.to_f64().to_physical_precise_up(scale);
++    (!rect.is_empty()).then(|| rect.merge(Rectangle::from_size(Size::from((1, 1)))))
++}
++
++/// Area of the cursor capture relative to the pointer: the cursor image and, during a drag, the
++/// drag-and-drop icon, like `render_pointer()` draws them. `None` when both are hidden.
++pub fn cursor_capture_area(niri: &Niri, output: &Output) -> Option<Rectangle<i32, Physical>> {
++    let size = cursor_image_size(niri, output);
++    let cursor = (!size.is_empty()).then(|| {
++        let hotspot = cursor_image_hotspot(niri, output);
++        Rectangle::new(Point::from((-hotspot.x, -hotspot.y)), size)
++    });
++    match (cursor, dnd_icon_capture_rect(niri, output)) {
++        (Some(cursor), Some(icon)) => Some(cursor.merge(icon)),
++        (cursor, icon) => cursor.or(icon),
++    }
++}
++
++/// Size of the cursor capture buffer on this output.
++fn cursor_capture_size(niri: &Niri, output: &Output) -> Size<i32, BufferCoords> {
++    match cursor_capture_area(niri, output) {
++        Some(area) => Size::from((area.size.w, area.size.h)),
++        // Fall back to the nominal cursor size when the cursor is currently hidden or has no
++        // buffer, so that the session always has valid constraints.
++        None => {
++            let int_scale = output.current_scale().integer_scale();
++            let fallback = i32::from(niri.config.borrow().cursor.xcursor_size) * int_scale;
++            Size::from((fallback, fallback))
++        }
++    }
++}
++
++/// Cursor hotspot (the pointer position) in capture buffer coordinates.
++pub fn cursor_capture_hotspot(niri: &Niri, output: &Output) -> Point<i32, BufferCoords> {
++    cursor_capture_area(niri, output).map_or(Point::from((0, 0)), |area| {
++        Point::from((-area.loc.x, -area.loc.y))
++    })
+ }
+ 
+ pub enum CaptureBuffer {
+diff --git a/src/niri.rs b/src/niri.rs
+index d382d1c0..867ea7c8 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -6002,17 +6002,27 @@ impl Niri {
+         let int_scale = output.current_scale().integer_scale();
+         let output_scale = Scale::from(output.current_scale().fractional_scale());
+ 
++        // The capture covers the cursor image and the drag-and-drop icon around the pointer
++        // (cursor_capture_area()); this is the pointer position within the capture buffer.
++        let pointer = image_copy_capture_impl::cursor_capture_area(self, output)
++            .map_or(Point::from((0, 0)), |area| {
++                Point::<i32, Physical>::from((-area.loc.x, -area.loc.y))
++            });
++        let cursor_hotspot = image_copy_capture_impl::cursor_image_hotspot(self, output);
++        let cursor_origin = pointer - cursor_hotspot;
++
+         let mut elements = Vec::new();
+         match self.cursor_manager.get_render_cursor(int_scale) {
+             RenderCursor::Hidden => (),
+             RenderCursor::Surface { surface, .. } => {
+                 // Subsurfaces can extend above or to the left of the root surface, so shift the
+-                // tree to put its bounding box at the origin. The hotspot is shifted to match in
+-                // cursor_capture_hotspot().
++                // tree to put its bounding box at the image origin. The hotspot is shifted to
++                // match in cursor_image_hotspot().
+                 let bbox = smithay::desktop::utils::bbox_from_surface_tree(&surface, (0, 0));
+                 let loc = Point::<i32, Logical>::from((-bbox.loc.x, -bbox.loc.y))
+                     .to_f64()
+-                    .to_physical_precise_round(output_scale);
++                    .to_physical_precise_round(output_scale)
++                    + cursor_origin;
+                 push_elements_from_surface_tree(
+                     renderer,
+                     &surface,
+@@ -6032,7 +6042,7 @@ impl Niri {
+                 let texture = self.cursor_texture_cache.get(icon, scale, &cursor, idx);
+                 match MemoryRenderBufferRenderElement::from_buffer(
+                     renderer,
+-                    Point::<f64, _>::from((0., 0.)),
++                    cursor_origin.to_f64(),
+                     &texture,
+                     None,
+                     None,
+@@ -6047,6 +6057,25 @@ impl Niri {
+             }
+         }
+ 
++        // Like render_pointer(), draw the drag-and-drop icon at its offset from the pointer,
++        // below the cursor.
++        if let Some(dnd_icon) = self.dnd_icon.as_ref() {
++            let loc = dnd_icon
++                .offset
++                .to_f64()
++                .to_physical_precise_round(output_scale)
++                + pointer;
++            push_elements_from_surface_tree(
++                renderer,
++                &dnd_icon.surface,
++                loc,
++                output_scale,
++                1.,
++                Kind::Cursor,
++                &mut |elem| elements.push(elem.into()),
++            );
++        }
++
+         elements
+     }
+ 
+diff --git a/src/tests/cursor_capture.rs b/src/tests/cursor_capture.rs
+index a1ded514..227a4ff9 100644
+--- a/src/tests/cursor_capture.rs
++++ b/src/tests/cursor_capture.rs
+@@ -18,7 +18,9 @@ use wayland_client::protocol::wl_pointer::WlPointer;
+ use wayland_client::protocol::wl_registry::{self, WlRegistry};
+ use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
+ 
+-use crate::niri::PointerVisibility;
++use smithay::input::pointer::CursorImageStatus;
++
++use crate::niri::{DndIcon, PointerVisibility};
+ use crate::tests::client::{self, ClientId};
+ use crate::tests::fixture::Fixture;
+ 
+@@ -30,7 +32,18 @@ struct Capture {
+ }
+ 
+ impl Capture {
++    /// Events, with the hotspot coordinates left out (they depend on the cursor theme).
+     fn take(&self) -> Vec<String> {
++        let mut events = self.take_raw();
++        for event in &mut events {
++            if event.starts_with("hotspot ") {
++                *event = "hotspot".to_owned();
++            }
++        }
++        events
++    }
++
++    fn take_raw(&self) -> Vec<String> {
+         std::mem::take(&mut *self.log.lock().unwrap())
+     }
+ }
+@@ -211,6 +224,103 @@ fn virtual_pointer_without_seat_is_echoed() {
+     assert_eq!(capture.take(), ["position 300 400"]);
+ }
+ 
++/// Capture buffer size and hotspot, updated from new events (unchanged values are not resent).
++fn geometry(capture: &Capture, last: &mut ((i32, i32), (i32, i32))) -> ((i32, i32), (i32, i32)) {
++    for event in capture.take_raw() {
++        let mut words = event.split(' ');
++        let kind = words.next().unwrap();
++        let mut numbers = words.map(|n| n.parse().unwrap());
++        let mut pair = || (numbers.next().unwrap(), numbers.next().unwrap());
++        match kind {
++            "buffer_size" => last.0 = pair(),
++            "hotspot" => last.1 = pair(),
++            _ => (),
++        }
++    }
++    *last
++}
++
++/// Uses a mapped 100x50 window surface as the drag-and-drop icon, as smithay's DnD grab would set
++/// `Niri::dnd_icon` for `wl_data_device.start_drag`.
++fn start_drag(f: &mut Fixture, id: ClientId, offset: (i32, i32)) {
++    let window = f.client(id).create_window();
++    let surface = window.surface.clone();
++    window.commit();
++    f.roundtrip(id);
++    let window = f.client(id).window(&surface);
++    window.attach_new_buffer();
++    window.set_size(100, 50);
++    window.ack_last_and_commit();
++    f.double_roundtrip(id);
++
++    let niri = f.niri();
++    let mapped = niri.layout.windows().next().unwrap().1;
++    let surface = mapped.toplevel().wl_surface().clone();
++    niri.dnd_icon = Some(DndIcon {
++        surface,
++        offset: Point::from(offset),
++    });
++}
++
++#[test]
++fn drag_icon_extends_the_cursor_capture_like_the_pointer_render() {
++    let mut f = set_up();
++    let bridge = add_client(&mut f);
++    warp(&mut f, bridge, 500., 500.);
++    let capture = cursor_session(&mut f, bridge);
++    let mut last = Default::default();
++    let ((w, h), (hot_x, hot_y)) = geometry(&capture, &mut last);
++    assert!(w > 0 && h > 0);
++
++    // The icon is drawn at its offset from the pointer, so the capture grows to the union of the
++    // cursor image (at -hotspot) and the icon, and the hotspot moves with the new origin.
++    start_drag(&mut f, bridge, (10, 20));
++    f.double_roundtrip(bridge);
++    let left = (-hot_x).min(10);
++    let top = (-hot_y).min(20);
++    let right = (w - hot_x).max(110);
++    let bottom = (h - hot_y).max(70);
++    assert_eq!(
++        geometry(&capture, &mut last),
++        ((right - left, bottom - top), (-left, -top))
++    );
++
++    // An icon above and to the left of the pointer moves the hotspot accordingly.
++    f.niri().dnd_icon.as_mut().unwrap().offset = Point::from((-120, -60));
++    f.double_roundtrip(bridge);
++    let left = (-hot_x).min(-120);
++    let top = (-hot_y).min(-60);
++    let right = (w - hot_x).max(1);
++    let bottom = (h - hot_y).max(1);
++    assert_eq!(
++        geometry(&capture, &mut last),
++        ((right - left, bottom - top), (-left, -top))
++    );
++
++    // Dropping restores the cursor-only capture.
++    f.niri().dnd_icon = None;
++    f.double_roundtrip(bridge);
++    assert_eq!(geometry(&capture, &mut last), ((w, h), (hot_x, hot_y)));
++}
++
++#[test]
++fn drag_icon_keeps_the_hotspot_inside_a_capture_without_cursor() {
++    let mut f = set_up();
++    let bridge = add_client(&mut f);
++    warp(&mut f, bridge, 500., 500.);
++    let capture = cursor_session(&mut f, bridge);
++    let mut last = Default::default();
++    geometry(&capture, &mut last);
++
++    f.niri()
++        .cursor_manager
++        .set_cursor_image(CursorImageStatus::Hidden);
++    start_drag(&mut f, bridge, (30, 40));
++    f.double_roundtrip(bridge);
++    // The capture spans the pointer pixel and the icon.
++    assert_eq!(geometry(&capture, &mut last), ((130, 90), (0, 0)));
++}
++
+ struct Registry;
+ 
+ impl Dispatch<WlRegistry, Registry> for client::State {
+@@ -244,8 +354,7 @@ impl Dispatch<ExtImageCopyCaptureCursorSessionV1, Log> for client::State {
+             Event::Enter => "enter".to_owned(),
+             Event::Leave => "leave".to_owned(),
+             Event::Position { x, y } => format!("position {x} {y}"),
+-            // The hotspot depends on the cursor theme.
+-            Event::Hotspot { .. } => "hotspot".to_owned(),
++            Event::Hotspot { x, y } => format!("hotspot {x} {y}"),
+             _ => return,
+         };
+         log.lock().unwrap().push(event);

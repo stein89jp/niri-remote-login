@@ -17,6 +17,9 @@ CAPTURE_MAGIC = b"NRA1"
 CAPTURE_HEADER = struct.Struct("!4sIQQQ")
 CAPTURE_BUDGET_NS = 60_000_000
 GRAPH_ATTEMPTS = 3
+# A graph that ran this long before failing was healthy; its failure starts a
+# fresh attempt budget. Rapid failures still exhaust GRAPH_ATTEMPTS.
+GRAPH_HEALTHY_SECONDS = 600
 SUPERVISOR_PID = os.getpid()
 
 
@@ -266,15 +269,23 @@ def main():
 
 
 def supervise_graph(runtime, environment):
-    for attempt in range(GRAPH_ATTEMPTS):
+    # Days-long desktops may see occasional PipeWire crashes. Each failure
+    # after ten healthy minutes resets the budget, so restarts stay finite in
+    # any ten-minute window without permanently disabling audio.
+    attempt = 0
+    while attempt < GRAPH_ATTEMPTS:
+        started = time.monotonic()
         try:
             run_graph(runtime, environment)
         except (RuntimeError, OSError) as error:
             print("Private audio graph unavailable: " + str(error), flush=True)
+            if time.monotonic() - started >= GRAPH_HEALTHY_SECONDS:
+                attempt = 0
             if attempt + 1 == GRAPH_ATTEMPTS:
                 raise
             time.sleep(0.25 * (2 ** attempt))
             print("Restarting private audio graph (attempt " + str(attempt + 2) + ")", flush=True)
+        attempt += 1
 
 
 def run_graph(runtime, environment):

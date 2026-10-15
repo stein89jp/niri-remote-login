@@ -30,6 +30,7 @@ target/
 
 # Disposable upstream checkouts, lab fixtures, and validation evidence.
 /compositor/upstream/
+/compositor/rebase-work/
 /lab/sysroot/
 /lab/results/
 /lab/downloads/
@@ -82,3 +83,11 @@ target/
 Thumbs.db
 Desktop.ini
 PLAN.md
+PLAN2.md
+PLAN3.md
+
+# Niri source archives are downloaded and hash-checked by makepkg (pins.json);
+# research/upstream checkouts are superseded by bridge/vendor and the pins.
+/compositor/niri-*.tar.gz
+/research/upstream/*
+!/research/upstream/manifest.json

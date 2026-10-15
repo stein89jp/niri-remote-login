@@ -5,12 +5,13 @@ import gzip
 import hashlib
 import json
 from pathlib import Path
+import re
 import tarfile
 import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 VERSION = "1.5"
-INCLUDE = ("LICENSE", "README.md", "Makefile", "bridge", "broker", "docs", "checkpoints", "scripts", "packaging", "compositor/README.md", "compositor/CHECKPOINT.md", "compositor/pins.json", "compositor/patches", "compositor/protocols", "lab", "poc", "prototype", "tests", "research")
+INCLUDE = ("LICENSE", "README.md", "Makefile", "bridge", "broker", "docs", "checkpoints", "scripts", "packaging", "compositor/README.md", "compositor/CHECKPOINT.md", "compositor/pins.json", "compositor/patches", "lab", "prototype", "tests")
 EXCLUDE = {"target", ".cargo-cache", "cargo-home", "__pycache__", ".git", "build", "private", "sysroot", "downloads", "results", "generated"}
 
 
@@ -69,20 +70,24 @@ def main():
     for item in (ROOT / "packaging/arch/niri-rdp-headless").iterdir():
         if item.is_file():
             shutil.copy2(item, headless / item.name)
-    patches = ROOT / "compositor/patches"
-    if patches.exists():
-        for item in patches.glob("*.patch"):
-            shutil.copy2(item, headless / item.name)
-    patch = headless / "0001-remote-headless-bounds-and-startup.patch"
-    if not patch.exists():
-        raise RuntimeError("missing required headless patch")
-    template = (headless / "PKGBUILD").read_text()
+    # The pinned series is the source of truth; every listed patch must exist.
+    pins = json.loads((ROOT / "compositor/pins.json").read_text())["selected"]
+    for relative in pins["patches"]:
+        item = ROOT / "compositor" / relative
+        if not item.is_file():
+            raise RuntimeError(f"missing required headless patch: {relative}")
+        shutil.copy2(item, headless / item.name)
     licenses = ROOT / "scripts/collect-licenses.py"
     shutil.copy2(licenses, headless / licenses.name)
-    (headless / "PKGBUILD").write_text(template.replace(
-        "@PATCH_SHA256@", hashlib.sha256(patch.read_bytes()).hexdigest()).replace(
-        "@CURSOR_PATCH_SHA256@", hashlib.sha256((headless / "0002-remote-cursor-capture.patch").read_bytes()).hexdigest()).replace(
-        "@LICENSE_SCRIPT_SHA256@", hashlib.sha256(licenses.read_bytes()).hexdigest()))
+
+    def source_digest(match):
+        source = headless / match.group(1)
+        if not source.is_file():
+            raise RuntimeError(f"PKGBUILD names a missing source: {match.group(1)}")
+        return hashlib.sha256(source.read_bytes()).hexdigest()
+
+    template = (headless / "PKGBUILD").read_text()
+    (headless / "PKGBUILD").write_text(re.sub(r"@SHA256:([A-Za-z0-9._-]+)@", source_digest, template))
     (out / "source-manifest.json").write_text(json.dumps({
         "version": VERSION, "archive_sha256": digest, "files": manifest,
         "status": "source build bundle; installation and boot acceptance require separate Arch test machine",

@@ -1,0 +1,36 @@
+# Offline repository checks on Arch Linux. Only the package install and
+# `make fetch` use the network; `make check` then runs with --offline.
+# Namespace/lab integrations, NVENC and GPU tests are opt-in and stay skipped.
+name: check
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    timeout-minutes: 60
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed base-devel git rust pkgconf cmake \
+            ffmpeg libxkbcommon wayland mesa libglvnd pam systemd-libs \
+            python openssl
+          useradd --create-home builder
+
+      - uses: actions/checkout@v4
+
+      - name: Hand the checkout to an unprivileged user
+        run: chown -R builder:builder "$GITHUB_WORKSPACE"
+
+      - name: Fetch locked Rust dependencies
+        run: su builder -c 'make fetch'
+
+      - name: Run offline checks
+        run: su builder -c 'make check'

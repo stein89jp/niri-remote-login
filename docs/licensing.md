@@ -14,7 +14,7 @@ the standard MIT text.
 | Component | License and scope |
 | --- | --- |
 | Original bridge, broker, helpers, tests, and documentation | MIT for original source, with upstream notices preserved where applicable. |
-| Patched Niri compositor and retained Niri reference source | GPL-3.0-or-later. The original source archive includes its license; the installed compositor package carries it too. |
+| Patched Niri compositor | GPL-3.0-or-later. The original source archive includes its license; the installed compositor package carries it too. |
 | IronRDP | MIT OR Apache-2.0. The package's third-party notices include both license texts. |
 | Wayland protocol XML | The copyright and permission notices embedded in each XML file apply. |
 | Other Cargo dependencies | Their individual licenses apply, including MIT, Apache-2.0, BSD, ISC, MPL-2.0, and others listed in the package notices. |
@@ -82,11 +82,22 @@ The principal upstream sources are:
 
 | Dependency | Exact source |
 | --- | --- |
-| Niri | [Commit `0be60b742762905b7bee1ea67bb5a2fb00859bf0`](https://github.com/niri-wm/niri/tree/0be60b742762905b7bee1ea67bb5a2fb00859bf0), also included in the matching source bundle. The maintained remote patch is included there and in this repository. |
-| IronRDP | [Commit `bf019ca502d1e52616853a5ded68c885cec1e322`](https://github.com/Devolutions/IronRDP/tree/bf019ca502d1e52616853a5ded68c885cec1e322). |
-| Smithay | [Commit `ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef`](https://github.com/Smithay/smithay/tree/ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef). |
+| Niri | [Commit `fc9e8c425e2267d877a65918f030c86f3c698179`](https://github.com/niri-wm/niri/tree/fc9e8c425e2267d877a65918f030c86f3c698179) (upstream `main`), also included in the matching source bundle. The maintained patch series is included there and in this repository. |
+| IronRDP | [Commit `7b976a6965c96c76ff949313e174ea55dada8c44`](https://github.com/Devolutions/IronRDP/tree/7b976a6965c96c76ff949313e174ea55dada8c44). |
+| Smithay | [Commit `8a270232f1bfc416c781273c98a3f52a812a0bba`](https://github.com/Smithay/smithay/tree/8a270232f1bfc416c781273c98a3f52a812a0bba). |
 | FFmpeg upstream | [FFmpeg 9.0.2 source archive](https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz). |
 | Arch FFmpeg packaging | [Exact packaging revision `5c4a25f039c060c421a1cd887551d491dff4d55d`](https://gitlab.archlinux.org/archlinux/packaging/packages/ffmpeg/-/tree/5c4a25f039c060c421a1cd887551d491dff4d55d), tagged `2-9.0.2-2`. Its recipe supplies the distribution's source inputs and build configuration. |
+
+These are the current source pins. The published `1.5-1` source bundle retains
+the pins it was built from, including Niri `0be60b742762905b7bee1ea67bb5a2fb00859bf0` with two
+maintained patches and Smithay `ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef`.
+The license inventory is unchanged by the rebase.
+
+The repository does not need to track the Niri source archive. `makepkg`
+downloads it from the pinned commit URL and verifies the SHA-256 recorded in the
+PKGBUILD and `compositor/pins.json`; each release's `makepkg --allsource` bundle
+preserves that exact archive with the patch series, so it remains the
+corresponding-source copy even if the download URL changes.
 
 Native dependency names are declared in the matching PKGBUILD; their installed
 versions are recorded in the binary's `.BUILDINFO`. Use the **Source Files** link

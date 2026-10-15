@@ -43,8 +43,11 @@ without compiling the changes. Then run the account authorization, optional
 NVIDIA drop-in, and service commands from the appropriate block above.
 
 The NVIDIA drop-in enables hardware video encoding with a default 60 fps capture
-budget and gives the frontend service GPU access. Your remote Linux account also
-needs GPU device access for hardware compositor rendering; see
+budget and gives the frontend service access to the NVIDIA and DRM devices.
+After upgrading or reinstalling, run its `install` command again even if
+`nvidia.conf` already exists: older copies lack the device allow-list. Your
+remote Linux account also needs GPU device access for hardware compositor
+rendering; see
 [Optional NVIDIA encoding](#optional-nvidia-encoding) for permissions and checks.
 
 Package release 14 automatically prepares NVIDIA device nodes before every
@@ -74,6 +77,8 @@ PipeWire-Pulse, WirePlumber and Pulse client utilities. In Windows mstsc, select
 `.rdp` profiles use `audiomode:i:0`. The remote output is **Remote Desktop Audio**.
 After upgrading, end any retained remote desktop and reconnect so the new session
 starts its private audio services. See the [audio contract](../bridge/README.md#session-audio).
+The Windows microphone can also be used in the remote desktop; it is on by
+default and needs only a client setting, see [remote microphone](#remote-microphone).
 
 The compositor installs at `/usr/lib/niri-rdp/niri-headless`, alongside stock
 `/usr/bin/niri`. It launches a separate remote desktop. It does not share your
@@ -156,8 +161,14 @@ network. If the host has a firewall, allow TCP 33991 from the intended client
 network using your existing firewall configuration. Port 3389 is left available
 for another remote desktop service. Nothing opens the firewall automatically.
 
-The initial self-signed certificate lasts 365 days. Compare the certificate's
-SHA-256 fingerprint with the client certificate details before accepting it:
+The generated self-signed certificate lasts 825 days. When it has fewer than
+30 days left (or has expired), the broker replaces it automatically at its next
+start and logs the new SHA-256 fingerprint
+(`journalctl -u niri-rdp-broker.service | grep -i fingerprint`). The fingerprint
+therefore changes on renewal, and mstsc asks you to trust the new certificate.
+Renewal happens only when the broker starts; restart the frontend as well so it
+loads the new certificate. Compare the current SHA-256 fingerprint with the
+client certificate details before accepting it:
 
 ```sh
 sudo openssl x509 -in /etc/niri-rdp/tls/cert.pem -noout -fingerprint -sha256
@@ -167,8 +178,10 @@ You can provide a trusted certificate and unencrypted private key at those same
 paths before starting the service. The TLS directory must be root-owned mode
 700, the key root-owned mode 600, and the certificate root-owned without group
 or world write access. Invalid, expired, mismatched, or incomplete identities
-fail startup rather than silently replacing your certificate. Replacing an
-identity requires restarting both services so the frontend loads new credentials.
+fail startup rather than silently replacing your certificate. Certificates you
+provide are never renewed or replaced: the broker logs a warning when fewer than
+30 days remain and fails startup once they expire. Replacing an identity requires
+restarting both services so the frontend loads new credentials.
 
 The remote desktop loads your existing `~/.config/niri/config.kdl`, preserving
 your bindings, appearance, includes and startup applications. DankMaterialShell
@@ -177,19 +190,22 @@ startup commands have not already launched a bar. Accounts without a Niri
 configuration receive `foot` and a bar: Super+Enter opens a terminal, Super+D
 opens Fuzzel, Super+Q closes a window, and Super+Shift+Q logs out.
 Disconnecting or losing the network preserves the desktop, open windows and
-applications for 45 seconds after the broker observes the connection detach. Reconnect with
+applications for 45 seconds after the broker observes the connection detach
+(`grace_seconds` in the [broker settings](#broker-settings)). Reconnect with
 the same Linux account and authenticate again to resume it; held keys and mouse
 buttons are released when the old connection closes. When that grace window
 expires, the broker fully logs out the desktop and cleans up its applications
 and session; a subsequent login starts a fresh desktop after cleanup.
 Super+Shift+Q logs out and ends the desktop; compositor exit or stopping
-the broker also ends it. A frontend restart preserves the desktop only if you reconnect
+the broker also ends it. On logout the desktop's applications receive SIGTERM
+and have 2 seconds to save state before they are killed. A frontend restart preserves the desktop only if you reconnect
 within the same 45-second grace window. After a silent network
 failure, the frontend may temporarily reject a reconnect while it still considers
 the old connection active. Keepalive/write deadlines bound detection; private
 blackhole checks measured about 20–23 seconds, after which a retry can authenticate.
 Each resume rechecks PAM authentication, account policy and group authorization;
-a revoked or expired account cannot resume.
+a revoked or expired account cannot resume. While another connection is attached
+to the account's desktop, a new login is refused rather than taking it over.
 The compositor
 tries headless GPU rendering automatically, preferring NVIDIA hardware, and falls
 back to surfaceless rendering when hardware is unavailable. Optional NVIDIA
@@ -268,7 +284,8 @@ Log out and start a fresh remote login after upgrading startup settings; a
 reconnect preserves the running desktop and its environment.
 
 Review `/etc/niri-rdp/frontend.conf`, `/etc/niri-rdp/headless.kdl`,
-`/etc/niri-rdp/waybar.json`, `/etc/niri-rdp/renderer.conf`, and
+`/etc/niri-rdp/waybar.json`, `/etc/niri-rdp/renderer.conf`,
+`/etc/niri-rdp/broker.conf` (see [broker settings](#broker-settings)), and
 `/etc/pam.d/niri-rdp`. `NIRI_RDP_LISTEN` accepts a numeric IP address and port,
 including bracketed IPv6. To use the standard RDP port on a host where it is free,
 set `NIRI_RDP_LISTEN=0.0.0.0:3389`. To retain tunnel-only access, set
@@ -282,13 +299,50 @@ ss -ltn 'sport = :33991'
 
 The login screen reports **Login denied. Check account and password.** for
 authentication or account-policy failures. **Desktop unavailable. Try again.**
-means the broker could not start or resume the desktop; check both service
-journals for the cause. These startup failures do not consume the login screen's
+means the broker could not start or resume the desktop, or the account's desktop
+was still starting or ending; check both service journals for the cause.
+**Desktop in use by another connection.** means another RDP connection is
+attached to the account's desktop; disconnect it first. **A local desktop session
+is still open.** means the account has a local graphical session, including one
+still closing; log out of it locally. These three messages appear only after the
+password and `niri-rdp-users` membership were accepted; every earlier failure
+shows the generic denial. These startup failures do not consume the login screen's
 failed-password attempt limit. Release 14 waits for the private WirePlumber
 default-device policy before selecting the remote audio output, fixing a startup
 race that previously rejected a correctly authenticated login.
 The **Password (length hidden)** field shows eight stars for any nonempty entry;
 physical dead keys and Compose sequences produce the completed character.
+
+The login screen disconnects after 60 seconds without a submitted attempt or
+120 seconds in total; the limits pause while PAM and desktop startup run.
+`NIRI_RDP_LOGIN_IDLE_SECS` (10–600, default 60) and `NIRI_RDP_LOGIN_TIMEOUT_SECS`
+(30–1800, default 120) change them; the idle limit must not exceed the total,
+and invalid values stop frontend startup. Rejected logins from one client
+address also start a per-source backoff, for both the login screen and direct
+client credentials: the first failure is free, then waits grow 1, 2, 4 … up to
+60 seconds. During a wait the same generic rejection is returned without
+contacting PAM. A successful login clears the source, and entries expire after
+15 quiet minutes. IPv6 clients are grouped by /64, and clients behind one NAT or
+tunnel share a backoff. Desktop startup failures are not counted.
+
+`/etc/pam.d/niri-rdp` is a complete stack and does not include
+`system-remote-login`. Only regular accounts in `niri-rdp-users` can authenticate,
+and root or nonmember attempts take as long as a wrong password. Failed RDP logins
+lock the account only for niri-rdp (5 failures, 300 seconds); the console, sudo
+and other services keep their own tally. The broker sets `PAM_RHOST` to the RDP
+client's address. The session stack includes `pam_limits` and `pam_umask`, as in
+Arch's `system-login`. Remote desktops therefore get the umask from
+`/etc/login.defs` (022 by default) and a core-dump limit of soft 0 / hard
+unlimited unless `pam_limits` configures one. They share `/tmp` with the account's
+other logins, like SSH and display-manager sessions. Reset an account with:
+
+```sh
+sudo faillock --dir /run/faillock-niri-rdp --user NAME --reset
+```
+
+The PAM file is package configuration. Upgrades over a locally edited copy
+produce `/etc/pam.d/niri-rdp.pacnew`; merge it and do not keep an include of
+`system-remote-login`.
 
 A TLS-only fallback profile is available if a client's normal connection setup
 fails. Save this as `niri.rdp` on Windows, replace the address and account, and
@@ -310,6 +364,162 @@ resizing are supported; see [the resolution contract](../bridge/README.md#dynami
 Only password PAM authentication is implemented; MFA and password-expiration
 conversations fail closed.
 
+### Broker settings
+
+`/etc/niri-rdp/broker.conf` holds the broker's settings, one `key = value` per
+line with `#` comments. Its only key is `grace_seconds` (0–3600, default 45):
+how long a disconnected desktop keeps running for a reconnect. `0` logs the
+desktop out as soon as the RDP connection ends.
+
+The broker reads the file once at start and checks it strictly. It must be a
+regular file (not a symbolic link) owned by root, not writable by group or
+others, and at most 4096 bytes. An unknown or repeated key, an invalid value or
+a failed file check rejects the whole file: the broker logs a warning to its
+journal and uses the default for every setting, but still starts. A missing
+file also means defaults. The journal records the period in use as
+`detach grace period: N seconds`.
+
+Restart the broker to apply a change. **Restarting the broker ends every
+connected and retained remote desktop**, so save your work and run it from a
+local terminal or an independent SSH session:
+
+```sh
+sudo systemctl restart niri-rdp-broker.service
+sudo journalctl -b -u niri-rdp-broker.service | grep -i 'grace\|broker.conf'
+```
+
+The file is package configuration: pacman keeps an edited copy and installs new
+defaults as `/etc/niri-rdp/broker.conf.pacnew`.
+
+### Login audit log and fail2ban
+
+The broker writes one journal entry per login event with the identifier
+`niri-rdp-broker` and the fields `NIRI_RDP_EVENT` (`auth-fail`, `login`,
+`resume`, `detach`, `grace-expire`, `logout` or `error`), `NIRI_RDP_USER`,
+`NIRI_RDP_RHOST` (the client address), `NIRI_RDP_RESULT` and
+`NIRI_RDP_SESSION`. Passwords are never logged. Desktop events after login come
+from the session's holder process, which runs in the logind `session-N.scope`
+rather than the broker service, so `journalctl -u niri-rdp-broker.service` does
+not show them. Query by identifier or field instead:
+
+```sh
+sudo journalctl -t niri-rdp-broker
+sudo journalctl NIRI_RDP_EVENT=auth-fail
+sudo journalctl NIRI_RDP_USER=alice -o verbose
+```
+
+A fail2ban filter and a commented jail example are installed as documentation
+under `/usr/share/doc/niri-remote-login/fail2ban/`; nothing enables them. The
+filter matches only `auth-fail` entries written by root inside
+`niri-rdp-broker.service`, so a local user cannot forge them with `logger`. To
+ban addresses at the firewall after repeated failures:
+
+```sh
+sudo pacman -S --needed fail2ban
+sudo install -m 644 /usr/share/doc/niri-remote-login/fail2ban/niri-rdp.conf \
+  /etc/fail2ban/filter.d/niri-rdp.conf
+sudo install -m 644 /usr/share/doc/niri-remote-login/fail2ban/niri-rdp.jail.example \
+  /etc/fail2ban/jail.d/niri-rdp.local
+sudoedit /etc/fail2ban/jail.d/niri-rdp.local
+sudo systemctl enable --now fail2ban.service
+sudo fail2ban-client status niri-rdp
+```
+
+In `niri-rdp.local`, uncomment the jail, set `port` to the port of
+`NIRI_RDP_LISTEN` and add your own client networks to `ignoreip`, so a mistyped
+password cannot lock you out of a remote-only host. The frontend's per-address
+backoff and the PAM lockout apply with or without fail2ban.
+
+### Remote microphone
+
+The Windows microphone can be used by applications in the remote desktop
+(Firefox, Discord, `pw-record` and similar). In mstsc, open **Show Options →
+Local Resources → Remote audio → Settings** and select **Record from this
+computer** (saved `.rdp` profiles use `audiocapturemode:i:1`). Keep **Play on
+this computer** selected for playback. In Windows 10, **Settings → Privacy →
+Microphone → Allow desktop apps to access your microphone** must be on.
+
+The frontend setting `NIRI_RDP_MICROPHONE` in `/etc/niri-rdp/frontend.conf`
+accepts `auto` (the default, also when the line is absent) or `off`. Any other
+value stops the frontend at startup with an error. `off` offers no microphone
+channel to the client at all; playback is unaffected. The remote source still
+exists with `off` but only records silence. Changing the setting needs
+a frontend restart, which disconnects the current RDP connection, so arrange it
+from a local terminal or SSH.
+
+Inside the remote desktop the microphone is the PipeWire source
+**Remote microphone (RDP)** (`niri-rdp-microphone`), and it is the default
+source, so applications use it without configuration. The default output stays
+**Remote Desktop Audio**. Windows records only while a remote application
+listens: the Windows microphone indicator appears when an application starts
+recording and goes off about 5 seconds after the last one stops. With no
+recorder, nothing is uploaded. The source outputs silence while no audio
+arrives.
+
+The microphone uses 48 kHz mono 16-bit PCM in 20 ms packets, about 0.8 Mbit/s
+of upload from the client before framing (44.1 kHz or stereo only when the
+client cannot record 48 kHz mono). Measured in the lab, a sample takes about
+120–145 ms from the client's capture to a remote recorder, of which about
+55 ms is client-side; queues on both sides hold at most 100 ms, so the delay
+cannot grow. The packaged Waybar (`/etc/niri-rdp/waybar.json`, used when your
+Niri configuration starts no bar of its own) shows a microphone icon while a
+remote application records; with DankMaterialShell or your own Waybar, use their
+privacy or microphone indicator instead.
+
+The microphone path is separate from playback: its own dynamic RDP channel,
+socket, session helper and restart budget. A microphone failure never ends the
+connection or the desktop, and the accepted PCM playback configuration is
+unchanged. A failed session helper is restarted twice at most (then the
+microphone stays off until a fresh remote desktop); reconnect after a restart
+to use the microphone again. A frontend-side failure leaves it off until the
+next connection. To troubleshoot:
+
+```sh
+# In the remote desktop: the source exists and is the default.
+pactl list sources short
+pactl get-default-source
+# On the host: microphone events and per-connection counters.
+sudo journalctl -u niri-rdp-frontend | grep -E "RDP microphone|connection summary"
+sudo journalctl -u niri-rdp-broker | grep "remote microphone"
+```
+
+In the [connection summary](#connection-summaries), `mic=` names the format
+used (for example `mic=pcm_48000_mono`; `mic=none` means Windows never recorded,
+typically because **Record from this computer** is off or no application
+listened), followed by `mic_opens`, `mic_packets`, `mic_bytes`, `mic_dropped`
+and `mic_errors`. A nonzero `mic_errors` means the client refused or did not
+answer a recording request within 10 seconds, sent invalid audio, or the
+session helper connection failed. A growing `mic_dropped` points at a stalled
+helper or late bursts after network stalls (audio older than 100 ms is
+discarded rather than delayed). After a refused or unanswered request, Windows is asked again only when
+an application starts recording at least 30 seconds later.
+
+### Connection summaries
+
+The frontend writes one `RDP connection summary` line to its journal when each
+connection ends, including failed TLS handshakes and connections dropped without
+a clean disconnect. It is always on and needs no diagnostics setting:
+
+```sh
+sudo journalctl -u niri-rdp-frontend | grep "connection summary"
+```
+
+Each line shows the client address, duration, `result=ok` or `error`, the video
+codec and mode actually used (`video_codec=bitmap` means no H.264 frames were
+sent), frame and IDR counts, average video kbps, the audio codec, waves,
+discarded blocks, credit waits and codec recoveries, clipboard transfers each
+way, timeouts and oversize drops, and the [microphone](#remote-microphone)
+format, opens, packets, bytes, drops and errors. It contains no usernames, error text, clipboard
+content or credentials; [performance controls](performance.md#configuration)
+describe every field. For example, `audio_codec=pcm` confirms the accepted PCM
+path, and a growing `audio_discarded_blocks` or `clipboard_timeouts` points at the
+link or client rather than the desktop.
+
+Local clipboard text, HTML or image data larger than its limit (1 MiB, 4 MiB
+and 32 MiB) is not offered to Windows. The frontend logs one warning naming only
+the format and limit, such as `local clipboard text exceeded 1048576 bytes and
+was not offered to the client`, and counts it in `clipboard_oversize_drops`.
+
 ## Maintainer builds and older artifacts
 
 The older split package workflow remains available:
@@ -323,7 +533,10 @@ It exports hash-checked source bundles under `artifacts/release/` for separate
 needs the complete repository checkout; copy or clone the repository rather than
 copying only the PKGBUILD. `makepkg --allsource` exports a portable source bundle.
 The combined package provides and conflicts with `niri-rdp-headless`, allowing
-pacman to replace a previously installed split compositor package.
+pacman to replace a previously installed split compositor package. For a split
+build, install both packages together: `niri-remote-login` requires
+`niri-rdp-headless>=26.04.remote2-1`, because the bridge's cursor depends on the
+current compositor patches (see [upgrade](upgrade.md#rebuild-the-installed-combined-package)).
 
 The archived `0.1.0-1` delivery is a preserved snapshot. It lacks current
 resolution support, NVENC, direct listening, automatic certificate setup, and
@@ -344,7 +557,10 @@ service account; it does not grant compositor GPU access to remote login account
 `/etc/niri-rdp/renderer.conf` contains one word: `auto` (default), `hardware`, or
 `software`. Set `hardware` during GPU validation so missing drivers or permissions
 fail compositor startup rather than quietly using the fallback. Set `software`
-to force the previous llvmpipe behavior. Changes apply to new sessions. Inspect
+to force the previous llvmpipe behavior. `software` also restricts glvnd to
+Mesa's EGL vendor (`/usr/share/glvnd/egl_vendor.d/50_mesa.json`) for the
+compositor and session apps, so llvmpipe is used even with NVIDIA drivers
+installed. Changes apply to new sessions. Inspect
 the broker journal for `headless renderer: hardware EGL device` and the render
 node path and `nvidia=true` to verify NVIDIA selection. The isolated lab has
 validated actual NVIDIA rendering with NVENC and FreeRDP decoding on an RTX
@@ -354,12 +570,13 @@ the [actual-machine checks](acceptance.md).
 `NIRI_RDP_FPS` in `frontend.conf` limits capture/transmission to 1–60 frames per
 second (default 60 for NVENC, 30 for bitmap). `NIRI_RDP_BITRATE_MBPS` accepts
 1–100 megabits per second (default 12) as the NVENC bitrate ceiling. Each
-connection starts at that ceiling and adapts down toward 1 Mbps when graphics
-acknowledgements slow relative to the connection's baseline, stall, or report a
-client decoding backlog. Audio receipt or playback congestion also reduces the
-video target, including while graphics acknowledgements are suspended. It
-recovers gradually when delivery stays healthy and audio has had no congestion
-for three seconds.
+connection starts at that ceiling and steps down through six quantized levels
+toward 1 Mbps when graphics acknowledgements slow relative to the connection's
+baseline, stall, or report a client decoding backlog, at most one level per
+second. Audio receipt or playback congestion also reduces the video target,
+including while graphics acknowledgements are suspended. It rises one level
+after 10 seconds of healthy delivery without audio congestion, applied at the
+next due keyframe or within 30 seconds.
 Changes apply to the live encoder without resetting the desktop. Reduce the
 frame rate or ceiling for limited networks; increasing the ceiling can improve
 AVC420 quality when the connection has enough bandwidth. Bitmap fallback does
@@ -403,11 +620,13 @@ connection uses bitmap updates. This is host-side encoding. Decoding happens
 on the RDP client, whose hardware acceleration depends on its own GPU and client.
 The current combined package includes NVENC; the archived
 `0.1.0-1` frontend binaries contain neither these fixes nor NVENC support.
-By default, the frontend reads SHM pixels and converts them to full-range BT.709
-on the CPU before hardware H.264 encoding. Optional `NIRI_RDP_GPU_CAPTURE=auto`
-uses supported DMA-BUF capture, EGL conversion and CUDA/NVENC surfaces, with SHM
-fallback. See [device requirements and measurements](performance.md); GPU
-compositor rendering alone does not prove that capture stays on the GPU.
+NVENC uses supported DMA-BUF capture by default (`NIRI_RDP_GPU_CAPTURE=auto`):
+EGL conversion and CUDA/NVENC surfaces, with SHM fallback. Set `shm` to force
+CPU readback and full-range BT.709 conversion; bitmap mode always uses SHM.
+Periodic keyframes are a 30-second safety net (`NIRI_RDP_GOP_SECONDS`, 1–3600);
+refresh, resize, resume and frame drops still force keyframes immediately.
+See [device requirements and measurements](performance.md); GPU compositor
+rendering alone does not prove that capture stays on the GPU.
 
 On the separate test installation, use an NVENC-capable NVIDIA GPU, a working
 NVIDIA driver with its userspace libraries, and an FFmpeg build providing
@@ -427,8 +646,10 @@ describes the runtime requirements for a compiled FFmpeg installation. Installin
 or building FFmpeg itself is a separate task.
 
 The standard frontend unit hides GPU devices. Enable the packaged NVIDIA
-drop-in, which exposes the host's device tree to the frontend and adds the
-`video` and `render` supplementary groups:
+drop-in, which makes host devices visible but allows only the NVIDIA (`nvidia`,
+`nvidiactl`, `nvidia-modeset`, `nvidia-uvm`) and DRM device groups, and adds the
+`video` and `render` supplementary groups; the base unit keeps
+`DevicePolicy=closed`:
 
 ```sh
 sudo install -d -m 755 /etc/systemd/system/niri-rdp-frontend.service.d
@@ -438,6 +659,9 @@ sudo systemctl daemon-reload
 sudo systemctl restart niri-rdp-frontend.service
 sudo journalctl -u niri-rdp-frontend.service -n 50 --no-pager
 ```
+
+Re-copy the drop-in after upgrading: drop-ins copied from older releases have no
+`DeviceAllow` lines, so NVENC fails with a device permission error.
 
 Explicit NVENC configuration fails startup if hardware encoder initialization
 fails. Check the journal for missing driver libraries, device permissions or an
@@ -509,9 +733,12 @@ sudo systemctl restart niri-rdp-frontend.service
 
 The combined 1.5 package includes damage-aware capture, input/resize coalescing,
 cached login rendering, stale-ACK recovery, separate negotiated cursor updates,
-private bidirectional Unicode text clipboard and deliberate DPI scaling. Clipboard
-payloads are text-only and limited to 1 MiB, with finite transfers. Enable
-clipboard in mstsc Local Resources.
+a private bidirectional clipboard and deliberate DPI scaling. The clipboard
+carries Unicode text (up to 1 MiB), HTML (up to 4 MiB) and images (up to 32 MiB
+and 32768 pixels per side) in both directions, with finite transfers. Files are
+not supported: copying files in Windows leaves the Linux clipboard unchanged.
+A clipboard message over the size limit is dropped and that paste fails; the
+session continues. Enable clipboard in mstsc Local Resources.
 
 [Performance controls](performance.md) document optional AVC444, GPU capture,
 quality profiles, coordinated graphics cadence/window, total link budget and

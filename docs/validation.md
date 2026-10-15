@@ -1,5 +1,363 @@
 # Validation record
 
+## Microphone redirection (MS-RDPEAI), 2026-10-15
+
+`PLAN3` added mstsc **Record from this computer**: the Windows microphone
+becomes the default PipeWire source **Remote microphone (RDP)**
+(`niri-rdp-microphone`) in the private session graph. User decisions: record
+only while a remote application listens (the client is released about 5 s after
+the last recorder stops), `NIRI_RDP_MICROPHONE=auto` by default, 48 kHz mono
+with 44.1 kHz fallback, lowest delay and a Waybar microphone indicator. The
+design is `artifacts/design/microphone.md`; lab evidence is under
+`artifacts/plan3-p3/`. All results below are automated, namespace or lab
+checks; no installed package, host service or active session was changed.
+
+The path is separate from playback: `AUDIO_INPUT` dynamic channel,
+`bridge/src/microphone.rs` with its own thread and drop-oldest queue (at most
+100 ms), socket `audio-in-0` as the optional third descriptor of the `NRB2`
+reply, NRM1 framing, the new `broker/config/session-microphone` helper (a
+`pw-cat` Audio/Source paced on CLOCK_MONOTONIC with a 30 ms lead and a
+20–60 ms jitter buffer) and its own restart budget. **The accepted playback
+baseline is unchanged:** `bridge/src/audio.rs`, `bridge/src/audio.c`,
+`broker/config/session-audio`, `tests/test_audio.py` and `tests/audio_rdpsnd.c`
+have identical SHA-256 before and after (`baseline-sha256-*.txt`), and the
+playback tests, including PCM preference and credit-wait continuity, pass
+unchanged. The vendored `ironrdp-server` gained `ServerEvent::RdpeaiRecycle`
+(`rdpeai_recycle.rs`), because MS-RDPEAI has no stop PDU.
+
+- Unit and wire tests: Rust format choice and Open ladder (EXTENSIBLE then
+  plain PCM, then the next format), Open only after negotiation, helper attach
+  and `IN_USE`, length validation, queue bound and drop-oldest under a stalled
+  writer, the 10 s Open timeout and 30 s retry rule, and clean shutdown;
+  `bridge/tests/microphone_wire.rs` runs negotiation, Open, Data, recycle and
+  late data for a recycled channel against the crate's client offline. Phase 3
+  ran 262 bridge unit tests plus the wire suites, and `make check`/`make lint`
+  passed (clippy clean). `tests/test_microphone.py` covers NRM1 parsing and
+  bounds, silence on underrun, the 5 s idle debounce, restart budgets,
+  `ECONNRESET` on frontend close and a stale-pipe regression; Python 143 tests
+  OK (3 skipped). Broker native tests 18/18, including the
+  `[desktop, audio, mic]`, `[desktop, audio]` and `[desktop]` replies.
+- Namespace integration: real Niri, the real `session-audio` and
+  `session-microphone`, the frontend behind `scripts/mock_broker.py`, and a
+  FreeRDP client (`lab/rdp-audio-client.c`) with its own PipeWire graph feeding a
+  1 kHz microphone tone and receiving a 440 Hz playback tone, both at −15 dBFS.
+  Latency is an upper bound from the client writer (including its 20 ms lead) to
+  arrival in `pw-record`.
+
+  | Measurement | Result |
+  | --- | --- |
+  | Microphone tone at the remote recorder | 1000.0 Hz, −15.05 dBFS (expected −15.05), 0 dropouts on first recording |
+  | Microphone latency p50 / p95: first, reopen, after reconnect, after helper recovery | 117 / 132, 133 / 146, 123 / 143, 110 / 125 ms (about 53 ms client side) |
+  | Settled padding | 0–23 tiny silence insertions per minute (1–9 samples each) |
+  | Client capture closed after the recorder stops | 5.02 s; reopened within 10–18 ms of the next recorder |
+  | Playback p50, microphone off vs on | 132.5 vs 130.0 ms; 0 discontinuities, `audio_codec=pcm`, 0 discarded blocks, 0 credit waits |
+  | Summary with the microphone | `mic=pcm_48000_mono mic_opens=2 mic_dropped=0 mic_errors=0`; with `off`, `mic=none` and no client capture stream |
+  | Helper SIGKILL while recording and playing | Session up, playback 0 gaps, `mic_errors=1`; microphone recovers after the helper restart and a reconnect |
+
+- Fixes found by the lab: the delay grew by 35–46 ms per reopen (190.8 ms p50
+  after reconnect) because audio left in the `pw-cat` pipe when the last
+  recorder stopped was replayed at the next recording; `session-microphone` now
+  drains it, with a regression test (`latency-creep-before-fix.txt`). An Open
+  the client never answers is abandoned after 10 s as a failed open.
+- Reproduce: build the bridge, prepare the lab artifacts (see
+  `compositor/README.md`), then run
+  `lab/run-isolated.sh env NIRI_RDP_LAB_BRIDGE=<bridge> python3 scripts/microphone-integration.py`.
+- Limits: Python pacing is sensitive to heavy CPU load (occasional 50–250-sample
+  gaps), and the first ~30 ms of a recording can underrun to silence.
+- Pending: the Windows 10 mstsc checks in
+  [microphone acceptance](acceptance.md#microphone-acceptance), including
+  10 minutes of playback and microphone together with unchanged playback
+  clarity and latency, the Windows indicator going off about 5 s after
+  recording stops, and five start/stop cycles without growing delay.
+
+## Niri rebase onto upstream main, 2026-10-15
+
+`PLAN2` moved the maintained compositor from PR #3953 head
+`0be60b742762905b7bee1ea67bb5a2fb00859bf0` (Smithay `ff5fa7df`, two large
+patches) to upstream Niri `main` `fc9e8c425e2267d877a65918f030c86f3c698179`
+(v26.04 plus later upstream work) with Smithay
+`8a270232f1bfc416c781273c98a3f52a812a0bba`. The local change is now a 12-patch
+feature series in `compositor/patches/`, one feature per patch, so a future
+rebase fails per feature. `compositor/pins.json` records the new selection and
+keeps the old pin as `previous` for rollback; design notes are under
+`artifacts/design/` (`niri-rebase-decision.md`, `niri-patch-inventory.md`,
+`niri-upstream-survey.md`, `cursor-migration.md`).
+
+- Kept, as patches: 0001 PR #3953's headless backend (rebased), 0002 fail-closed
+  startup, 0003 output bounds, 0004 in-place output mode changes, 0005 EGL device
+  selection with the headless primary render node, 0006 DMA-BUF feedback, 0007
+  private startup hook, 0008 keyboard layout group kept on modifier sync, 0009
+  seat keymap restored after a Unicode tap (needed for Fcitx reconnect), 0010
+  remote-input regression tests, 0011 cursor sessions without motion echo and
+  0012 drag-and-drop icon in the cursor capture.
+- Dropped because upstream now provides them: keybinding-routed virtual keyboard
+  (Mod+D works remotely), held-key release when a virtual keyboard is destroyed,
+  input-method forwarded keys bypassing the grab, and v120 wheel mapping.
+- Replaced: the private `niri-rdp-cursor-v1` protocol and its compositor patch.
+  The bridge now uses standard ext-image-copy-capture cursor sessions (shape,
+  hotspot, position, hidden cursor, 384 px cap with embedded fallback) and sends
+  its virtual keyboard with `no_keymap`, so it follows Niri's keymap and reloads.
+  Without 0011, stock Niri would echo the bridge's own motion as warps and the
+  mstsc cursor would snap back; packaging keeps bridge and compositor in lockstep
+  (`niri-rdp-headless` `26.04.remote2-1`).
+- Software renderer fix: with NVIDIA's glvnd vendor installed, `software` did not
+  give llvmpipe. The session worker now also sets
+  `__EGL_VENDOR_LIBRARY_FILENAMES` to Mesa's `50_mesa.json`, inherited by session
+  apps. `artifacts/plan2-p5/software-renderer.txt` shows `llvmpipe (LLVM 23.1.1)`
+  with the restriction and the RTX 4070 Ti without it.
+- Packaging: `prepare()` in the combined PKGBUILD now clears the copied tree in
+  `src/` (except `bridge/target`) before copying. A reused `src/` had kept deleted
+  `bridge/src/wayland.rs` and `video.rs` beside their new module directories
+  (E0761) and stale compositor patches.
+
+Results (evidence in `artifacts/plan2-p5/`):
+
+- Compositor: 230 library tests; `backend::headless` 8/8 and
+  `tests::remote_input` plus `tests::cursor_capture` 16/16 in the Phase 5 build.
+- Lab: capture proof passed; namespace bitmap integration 11/11 (including
+  Mod+D, jp106 and phone Unicode, live portrait/landscape resize, held-key
+  release and compositor crash); NVIDIA renderer with NVENC AVC420 and DMA-BUF GPU
+  capture passed (14 activations); Fcitx5/Mozc 2/2; clipboard passed; cursor
+  capture policy 9/9 (100/150/200% DPI, reload, warps, one-FPS input) with zero
+  motion echoes.
+- Package: `make check`, a fresh `makepkg` with `check()`,
+  `scripts/validate-packages.py` and packaged integration 11/11 passed.
+- Drag-and-drop icon: unit tests only; no lab fixture drags.
+
+Performance parity, installed old pair (`/usr/lib/niri-rdp`) against the new
+pair, each run in its own `lab/run-isolated.sh` namespace with
+`scripts/headless-performance.py --seconds 10`, mean of two runs (one for
+NVENC/GPU). CPU is percent of one core. Frontend CPU is slightly lower; the
+compositor is within noise. Idle decodes two updates in ten seconds for both
+pairs; the new pair's 0/0 interval means both arrived together (a 0 µs
+interval), not a stall.
+
+| Workload | Pin | Compositor CPU % | Frontend CPU % | Decoded upd/s | Interval p50/p95 ms | Capture wait p50 ms |
+|---|---|---|---|---|---|---|
+| 1920 idle | old | 1.6 | 0.4 | 0.2 | 16/16 | 4.3 |
+| 1920 idle | new | 1.5 | 0.4 | 0.2 | 0/0 | 9.5 |
+| 1920 scroll | old | 89.9 | 16.7 | 29.7 | 31/62 | 19.2 |
+| 1920 scroll | new | 90.7 | 15.7 | 29.8 | 31/62 | 19.3 |
+| 1920 typing | old | 79.0 | 3.8 | 4.0 | 230/458 | 36.9 |
+| 1920 typing | new | 78.3 | 3.0 | 3.9 | 231/460 | 37.3 |
+| 1920 video | old | 91.8 | 16.6 | 29.9 | 26/56 | 18.3 |
+| 1920 video | new | 92.7 | 15.1 | 30.0 | 26/54 | 18.0 |
+| 1920 video nvenc/gpu (GPU capture activations 1) | old | 7.5 | 9.7 | 35.5 | 26/33 | 26.2 |
+| 1920 video nvenc/gpu (GPU capture activations 1) | new | 7.9 | 8.6 | 35.5 | 26/33 | 26.1 |
+| 1920 window | old | 78.5 | 6.2 | 103.2 | 0/40 | 37.7 |
+| 1920 window | new | 77.8 | 3.5 | 102.5 | 0/40 | 37.9 |
+| 3840 video | old | 208.4 | 38.6 | 69.0 | 10/32 | 54.9 |
+| 3840 video | new | 211.4 | 34.4 | 71.5 | 9/30 | 55.6 |
+
+The accepted PCM audio combination and its controls are unchanged. No installed
+package, host service or active session was changed. Pending in Windows 10
+mstsc after the clean reinstall (see [acceptance](acceptance.md#niri-rebase-acceptance)):
+typing in the configured layout, Mod+D and Mod+wheel; Fcitx Japanese; emoji then
+reconnect; layout reload while connected; cursor shape, hotspot and smoothness
+at 100% and 200%; the drag-and-drop icon; live resize; reconnect to the same
+compositor PID; Super+Shift+Q logout; NVENC with GPU capture; audio; clipboard;
+and the software renderer if used.
+
+## IronRDP 7b976a6 bump, 2026-10-15
+
+Wave 4 of `PLAN.md` (WP-15) moved every IronRDP git dependency from
+`bf019ca502d1e52616853a5ded68c885cec1e322` to master
+`7b976a6965c96c76ff949313e174ea55dada8c44` (2026-10-13). The three upstream
+commits are #2102 (EGFX frame acknowledgement limits), #2111 (Windows-only
+clipboard logging) and #1985 (`offers_display_control`, default true). All local
+`ironrdp-server` changes listed in `bridge/vendor/ironrdp-server/UPSTREAM` were
+re-applied unchanged; upstream contains none of them. Upstream did not touch the
+sound path, so RDPSND wire behaviour and pacing are unchanged.
+
+- Video: a nonzero client core Frame Acknowledge capability now caps the
+  bridge's adaptive frame window, which defaults to 2. The EGFX frame tracker is
+  the only credit gate. Typed submissions count a full window
+  (`backpressured_submissions`) separately from other rejections
+  (`rejected_submissions`), and any dropped frame still forces an IDR.
+  Acknowledgements for unknown or stale frames no longer reach rate control.
+- Results: `make check` and `make lint` passed after refreshing the makepkg
+  Cargo cache with `makepkg -o`. The vendored crate's own 43 unit tests passed in
+  a scratch workspace, including the upstream frame acknowledgement and EGFX
+  tests. Namespace bitmap, brief NVENC AVC420 and clipboard integrations passed.
+  AVC444 and the `--nvidia-renderer` GPU capture variant were not run.
+- Pending: Windows 10 mstsc smoothness and latency with the frame
+  acknowledgement cap. If mstsc advertises a limit of 1, the window drops to one
+  frame.
+
+## Capture efficiency, pointer cache and connection summary, 2026-10-15
+
+Wave 3 of `PLAN.md` (work packages WP-12 to WP-14) changed SHM/GPU capture, the
+cursor path and frontend diagnostics. All results below are automated, namespace
+or lab checks; no installed package, host service or active session was changed.
+The accepted audio combination is unchanged; WP-14 only adds counters to the
+audio code.
+
+- Capture (WP-12): SHM capture uses a pool of up to three shared buffers plus a
+  private overflow buffer per layout, with zero-copy snapshots; a buffer still
+  held as a diff base or encoder input is never rewritten, and capture then
+  copies through the overflow buffer (`capture_pool_exhausted`). At 4K the pool
+  can hold about 133 MB. Compositor damage limits comparisons to the damaged
+  64-pixel tiles, audited by a full comparison once per second; a change outside
+  the damage counts `capture_damage_missed` and forces a full refresh. A 16-entry
+  capture log lets unchanged-desktop and bitmap fallback checks skip full-frame
+  comparisons. GPU capture caches EGL images and textures per DMA-BUF and its
+  uniform locations. Rust tests cover pooled-slot reuse while a diff base holds
+  it, overflow copies, capture-log history and damage-hint comparison. The
+  vendored bitmap diff was left unchanged: it already scans only sent
+  subregions, and a hook would need a new vendored public API.
+- Measurements were taken in the lab with an llvmpipe-rendered compositor and SHM
+  capture (before → after); live audio cadence was not measured because the lab
+  has no PipeWire. Reports are under `artifacts/wp12/`.
+
+  | Measurement | Before | After |
+  | --- | --- | --- |
+  | `capture_snapshot` p95, 4K scroll | 3.65 ms | 0.63 ms |
+  | `capture_snapshot` p95, 4K video | 3.31 ms | 0.12 ms |
+  | `capture_snapshot` p95, 4K typing | 6.75 ms | 4.18 ms |
+  | `capture_snapshot` p95, 1080p scroll | 1.07 ms | 0.17 ms |
+  | Bitmap-mode 4K frontend CPU, scroll / video / typing | 27.6 / 38.1 / 6.1% | 26.2 / 34.3 / 4.0% |
+  | NVENC SHM capture-to-submit, 4K scroll p50 / p95 | 15.8 / 18.5 ms | 13.4 / 16.3 ms |
+  | GPU conversion, 4K p50 / p95 | 0.49 / 1.22 ms | 0.33 / 0.49 ms |
+  | Runtime-thread work per 4K typing frame: bitmap damage / unchanged check | 4.5 / 2.1 ms | 0.005 / 0.002 ms |
+
+  No damage misses were recorded in these workloads.
+- Pointer cache (WP-13): the client's negotiated pointer cache size now reaches
+  the desktop through a vendored `RdpServerDisplay::pointer_cache_capabilities`
+  method (recorded in `bridge/vendor/ironrdp-server/UPSTREAM`). Each activation
+  keeps a least-recently-used cache of min(size, 32) shapes, matched by hash and
+  full comparison, and sends repeated shapes as cached-pointer references; a
+  cache size of 0 sends full shapes as before. Rust tests cover free-slot use
+  then cached references, LRU eviction, hash collisions, the slot bound and
+  pass-through without a client cache, an empty cache after reactivation, and
+  that a shape skipped before transmission is never referenced.
+- Connection summary (WP-14): every served connection writes one always-on
+  `RDP connection summary` journal line at disconnect with duration, result,
+  video codec/mode, frames, IDRs, average H.264 kbps, audio codec, waves,
+  discarded blocks, credit waits, codec recoveries and clipboard transfers,
+  timeouts and oversize drops; it carries no usernames, error text or content.
+  Local clipboard data over its bound now logs one warning and is counted
+  instead of being dropped silently. Rust tests cover the line format and
+  counter reset, one summary per disconnect, one summary per abruptly dropped
+  TCP connection with no duplicates, summary counters fed while diagnostics are
+  off, and clipboard transfer, timeout and oversize counts.
+
+Actual Windows 10 mstsc checks for these changes (stale-region and
+`capture_damage_missed` checks at 1080p and 4K, cursor shapes with the pointer
+cache, and one summary line per connection) remain pending after the user's
+clean reinstall; see [the acceptance matrix](acceptance.md).
+
+## Broker sessions, audit, code split and rich clipboard, 2026-10-15
+
+Wave 2 of `PLAN.md` (work packages WP-9 to WP-11) changed the broker, its PAM
+stack and unit, the frontend-to-broker protocol, the bridge's module layout and
+the clipboard. All results below are automated, namespace or lab checks; no
+installed package, host service or active session was changed. The accepted
+audio combination is unchanged.
+
+- Broker (WP-9): `make -C broker` tests passed 17/17. After PAM and the
+  `niri-rdp-users` check pass, an attached desktop returns status 4 (**Desktop in
+  use by another connection.**) and a local graphical session status 5 (**A local
+  desktop session is still open.**); earlier failures stay the generic status 1.
+  The protocol is now `NRB2`, carrying the client address as `PAM_RHOST` and into
+  journal audit entries (`NIRI_RDP_EVENT`, `NIRI_RDP_USER`, `NIRI_RDP_RHOST`,
+  `NIRI_RDP_RESULT`, `NIRI_RDP_SESSION`; never passwords). New
+  `/etc/niri-rdp/broker.conf` sets `grace_seconds` (0–3600, default 45); tests
+  cover bounds, unknown and repeated keys, ownership, permissions, symbolic links
+  and size, each falling back to defaults with a warning. Desktops get the PAM
+  session's umask (022 by default, with `pam_umask` added to the stack) and core
+  limit soft 0 / hard unlimited, share `/tmp` (no `PrivateTmp`), and get 2 seconds
+  after SIGTERM before SIGKILL on logout. `scripts/mock_broker.py` speaks `NRB2`;
+  the lab TLS broker contract and TLS login-screen integrations passed. A fail2ban
+  filter and commented jail are packaged as documentation only.
+- Code split (WP-10): `bridge/src/wayland.rs` and `bridge/src/video.rs` became the
+  `wayland/` and `video/` module directories with an unchanged public API. The
+  change is behaviour-preserving: the same 208 Rust test names and counts pass,
+  Clippy and rustfmt are clean, and the headless integration passed 11/11.
+- Clipboard (WP-11): Windows text, `HTML Format` and one image (PNG, then DIBV5,
+  then DIB) reach Linux as text, `text/html` and `image/png`; Linux PNG reaches
+  Windows as CF_DIB plus registered `PNG`, and HTML as `HTML Format`. Limits are
+  1 MiB text, 4 MiB HTML, and 32 MiB and 32768 pixels per side for images; a copy
+  with no usable format, such as files, leaves the Linux selection unchanged.
+  Rust unit tests cover CF_HTML and DIB/PNG conversion and the bounds.
+  `scripts/clipboard-integration.py` through `lab/run-isolated.sh` with
+  `NIRI_RDP_LAB_NIRI=/usr/lib/niri-rdp/niri-headless` passed all 4 cycles,
+  including a new rich cycle (PNG → DIB, HTML → CF_HTML and the reverse). File
+  transfer is not implemented.
+- Vendored clipboard bound (WP-11 follow-up, recorded in
+  `bridge/vendor/ironrdp-server/UPSTREAM`): the CLIPRDR limit rose to 32 MiB +
+  4104 bytes. A well-formed message over it is now skipped without buffering and
+  logged once with only its declared size instead of ending the session; a
+  skipped Format Data Response becomes a failed response, so that paste fails.
+  Malformed or compressed sequences still close the connection.
+  `bridge/tests/clipboard_wire.rs` covers this.
+
+Actual Windows 10 mstsc checks for these changes (busy and local-session
+messages, audit entries with the real client address, session umask, core limit
+and `/tmp`, logout SIGTERM grace, reconnect within `grace_seconds`, and images and
+rich text in both directions) remain pending after the user's clean reinstall;
+see [the acceptance matrix](acceptance.md).
+
+## Login, PAM, TLS, hardening and recovery fixes, 2026-10-15
+
+Wave 1 of `PLAN.md` (work packages WP-1 to WP-8) changed the frontend, broker
+PAM policy, TLS preparation, frontend unit, NVENC rate control, wheel input,
+clipboard and audio supervision. All results below are automated, namespace or
+lab checks; no installed package, host service or active session was changed.
+The accepted audio combination is unchanged: PCM preference, 20 ms pacing, zero
+timestamps, capture bounds and transport credits, with their PCM wire-byte and
+credit-wait regressions kept.
+
+- Login screen (WP-1): the form disconnects after 60 seconds without a submit or
+  120 seconds total, pausing during PAM and desktop startup; limits are
+  configurable and invalid values stop startup. Rust tests cover deadlines and
+  the per-source backoff (first failure free, then 1 s doubling to 60 s, 15-minute
+  expiry, 1024 sources, IPv6 /64 grouping, success clears it). Rejections during
+  backoff return the generic failure without contacting PAM, for the login screen
+  and direct credentials; desktop startup failures are not counted. The disposable
+  integration waits briefly after its wrong-credential case so the backoff does
+  not reject its following correct login. Deadline tests use short real time.
+- PAM (WP-2): `tests/test_pam_config.py` adds 10 tests, including two Bubblewrap
+  lab runs of the written-out stack. Failed RDP logins use the private
+  `/run/faillock-niri-rdp` tally (5 failures, 300 seconds), so console and sudo
+  are not locked. The group/UID check is `required`, so rejected accounts took
+  about 1.4–2.7 seconds with a right or wrong password, closing the root timing
+  oracle. Installed PAM/logind behavior remains an acceptance check.
+- TLS (WP-3): `tests/test_prepare_tls.py` adds 16 tests. Generated certificates
+  are RSA-3072, valid 825 days, recorded in `/etc/niri-rdp/tls/generated`, and
+  renewed atomically at broker start within 30 days of expiry, logging the new
+  fingerprint. Unmarked certificates exactly matching the earlier generator are
+  adopted and renewed; user-provided certificates warn within 30 days and still
+  fail on expiry.
+- Frontend unit (WP-4): `systemd-analyze security` exposure fell from 6.3 to 1.5
+  for the base unit and from 7.0 to 1.7 with the NVIDIA drop-in, which now allows
+  only the NVIDIA and DRM device groups under `DevicePolicy=closed`.
+- Video (WP-5): NVENC defaults to `NIRI_RDP_GPU_CAPTURE=auto` with SHM fallback,
+  and periodic IDRs default to every 30 seconds (`NIRI_RDP_GOP_SECONDS`) instead
+  of every two seconds; all forced-IDR paths remain. The encoder probe produced
+  one IDR in 600 frames. Bitrate adaptation uses six quantized levels, lowers at
+  most one level per second and raises one level after 10 healthy seconds at the
+  next due IDR. Native video, rate, GPU and configuration tests cover the new
+  settings and bounds.
+- Input (WP-6): RDP 120-unit wheel rotation accumulates per axis; whole notches go
+  out as `zwlr_virtual_pointer_v1` `axis_discrete` (Niri v120), 15 px per notch;
+  fractional units go out as plain axis motion. Partial notches reset on direction
+  change and on release/disconnect. Rust Wayland input tests cover this; a
+  real-application `axis_value120` assertion is not yet automated.
+- Clipboard (WP-7): CLIPRDR no longer disables remote copy after a slow response;
+  an unanswered request is replaced after a 60-second cap. Every Format Data
+  Request is answered, and overlapping requests receive an error response. The
+  FreeRDP clipboard integration passed on 2026-10-15.
+- Audio recovery (WP-8): after 10 healthy minutes, a helper or private-graph
+  failure receives a fresh restart budget; rapid failures still stop after two
+  helper restarts or three graph attempts. The audio worker, capture and
+  confirmation now use an injected clock instead of sleeps, and the audio suite
+  passed 20 consecutive runs under a 16-CPU load.
+
+Actual Windows 10 mstsc checks for these changes (login limits and backoff, PAM
+lockout scope, certificate fingerprint, NVENC with the new drop-in, wheel binds,
+large clipboard transfers and repeated audio recovery) remain pending after the
+user's clean reinstall; see [the acceptance matrix](acceptance.md).
+
 ## mstsc cursor jumping, 2026-10-15
 
 The user reported improved picture quality and approximately four percentage
@@ -963,8 +1321,11 @@ Additional implementation evidence is tracked in
 [compositor checkpoint](../compositor/CHECKPOINT.md),
 [bridge checkpoint](../bridge/CHECKPOINT.md),
 [broker checkpoint](../broker/CHECKPOINT.md), and the repository checkpoints.
-The foundation record below is preserved as historical evidence. Current
-actual-machine gates are listed in [acceptance](acceptance.md).
+The 0.1.0-era foundation record (completed PoC suites, foundation limits,
+reproduction commands and the 2026-10-10 to 2026-10-12 resolution, installation,
+keyboard and NVIDIA device entries) is preserved in the
+[0.1.0 validation archive](archive/validation-0.1.md). Current actual-machine
+gates are listed in [acceptance](acceptance.md).
 
 ## Packaged integration, 2026-10-10
 
@@ -999,313 +1360,3 @@ physical-monitor tests are still pending.
 Executed on Arch Linux on 2026-10-10. All changes are workspace files or temporary
 test artifacts. No packages, system units, PAM policies, GNOME settings, accounts,
 firewall rules, or monitor/power settings were changed.
-
-## Completed
-
-- **7 Python session-isolation tests pass.** They use real child processes and
-  a private D-Bus: no inherited display/socket/credential environment, private
-  directories for two workers, visible startup failure, worker and descendant
-  termination, cleanup, and refusal to run the harness as root.
-- **5 Rust adapter unit tests pass.** Fixed loopback endpoint/peer policy,
-  framebuffer stride/size/pixels and input-driven changes, extreme pointer
-  coordinates, extended-key separation, and input release after disconnect.
-- **4 startup failure tests pass.** Missing/empty credentials, missing or invalid
-  TLS identity, forbidden CLI overrides and TLS key logging all fail closed.
-- **1 real FreeRDP transport integration test passes.** A temporary synthetic IronRDP
-  server at `127.0.0.1:33990` used TLS/CredSSP and random throwaway credentials.
-  The displayless FreeRDP C client rejects an incorrect password specifically
-  through NLA, verifies HYBRID/TLS negotiation, decodes the 640×480 bitmap,
-  sends keyboard/pointer input and checks its pixel feedback, verifies key
-  release, then repeats the exchange on a fresh connection. This does not test
-  resuming a persistent desktop session. The server and
-  TLS/credential artifacts are cleaned up. A preliminary `xfreerdp3` auth-only
-  test also passed before this stronger test replaced it.
-
-These are 17 automated tests across the three suites. The integration client
-uses FreeRDP's software GDI without opening any X11 or Wayland display. Its
-certificate-verification bypass is limited to the managed test's ephemeral
-self-signed loopback certificate.
-
-The sandbox initially denied Unix/network socket creation. Successful socket
-tests were run with explicit execution permission outside the sandbox. Private
-D-Bus uses a Unix socket; the RDP listener is loopback-only and temporary.
-
-## Foundation limits (before the real bridge implementation)
-
-No real Niri process, capture client, virtual keyboard/pointer bridge, PAM login
-broker, or logind remote session was started. Niri is not installed on this host;
-its behavior was investigated using pinned source. No Windows `mstsc.exe`
-interoperability, physical monitor power-off, GPU/software rendering, resize,
-remote account authentication, or same-UID desktop coexistence has been tested.
-The proof of concept establishes transport/adapter and process-isolation
-foundations, not completion of the target desktop.
-
-The RDP prototype uses the **published** `ironrdp-server =0.13.0` and its lockfile.
-The research snapshot is a later development revision with materially different
-APIs despite the same manifest version. Its new credential/session binding APIs
-must not be assumed to exist in the published crate used by the prototype.
-
-## Reproduction
-
-From the repository root:
-
-```sh
-python3 -m unittest discover -s tests -v
-CARGO_HOME="$PWD/poc/.cargo-cache" cargo test --locked --offline --manifest-path poc/Cargo.toml
-python3 poc/tests/startup.py
-POC_RDP_BINARY="$PWD/poc/target/debug/niri-rdp-transport-poc" python3 -m unittest discover -s tests -v
-```
-
-The local Cargo cache is ignored. On a fresh checkout, dependency acquisition
-must precede `--offline`; keep the Cargo home and target within the workspace.
-See [PoC instructions](../poc/README.md) for explicit TLS setup, launch, and
-integration commands. Default test discovery does not implicitly start an RDP
-service.
-
-
-## Dynamic resolution validation (2026-10-10)
-
-The current bridge and maintained headless compositor patch support native
-client-selected initial resolution and single-display live resize. The displayless
-FreeRDP client negotiates 1001×701, then sends Display Control layouts for
-702×1001 → 1002×701 → 702×1001 on the same connection. For every size, the harness
-checks decoded frame geometry against Niri IPC's native and logical output size,
-then requires application keyboard and center-pointer click/release feedback.
-This verifies application reflow at native resolution as well as RDP geometry.
-
-Three complete isolated TLS broker fixture suites passed: bitmap, NVENC AVC420,
-and NVENC with a bitmap-only client. Receipts are
-`artifacts/dynamic-resolution-bitmap.json`,
-`artifacts/dynamic-resolution-nvenc.json`, and
-`artifacts/dynamic-resolution-nvenc-fallback.json`. They also retain wrong-password
-rejection, reconnect, held-input disconnect release, compositor-crash termination,
-frontend survival and broker lease EOF checks. The last fallback run uses the
-final disconnect responsiveness checks. The fixture supplies a real compositor
-FD but does not authenticate through PAM.
-
-All 27 bridge unit tests passed, including resize-before-pixels ordering,
-cancellation, unsupported layouts, odd-size video decoding, encoder recreation,
-and graphics surface reset. Both compositor headless regressions passed; the
-maintained patch applies to the pristine pinned archive, and both debug binaries
-build. Python regression discovery passed seven tests with the opt-in synthetic
-transport test skipped. Socket tests and isolated integration required execution
-outside the restrictive sandbox. No host service was installed or enabled.
-
-Reproduce after building the patched compositor, bridge and strict FreeRDP probe:
-
-```sh
-cargo test --manifest-path bridge/Cargo.toml --locked --offline
-lab/run-isolated.sh env NIRI_RDP_LAB_TLS_CONTRACT=1 \
-  NIRI_RDP_LAB_REPORT=artifacts/dynamic-resolution-bitmap.json \
-  python3 scripts/headless-integration.py
-lab/run-isolated.sh --nvenc env NIRI_RDP_LAB_ENCODER=nvenc \
-  NIRI_RDP_LAB_TLS_CONTRACT=1 \
-  NIRI_RDP_LAB_REPORT=artifacts/dynamic-resolution-nvenc.json \
-  python3 scripts/headless-integration.py
-lab/run-isolated.sh --nvenc env NIRI_RDP_LAB_ENCODER=nvenc \
-  NIRI_RDP_LAB_GFX=0 NIRI_RDP_LAB_TLS_CONTRACT=1 \
-  NIRI_RDP_LAB_REPORT=artifacts/dynamic-resolution-nvenc-fallback.json \
-  python3 scripts/headless-integration.py
-```
-
-See the [resolution contract](../bridge/README.md#dynamic-resolution) for bounds
-and rebuilding both packages. Windows mstsc, installed-service operation and
-real PAM/logind boot acceptance remain separate-machine gates.
-
-## Simplified Arch host installation (2026-10-10)
-
-`packaging/arch/niri-rdp/PKGBUILD` builds the compositor, bridge, broker, and
-setup helpers as one `niri-remote-login` package. Source checksum verification,
-portable `makepkg --allsource` export and verification outside the checkout,
-pinned compositor patch application, package assembly, and staged package
-structure checks passed. The assembly check reused existing compiled binaries;
-a complete fresh combined release build and actual pacman installation were not
-performed. The legacy split-package source exporter also excludes makepkg's
-generated trees and cached inputs.
-
-Python discovery passed 13 tests, with the opt-in synthetic transport test
-skipped. The broker's 10 mock-PAM test groups passed. The bridge Rust suite
-passed 35 library tests plus one frontend test, including direct listener configuration, restricted credential-less
-login binding, keyboard/focus handling, password masking, rejected login, and
-stream cancellation. Staged systemd units passed `systemd-analyze verify`; only
-executable paths were redirected to the extracted package for this check. TLS
-tests use temporary files and exercise real OpenSSL generation, identity
-preservation, private-key permissions, and incomplete/symlink identity rejection.
-
-Fresh bridge and FreeRDP probe builds passed three isolated real-desktop suites:
-
-- `artifacts/easy-install-direct-tls-integration.json`: direct ClientInfo
-  credentials through the broker protocol to a real Niri desktop.
-- `artifacts/easy-install-login-integration.json`: omitted ClientInfo credentials
-  reach the login form, wrong form credentials are rejected, and physical US
-  scancodes submit valid credentials before real desktop interaction.
-- `artifacts/easy-install-login-nvenc-integration.json`: the same login sequence
-  switches to actual NVIDIA NVENC AVC420 with client-decoded desktop frames.
-
-All suites exercise real application frames/input, client-selected initial
-resolution, native/live portrait and odd-height resize, reconnect, held-input
-release, compositor failure, frontend survival, and closure of each accepted
-broker lease. The namespace broker supplies a real compositor socket but uses
-fixture credentials: these results establish RDP/login/desktop transport,
-not installed Linux PAM or logind sessions.
-
-Reproduce the login-screen suites after building the patched compositor, bridge,
-and strict FreeRDP probe:
-
-```sh
-lab/run-isolated.sh env NIRI_RDP_LAB_TLS_CONTRACT=1 \
-  NIRI_RDP_LAB_LOGIN_SCREEN=1 \
-  NIRI_RDP_LAB_REPORT=artifacts/easy-install-login-integration.json \
-  python3 scripts/headless-integration.py
-lab/run-isolated.sh --nvenc env NIRI_RDP_LAB_ENCODER=nvenc \
-  NIRI_RDP_LAB_TLS_CONTRACT=1 NIRI_RDP_LAB_LOGIN_SCREEN=1 \
-  NIRI_RDP_LAB_REPORT=artifacts/easy-install-login-nvenc-integration.json \
-  python3 scripts/headless-integration.py
-```
-
-Microsoft's [RDP negotiation request specification](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-rdpbcgr/902b090b-9cb3-4efc-92bf-ee13373371e3)
-allows a client offering CredSSP to also offer TLS. The pinned acceptor selects
-the shared TLS protocol and supplies ClientInfo credentials even when they are
-empty. This supports the ordinary-client/login-screen design; it is not evidence
-that a specific Windows build interoperates. Actual Windows mstsc, installed
-PAM/logind boot login, and physical-monitor acceptance remain pending.
-
-## Remote login graphics fixes (2026-10-11)
-
-The rebuilt bridge passed eight login-related tests and sixteen video tests,
-including static-form repaint, bitmap fallback without AVC, and delivery of the
-first graphics surface while the client suppresses output during its handshake.
-An isolated bitmap/TLS login-screen run passed wrong-password rejection,
-authentication into a real headless Niri desktop, decoded frames, live resizing,
-application input, disconnect releases, compositor failure, and broker lease
-closure. Its report is `artifacts/remote-fixes-login-integration.json`.
-
-The run used fixture credentials through the namespace broker, existing lab
-compositor/client binaries, and FreeRDP libraries extracted into the local test
-sysroot. It did not validate installed PAM/logind, an actual Windows mstsc
-client, or hardware NVENC; no NVIDIA devices were available. Login and desktop
-now share one graphics wrapper, so authentication at the negotiated desktop
-size reuses the login surface and adds no surface initialization to the NVENC
-integration fixture's existing count.
-
-## Remote keyboard and desktop fixes (2026-10-11)
-
-`make check` passed: 22 Python tests (one optional transport test skipped),
-five transport unit tests, four startup checks, ten native broker groups, and
-42 bridge tests. The worker's 14 host setup tests include host configuration
-reuse, remote override precedence, private bar startup and duplicate detection.
-Niri validated the user's existing configuration through the remote wrapper.
-
-The rebuilt compositor and expanded FreeRDP fixture passed combined TLS login
-and keyboard integration, recorded in
-`artifacts/login-keyboard-regression-integration.json`. The Wayland application
-decodes its actual advertised XKB keymap and requires consecutive `abc123ABc`,
-Return, and a Meta+D compositor binding. The run also checks resize, capture,
-disconnect release and compositor crash cleanup. The maintained patch applies
-cleanly to the exact pinned source archive and its checksum matches `pins.json`.
-Actual Windows mstsc, installed PAM/logind, the running DMS bar and hardware
-NVENC remain machine checks; these results do not claim those checks passed.
-
-Both headless compositor library regressions passed on the rebuilt source
-(`cargo test --locked --offline --no-default-features --lib backend::headless`).
-
-## Japanese layout and phone Unicode input (2026-10-11)
-
-Validation passed: 47 bridge library tests plus one frontend test, 22 Python
-tests (one optional transport test skipped), and the real-compositor RDP
-integration using both debug and release frontends. The release binary's host
-shared-library dependencies resolve successfully.
-
-The remote bridge now uses `evdev` / `jp106` / `jp`, matching the host's
-`/etc/X11/xorg.conf.d/00-keyboard.conf`. Login punctuation uses the same JIS
-positions. Japanese Ro, Yen, Hiragana/Katakana, Henkan and Muhenkan scan codes
-map to their Linux evdev keys.
-
-The FreeRDP fixture sends physical `abc123ABc`, JIS punctuation, Ro/Yen and
-conversion keys, then phone-style Unicode presses/releases containing Japanese
-and emoji with interleaved UTF-16 surrogate releases. The real Wayland fixture
-decodes `@"^&:[]` plus two backslashes and `Phone@"日本😀Aa@` exactly. This
-also exercises repeated Unicode presses, Backspace, Unicode Enter, Shift held
-across text injection, resumed physical typing, reconnect and disconnect
-release. Results: `artifacts/jp106-phone-keyboard-integration.json`.
-
-Unicode uses balanced taps through a temporary one-level keymap; the physical
-JP106 keymap and modifiers are restored after every scalar. Mobile IME
-composition happens in the client; remote IME composition is outside this
-change. Actual phone app and Windows hardware/client checks still require the
-user's devices. The automated test verifies both RDP event paths through the
-compositor into an application, rather than merely checking server receipt.
-
-Build the frontend using the repository's cached dependencies:
-
-```sh
-CARGO_HOME="$PWD/poc/.cargo-cache" cargo build --release --locked --offline --manifest-path bridge/Cargo.toml
-```
-
-System deployment requires root. An installed frontend continues using the
-old binary until it is updated and restarted. The package rebuild workflow in
-`docs/upgrade.md` includes the new `bridge/src/keyboard.rs` automatically.
-
-## Host keyboard and input-method inheritance (2026-10-12)
-
-Installed-host investigation found `jp` / `jp106` still saved in localed's
-configuration. The user's usual Niri `xkb` section was empty. The packaged
-headless build disables desktop D-Bus integration, including the locale1
-keyboard watcher, so it had fallen back to US. A remote session also rewrote
-the shared Fcitx profile. The later login attempt had no authenticated session
-or PAM failure counter; this does not prove which typed character failed.
-
-The environment helper now exports saved host XKB defaults before both the
-remote compositor and frontend start. The login form uses XKB rather than a
-fixed ASCII table. Configured Fcitx/IBus starts before applications, with a
-private Fcitx profile snapshot and private IBus address/discovery file.
-
-Regression checks cover localed parsing and user precedence; inherited JP106
-punctuation, Ro and Yen in a real headless seat at startup and reload; explicit
-Swedish override; login JP106, US, Swedish, AltGr, keypad and Unicode handling;
-private bus activation; input-method selection, disabled overrides, duplicate
-startup suppression and isolation of host profile writes. The maintained patch
-applies to the pinned source archive, and its hash matches `pins.json`.
-
-Release 12's package checks passed: 67 bridge tests, three headless compositor
-tests, 12 native broker groups and 52 Python tests (one optional transport test
-skipped). The isolated RDP login integration also authenticated a disposable
-password containing JIS punctuation through physical scancodes and Shift events.
-An isolated Fcitx startup loaded Mozc and the native Wayland input method, reused
-one daemon on repeated startup and preserved the source profile through teardown.
-
-Windows 10 mstsc and a physical Japanese keyboard require a fresh login on the
-updated installed host for final confirmation. The automated checks do not
-claim that device test has passed.
-
-## NVIDIA device preparation after reboot (2026-10-12)
-
-The installed headless host repeatedly failed the NVENC preflight with
-`CUDA_ERROR_NO_DEVICE` after reboot, despite a loaded NVIDIA driver and the
-correct GPU-access drop-in. Running `nvidia-smi` created `/dev/nvidia0` and
-`/dev/nvidiactl` after the failed starts. A one-frame FFmpeg NVENC test then
-passed with `setpriv --no-new-privs`, consistent with missing device nodes being
-the startup blocker. This observation does not prove the repaired boot path.
-
-Release 13 packages `niri-rdp-nvidia-devices.service` and makes the frontend
-wait for it through `Wants` and `After`. The root helper prepares base nodes and
-UVM nodes in separate commands, skips machines without a loaded NVIDIA GPU,
-and finishes without remaining active so it can run on later frontend starts.
-The frontend retains its unprivileged account and hardening. Existing NVIDIA
-drop-ins do not need a new dependency or a separately enabled helper.
-
-Validation passed: 62 Python regressions (two optional tests skipped), including
-startup-order and device-preparation regressions; the combined release 13
-`makepkg` build and checks; package structure/preservation validation; and
-`systemd-analyze verify` on the packaged helper, frontend and broker units.
-The package checks include 67 bridge tests, the headless compositor tests,
-native broker checks and 54 Python tests (one optional hardware test skipped).
-The release source bundle also includes the helper. Logs and extracted package
-evidence are under `artifacts/nvidia-boot-fix/`.
-
-Sandbox socket restrictions initially blocked private D-Bus/audio and Rust IPC
-tests; rerunning the checks outside the sandbox passed. No package installation,
-service restart or reboot was performed during this packaging change.
-Installed NVIDIA cold-boot validation remains pending in
-[acceptance.md](acceptance.md), and must precede any `nvidia-smi` invocation that
-could create the missing nodes itself.

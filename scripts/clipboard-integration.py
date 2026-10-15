@@ -1,5 +1,6 @@
 #!/usr/bin/python3
-"""Known Unicode text through real CLIPRDR and two isolated Wayland desktops.
+"""Known Unicode text, HTML and images through real CLIPRDR and two isolated
+Wayland desktops.
 
 Run with lab/run-isolated.sh. No host display, clipboard or bus is consulted.
 """
@@ -10,8 +11,10 @@ import secrets
 import selectors
 import signal
 import subprocess
+import struct
 import tempfile
 import time
+import zlib
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -48,17 +51,66 @@ def marker(process, expected):
     raise RuntimeError("missing clipboard marker: " + expected)
 
 
-def copy(environment, text):
-    process = subprocess.Popen(["wl-copy", "--foreground", "--type", "text/plain;charset=utf-8"],
+# Rich-mode fixtures, mirrored in scripts/rdp-clipboard-client.c.
+NATIVE_RGBA = [(255, 0, 0, 255), (0, 255, 0, 255), (0, 0, 255, 128),
+               (10, 20, 30, 255), (40, 50, 60, 0), (200, 100, 50, 255)]
+NATIVE_FRAGMENT = "<p>Wayland <i>rich</i> 日本</p>"
+REMOTE_DOCUMENT = "<html><body>\r\n<!--StartFragment--><b>RDP rich</b><!--EndFragment-->\r\n</body>\r\n</html>"
+REMOTE_RGB = [(1, 2, 3), (4, 5, 6), (7, 8, 9), (250, 251, 252), (128, 64, 32), (0, 0, 0)]
+
+
+def png_chunk(kind, data):
+    return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+
+
+def encode_png(width, height, pixels):
+    rows = b"".join(b"\0" + bytes(c for p in pixels[y * width:(y + 1) * width] for c in p) for y in range(height))
+    return (b"\x89PNG\r\n\x1a\n" + png_chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 6, 0, 0, 0))
+            + png_chunk(b"IDAT", zlib.compress(rows)) + png_chunk(b"IEND", b""))
+
+
+def decode_png(data):
+    """8-bit RGB/RGBA, non-interlaced: what the bridge writes."""
+    if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+        raise RuntimeError("pasted image is not PNG")
+    position, compressed, header = 8, b"", None
+    while position < len(data):
+        length, kind = struct.unpack(">I4s", data[position:position + 8])
+        body = data[position + 8:position + 8 + length]
+        position += 12 + length
+        if kind == b"IHDR":
+            header = struct.unpack(">IIBBBBB", body)
+        elif kind == b"IDAT":
+            compressed += body
+    width, height, depth, color, _, _, interlace = header
+    if depth != 8 or color not in (2, 6) or interlace:
+        raise RuntimeError("unexpected PNG layout")
+    channels = 3 if color == 2 else 4
+    raw, stride, previous, pixels = zlib.decompress(compressed), width * channels, bytes(width * channels), []
+    for y in range(height):
+        kind, line = raw[y * (stride + 1)], bytearray(raw[y * (stride + 1) + 1:(y + 1) * (stride + 1)])
+        for i in range(stride):
+            left = line[i - channels] if i >= channels else 0
+            up, corner = previous[i], previous[i - channels] if i >= channels else 0
+            p = left + up - corner
+            paeth = min((abs(p - left), 0, left), (abs(p - up), 1, up), (abs(p - corner), 2, corner))[2]
+            line[i] = (line[i] + (0, left, up, (left + up) // 2, paeth)[kind]) & 0xff
+        previous = bytes(line)
+        pixels += [tuple(line[x * channels:(x + 1) * channels]) for x in range(width)]
+    return width, height, pixels
+
+
+def copy(environment, text, mime="text/plain;charset=utf-8"):
+    process = subprocess.Popen(["wl-copy", "--foreground", "--type", mime],
                                env=environment, stdin=subprocess.PIPE,
                                stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
-    process.stdin.write(text.encode())
+    process.stdin.write(text if isinstance(text, bytes) else text.encode())
     process.stdin.close()
     return process
 
 
-def paste(environment):
-    return subprocess.run(["wl-paste", "--no-newline", "--type", "text/plain;charset=utf-8"],
+def paste(environment, mime="text/plain;charset=utf-8"):
+    return subprocess.run(["wl-paste", "--no-newline", "--type", mime],
                           env=environment, capture_output=True, timeout=3)
 
 
@@ -108,12 +160,16 @@ def main():
             if bridge.poll() is not None:
                 raise RuntimeError("frontend startup failed: " + (private / "bridge.log").read_text())
             receipts = []
-            for cycle, empty in enumerate((False, True, False)):
+            for cycle, mode in enumerate(("text", "empty", "text", "rich")):
+                empty, rich = mode == "empty", mode == "rich"
                 client_environment = dict(base, WLOG_LEVEL="OFF", NIRI_RDP_TEST_NLA="1",
                                           NIRI_RDP_TEST_USERNAME=username, NIRI_RDP_TEST_PASSWORD=password)
                 if empty:
                     client_environment["NIRI_RDP_TEST_CLIPBOARD_EMPTY"] = "1"
-                client = subprocess.Popen([str(ROOT / "artifacts/rdp-clipboard-client")], env=client_environment,
+                if rich:
+                    client_environment["NIRI_RDP_TEST_CLIPBOARD_RICH"] = "1"
+                client = subprocess.Popen([str(ROOT / os.environ.get(
+                    "NIRI_RDP_LAB_CLIPBOARD_CLIENT", "artifacts/rdp-clipboard-client"))], env=client_environment,
                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                                           text=True, bufsize=1)
                 processes.append(client)
@@ -127,19 +183,37 @@ def main():
                     for _ in range(3):
                         processes.append(copy(environments[0], "stale"))
                         time.sleep(0.01)
-                native = copy(environments[0], "" if empty else "Wayland 日本😀\nline 2")
-                processes.append(native)
+                if rich:
+                    # Native PNG -> CF_DIB (plus a "PNG" offer), then native HTML -> CF_HTML.
+                    processes.append(copy(environments[0], encode_png(3, 2, NATIVE_RGBA), "image/png"))
+                    marker(client, "NIRI_RDP_CLIPBOARD_IMAGE_OK")
+                    processes.append(copy(environments[0], NATIVE_FRAGMENT, "text/html"))
+                else:
+                    processes.append(copy(environments[0], "" if empty else "Wayland 日本😀\nline 2"))
                 marker(client, "NIRI_RDP_CLIPBOARD_NATIVE_TO_RDP_OK")
                 marker(client, "NIRI_RDP_CLIPBOARD_RDP_DATA_SENT")
                 deadline = time.monotonic() + 5
                 expected = b"" if empty else "RDP 日本😀\nline 2".encode()
                 while True:
-                    result = paste(environments[0])
                     types = subprocess.run(["wl-paste", "--list-types"], env=environments[0], capture_output=True, timeout=3)
-                    if result.returncode == 0 and result.stdout == expected and b"application/x-niri-rdp-private-text" in types.stdout:
-                        break
+                    own = b"application/x-niri-rdp-private-text" in types.stdout
+                    if rich:
+                        # CF_HTML and a 24-bit bottom-up CF_DIB -> text/html and image/png.
+                        listed = types.stdout.split()
+                        if own and b"image/png" in listed and b"text/html" in listed:
+                            image = paste(environments[0], "image/png")
+                            html = paste(environments[0], "text/html")
+                            if decode_png(image.stdout) != (3, 2, REMOTE_RGB):
+                                raise RuntimeError("RDP image did not convert to the expected PNG")
+                            if html.stdout.decode() != '<meta charset="utf-8">' + REMOTE_DOCUMENT:
+                                raise RuntimeError("RDP HTML did not convert to the expected text/html")
+                            break
+                    else:
+                        result = paste(environments[0])
+                        if result.returncode == 0 and result.stdout == expected and own:
+                            break
                     if time.monotonic() > deadline:
-                        raise RuntimeError("RDP text did not become the native selection")
+                        raise RuntimeError("RDP content did not become the native selection")
                     time.sleep(0.05)
                 if paste(environments[1]).stdout != b"second private desktop":
                     raise RuntimeError("clipboard escaped its authorized compositor")
@@ -149,7 +223,8 @@ def main():
                     raise RuntimeError("clipboard client failed: " + client.stderr.read())
                 if any(desktop.poll() is not None for desktop in desktops):
                     raise RuntimeError("clipboard reconnect replaced or ended a desktop")
-                receipts.append({"empty": empty, "unicode_and_multiline": not empty,
+                receipts.append({"empty": empty, "unicode_and_multiline": mode == "text",
+                                 "images_and_html": rich,
                                  "native_to_rdp": True, "rdp_to_native": True, "other_desktop_unchanged": True,
                                  "native_oversize_then_recovery": cycle == 0,
                                  "rapid_ownership_converged": cycle == 0})

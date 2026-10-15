@@ -1,0 +1,499 @@
+From cbd234f71a57ef6e90cad71dc20c8c8d988fca79 Mon Sep 17 00:00:00 2001
+From: Niri-RDP rebase <niri-rdp@localhost>
+Date: Thu, 15 Oct 2026 14:04:43 +0900
+Subject: [PATCH 11/12] image-copy-capture: don't echo a client's own pointer
+ motion to its cursor sessions
+
+A remote desktop server (the Niri-RDP bridge) moves the cursor with a
+zwlr_virtual_pointer_v1 created for its own wl_seat and draws the cursor on
+the remote client from an ext-image-copy-capture cursor session on the same
+connection. Every position it caused came back as a cursor `position`
+event, which the server must forward as a pointer warp, snapping the
+remote client's newer local cursor back while it moves.
+
+Remember which client's virtual pointer (identified by the seat it was
+created for) moved the cursor last in each event loop iteration and where
+it left it. If the cursor is still there on the next cursor session
+refresh, that client's own sessions take the position as known instead of
+receiving it. Everything else is unchanged:
+
+- enter and leave are always sent, as is the initial position of a new
+  session;
+- compositor warps (warp-mouse-to-focus) and motion from other pointers
+  or clients are reported to every session;
+- a virtual pointer created without a seat is echoed as before.
+
+Smithay deduplicates positions against the last one it sent, so a warp
+back to exactly that position after own motion is re-sent after a leave.
+
+This replaces the motion-echo suppression of the former niri-rdp-cursor-v1
+protocol (feature F13); upstream cursor sessions replace the rest of it.
+---
+ src/handlers/image_copy_capture.rs |  33 ++++
+ src/handlers/mod.rs                |  15 +-
+ src/niri.rs                        |  29 ++-
+ src/tests/cursor_capture.rs        | 278 +++++++++++++++++++++++++++++
+ src/tests/mod.rs                   |   1 +
+ 5 files changed, 348 insertions(+), 8 deletions(-)
+ create mode 100644 src/tests/cursor_capture.rs
+
+diff --git a/src/handlers/image_copy_capture.rs b/src/handlers/image_copy_capture.rs
+index 81f9fd12..2037ef52 100644
+--- a/src/handlers/image_copy_capture.rs
++++ b/src/handlers/image_copy_capture.rs
+@@ -59,6 +59,37 @@ pub struct ImageCopyCursorSession {
+     pub stream_id: CastStreamId,
+     /// Credentials of the capturing client, if known.
+     pub credentials: Option<Credentials>,
++    /// Cursor position last given to the session (smithay deduplicates against it).
++    pub reported_pos: Option<Point<i32, BufferCoords>>,
++    /// Cursor position the client knows: the reported one, or where the client's own virtual
++    /// pointer moved the cursor since.
++    pub known_pos: Option<Point<i32, BufferCoords>>,
++}
++
++impl ImageCopyCursorSession {
++    /// Sends the cursor position (`None` to leave) unless the client already knows it.
++    ///
++    /// `own_motion` means that the session's client moved the cursor to `pos` with its own virtual
++    /// pointer. Such a client, like a remote desktop server, already shows its local cursor
++    /// there, and echoing older positions back would warp that cursor back while it moves. Enter
++    /// and leave are always sent.
++    pub fn set_cursor_pos(&mut self, pos: Option<Point<i32, BufferCoords>>, own_motion: bool) {
++        if own_motion && pos.is_some() && self.known_pos.is_some() {
++            self.known_pos = pos;
++            return;
++        }
++        if pos == self.known_pos {
++            return;
++        }
++        if pos.is_some() && pos == self.reported_pos {
++            // The client moved its cursor away since this was reported, and smithay would drop
++            // the same position, so report it again after a leave.
++            self.session.set_cursor_pos(None);
++        }
++        self.session.set_cursor_pos(pos);
++        self.reported_pos = pos;
++        self.known_pos = pos;
++    }
+ }
+ 
+ /// Credentials for the client which created a capture session.
+@@ -351,6 +382,8 @@ impl ImageCopyCaptureHandler for State {
+                 session_id,
+                 stream_id: CastStreamId::next(),
+                 credentials,
++                reported_pos: None,
++                known_pos: None,
+             });
+         // Send the initial cursor position and hotspot.
+         self.niri.refresh_image_copy_cursor_sessions();
+diff --git a/src/handlers/mod.rs b/src/handlers/mod.rs
+index 8ad784ed..3daae576 100644
+--- a/src/handlers/mod.rs
++++ b/src/handlers/mod.rs
+@@ -14,7 +14,7 @@ use std::time::Duration;
+ 
+ use smithay::backend::allocator::dmabuf::Dmabuf;
+ use smithay::backend::drm::DrmNode;
+-use smithay::backend::input::{InputEvent, TabletToolDescriptor};
++use smithay::backend::input::{Event as _, InputEvent, TabletToolDescriptor};
+ use smithay::desktop::{PopupKind, PopupManager};
+ use smithay::input::dnd::{self, DnDGrab, DndGrabHandler, DndTarget};
+ use smithay::input::pointer::{self, CursorIcon, CursorImageStatus, Focus, PointerHandle};
+@@ -658,7 +658,20 @@ impl ScreencopyHandler for State {
+ 
+ impl VirtualPointerHandler for State {
+     fn process_virtual_pointer_event(&mut self, event: InputEvent<VirtualPointerBackend>) {
++        // The seat given at creation identifies the client that owns the virtual pointer.
++        let device = match &event {
++            InputEvent::PointerMotion { event } => Some(event.device()),
++            InputEvent::PointerMotionAbsolute { event } => Some(event.device()),
++            _ => None,
++        };
++        let client = device.and_then(|device| device.wl_seat()?.client());
++
+         self.process_input_event(event);
++
++        if let Some(client) = client {
++            let location = self.niri.seat.get_pointer().unwrap().current_location();
++            self.niri.virtual_pointer_motion = Some((client.id(), location));
++        }
+     }
+ }
+ 
+diff --git a/src/niri.rs b/src/niri.rs
+index 6c8fbe70..d382d1c0 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -417,6 +417,12 @@ pub struct Niri {
+     pub pointer_inside_hot_corner: bool,
+     pub pointer_constraint_position_hint: Option<Point<f64, Logical>>,
+     pub tablet_cursor_location: Option<Point<f64, Logical>>,
++    /// Client whose virtual pointer moved the cursor last this event loop iteration, and where it
++    /// left the cursor.
++    ///
++    /// That client already knows this position, so its own cursor capture sessions don't get it
++    /// echoed back.
++    pub virtual_pointer_motion: Option<(ClientId, Point<f64, Logical>)>,
+     pub gesture_swipe_3f_cumulative: Option<(f64, f64)>,
+     pub overview_scroll_swipe_gesture: ScrollSwipeGesture,
+     pub vertical_wheel_tracker: ScrollTracker,
+@@ -2866,6 +2872,7 @@ impl Niri {
+             pointer_inside_hot_corner: false,
+             pointer_constraint_position_hint: None,
+             tablet_cursor_location: None,
++            virtual_pointer_motion: None,
+             gesture_swipe_3f_cumulative: None,
+             overview_scroll_swipe_gesture: ScrollSwipeGesture::new(),
+             vertical_wheel_tracker: ScrollTracker::new(120),
+@@ -6046,6 +6053,7 @@ impl Niri {
+     /// Sends cursor position, hotspot and size to cursor sessions independently
+     /// of the cursor image.
+     pub fn refresh_image_copy_cursor_sessions(&mut self) {
++        let virtual_pointer_motion = self.virtual_pointer_motion.take();
+         if self.image_copy_cursor_sessions.is_empty() {
+             return;
+         }
+@@ -6056,18 +6064,22 @@ impl Niri {
+             .tablet_cursor_location
+             .unwrap_or_else(|| self.seat.get_pointer().unwrap().current_location());
+ 
++        // The client whose virtual pointer left the cursor where it is now, if any.
++        let moved_by = virtual_pointer_motion
++            .and_then(|(client, location)| (location == pointer_pos).then_some(client));
++
+         let mut sessions = mem::take(&mut self.image_copy_cursor_sessions);
+         for s in &mut sessions {
+             let Some(output) = image_copy_capture_impl::source_output(&s.session.source()) else {
+-                s.session.set_cursor_pos(None);
++                s.set_cursor_pos(None, false);
+                 continue;
+             };
+             let Some(geo) = self.global_space.output_geometry(&output) else {
+-                s.session.set_cursor_pos(None);
++                s.set_cursor_pos(None, false);
+                 continue;
+             };
+             let Some(mode) = output.current_mode() else {
+-                s.session.set_cursor_pos(None);
++                s.set_cursor_pos(None, false);
+                 continue;
+             };
+ 
+@@ -6115,12 +6127,15 @@ impl Niri {
+             let image = Rectangle::new(pos - hotspot, Size::from((cursor_size.w, cursor_size.h)));
+             let output_rect =
+                 Rectangle::from_size(output.current_transform().transform_size(mode.size));
+-            if self.pointer_visibility.is_visible() && image.overlaps(output_rect) {
++            let pos = if self.pointer_visibility.is_visible() && image.overlaps(output_rect) {
+                 // not geo.to_f64().contains(pointer_pos)
+-                s.session.set_cursor_pos(Some(Point::from((pos.x, pos.y))));
++                Some(Point::from((pos.x, pos.y)))
+             } else {
+-                s.session.set_cursor_pos(None);
+-            }
++                None
++            };
++            let own_motion =
++                moved_by.is_some() && s.session.client().map(|client| client.id()) == moved_by;
++            s.set_cursor_pos(pos, own_motion);
+         }
+         // This shouldn't be possible since sessions are only added from the
+         // ImageCopyCaptureHandler callbacks, which run in dispatch_clients()
+diff --git a/src/tests/cursor_capture.rs b/src/tests/cursor_capture.rs
+new file mode 100644
+index 00000000..a1ded514
+--- /dev/null
++++ b/src/tests/cursor_capture.rs
+@@ -0,0 +1,278 @@
++//! ext-image-copy-capture cursor sessions as used by the Niri-RDP remote desktop bridge.
++//!
++//! The bridge moves the cursor with its own virtual pointer and draws the cursor on the remote
++//! client from a cursor session on the same connection. Positions that its own pointer caused must
++//! not come back, or the remote client's local cursor would warp back while it moves. Positions
++//! from anything else (compositor warps, other pointers) and enter/leave still have to.
++
++use std::sync::{Arc, Mutex};
++
++use smithay::reexports::wayland_protocols::ext::image_capture_source::v1::client::ext_image_capture_source_v1::ExtImageCaptureSourceV1;
++use smithay::reexports::wayland_protocols::ext::image_capture_source::v1::client::ext_output_image_capture_source_manager_v1::ExtOutputImageCaptureSourceManagerV1;
++use smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_cursor_session_v1::{self, ExtImageCopyCaptureCursorSessionV1};
++use smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_manager_v1::ExtImageCopyCaptureManagerV1;
++use smithay::reexports::wayland_protocols::ext::image_copy_capture::v1::client::ext_image_copy_capture_session_v1::{self, ExtImageCopyCaptureSessionV1};
++use smithay::reexports::wayland_protocols_wlr::virtual_pointer::v1::client::zwlr_virtual_pointer_v1::ZwlrVirtualPointerV1;
++use smithay::utils::Point;
++use wayland_client::protocol::wl_pointer::WlPointer;
++use wayland_client::protocol::wl_registry::{self, WlRegistry};
++use wayland_client::{Connection, Dispatch, QueueHandle, WEnum};
++
++use crate::niri::PointerVisibility;
++use crate::tests::client::{self, ClientId};
++use crate::tests::fixture::Fixture;
++
++type Log = Arc<Mutex<Vec<String>>>;
++
++struct Capture {
++    log: Log,
++    _session: ExtImageCopyCaptureCursorSessionV1,
++}
++
++impl Capture {
++    fn take(&self) -> Vec<String> {
++        std::mem::take(&mut *self.log.lock().unwrap())
++    }
++}
++
++fn set_up() -> Fixture {
++    let mut f = Fixture::new();
++    f.add_output(1, (1920, 1080));
++    f
++}
++
++fn add_client(f: &mut Fixture) -> ClientId {
++    let id = f.add_client();
++    // Output names arrive after the first roundtrip.
++    f.roundtrip(id);
++    id
++}
++
++/// Binds a global that the shared test client does not bind itself.
++fn bind<I: wayland_client::Proxy + 'static>(f: &mut Fixture, id: ClientId) -> I
++where
++    client::State: Dispatch<I, ()>,
++{
++    let client = f.client(id);
++    let global = client
++        .state
++        .globals
++        .iter()
++        .find(|global| global.interface == I::interface().name)
++        .unwrap();
++    let (name, version) = (global.name, global.version.min(I::interface().version));
++    let registry = client.display.get_registry(&client.qh, Registry);
++    registry.bind(name, version, &client.qh, ())
++}
++
++/// A cursor session of output 1 for the seat pointer of this client.
++fn cursor_session(f: &mut Fixture, id: ClientId) -> Capture {
++    let sources: ExtOutputImageCaptureSourceManagerV1 = bind(f, id);
++    let manager: ExtImageCopyCaptureManagerV1 = bind(f, id);
++    let log = Log::default();
++    let client = f.client(id);
++    let output = client.output("headless-1");
++    let seat = client.state.seats.keys().next().unwrap().clone();
++    let pointer = seat.get_pointer(&client.qh, ());
++    let source = sources.create_source(&output, &client.qh, ());
++    let session = manager.create_pointer_cursor_session(&source, &pointer, &client.qh, log.clone());
++    session.get_capture_session(&client.qh, log.clone());
++    f.double_roundtrip(id);
++    Capture {
++        log,
++        _session: session,
++    }
++}
++
++/// A virtual pointer mapped to output 1, created for the client's seat like the bridge does.
++fn virtual_pointer(f: &mut Fixture, id: ClientId, with_seat: bool) -> ZwlrVirtualPointerV1 {
++    let client = f.client(id);
++    let output = client.output("headless-1");
++    let seat = client.state.seats.keys().next().unwrap().clone();
++    let manager = client.state.virtual_pointer_manager.as_ref().unwrap();
++    let seat = with_seat.then_some(&seat);
++    manager.create_virtual_pointer_with_output(seat, Some(&output), &client.qh, ())
++}
++
++fn move_to(f: &mut Fixture, id: ClientId, pointer: &ZwlrVirtualPointerV1, x: u32, y: u32) {
++    pointer.motion_absolute(0, x, y, 1920, 1080);
++    pointer.frame();
++    f.double_roundtrip(id);
++}
++
++fn warp(f: &mut Fixture, id: ClientId, x: f64, y: f64) {
++    f.niri_state().move_cursor(Point::from((x, y)));
++    f.double_roundtrip(id);
++}
++
++#[test]
++fn cursor_session_reports_position_and_offers_argb8888_shm() {
++    let mut f = set_up();
++    let bridge = add_client(&mut f);
++    let pointer = virtual_pointer(&mut f, bridge, true);
++    move_to(&mut f, bridge, &pointer, 100, 200);
++
++    let capture = cursor_session(&mut f, bridge);
++    let events = capture.take();
++    // A new session always gets the current position, also when the client moved there itself.
++    let position = events.iter().position(|e| e == "position 100 200").unwrap();
++    assert_eq!(events[..position], ["enter", "hotspot"]);
++    // Cursor images are SHM ARGB8888 only; cursor constraints never offer DMA-BUF.
++    assert!(events.contains(&"shm_format Argb8888".to_owned()));
++    assert!(events.iter().any(|e| e.starts_with("buffer_size ")));
++    assert!(!events.iter().any(|e| e.starts_with("dmabuf")));
++    assert_eq!(events.last().unwrap(), "done");
++}
++
++#[test]
++fn own_virtual_pointer_motion_is_not_echoed() {
++    let mut f = set_up();
++    let bridge = add_client(&mut f);
++    let other = add_client(&mut f);
++    let pointer = virtual_pointer(&mut f, bridge, true);
++    let other_pointer = virtual_pointer(&mut f, other, true);
++    let capture = cursor_session(&mut f, bridge);
++    let observer = cursor_session(&mut f, other);
++    capture.take();
++    observer.take();
++
++    move_to(&mut f, bridge, &pointer, 300, 400);
++    move_to(&mut f, bridge, &pointer, 310, 405);
++    f.roundtrip(other);
++    assert!(capture.take().is_empty());
++    // Other clients still see the motion.
++    assert_eq!(observer.take().last().unwrap(), "position 310 405");
++
++    // The bridge's last motion stays acknowledged across idle iterations.
++    f.double_roundtrip(bridge);
++    assert!(capture.take().is_empty());
++
++    // Compositor warps (e.g. warp-mouse-to-focus) and other pointers still move the cursor.
++    warp(&mut f, bridge, 500., 600.);
++    assert_eq!(capture.take(), ["position 500 600"]);
++    move_to(&mut f, other, &other_pointer, 700, 800);
++    f.double_roundtrip(bridge);
++    assert_eq!(capture.take(), ["position 700 800"]);
++    move_to(&mut f, bridge, &pointer, 710, 800);
++    assert!(capture.take().is_empty());
++}
++
++#[test]
++fn warp_to_the_last_reported_position_is_reported_again() {
++    let mut f = set_up();
++    let bridge = add_client(&mut f);
++    let pointer = virtual_pointer(&mut f, bridge, true);
++    warp(&mut f, bridge, 50., 60.);
++    let capture = cursor_session(&mut f, bridge);
++    assert!(capture.take().contains(&"position 50 60".to_owned()));
++
++    move_to(&mut f, bridge, &pointer, 900, 500);
++    assert!(capture.take().is_empty());
++
++    // Smithay already sent (50, 60) and deduplicates it, but the client is elsewhere now.
++    warp(&mut f, bridge, 50., 60.);
++    assert_eq!(
++        capture.take(),
++        ["leave", "enter", "hotspot", "position 50 60"]
++    );
++}
++
++#[test]
++fn visibility_changes_are_reported_for_own_motion() {
++    let mut f = set_up();
++    let bridge = add_client(&mut f);
++    let pointer = virtual_pointer(&mut f, bridge, true);
++    move_to(&mut f, bridge, &pointer, 100, 100);
++    let capture = cursor_session(&mut f, bridge);
++    capture.take();
++
++    // Hidden by niri (hide-when-typing): leave.
++    f.niri().pointer_visibility = PointerVisibility::Hidden;
++    f.double_roundtrip(bridge);
++    assert_eq!(capture.take(), ["leave"]);
++
++    // Own motion shows the pointer again: enter must not be suppressed.
++    move_to(&mut f, bridge, &pointer, 120, 130);
++    assert_eq!(capture.take(), ["enter", "hotspot", "position 120 130"]);
++    move_to(&mut f, bridge, &pointer, 140, 150);
++    assert!(capture.take().is_empty());
++}
++
++#[test]
++fn virtual_pointer_without_seat_is_echoed() {
++    let mut f = set_up();
++    let bridge = add_client(&mut f);
++    // Without a seat the owner of the virtual pointer is unknown.
++    let pointer = virtual_pointer(&mut f, bridge, false);
++    let capture = cursor_session(&mut f, bridge);
++    capture.take();
++
++    move_to(&mut f, bridge, &pointer, 300, 400);
++    assert_eq!(capture.take(), ["position 300 400"]);
++}
++
++struct Registry;
++
++impl Dispatch<WlRegistry, Registry> for client::State {
++    fn event(
++        _: &mut Self,
++        _: &WlRegistry,
++        _: wl_registry::Event,
++        _: &Registry,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++    }
++}
++
++wayland_client::delegate_noop!(client::State: ignore WlPointer);
++wayland_client::delegate_noop!(client::State: ExtOutputImageCaptureSourceManagerV1);
++wayland_client::delegate_noop!(client::State: ExtImageCaptureSourceV1);
++wayland_client::delegate_noop!(client::State: ExtImageCopyCaptureManagerV1);
++
++impl Dispatch<ExtImageCopyCaptureCursorSessionV1, Log> for client::State {
++    fn event(
++        _: &mut Self,
++        _: &ExtImageCopyCaptureCursorSessionV1,
++        event: ext_image_copy_capture_cursor_session_v1::Event,
++        log: &Log,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        use ext_image_copy_capture_cursor_session_v1::Event;
++        let event = match event {
++            Event::Enter => "enter".to_owned(),
++            Event::Leave => "leave".to_owned(),
++            Event::Position { x, y } => format!("position {x} {y}"),
++            // The hotspot depends on the cursor theme.
++            Event::Hotspot { .. } => "hotspot".to_owned(),
++            _ => return,
++        };
++        log.lock().unwrap().push(event);
++    }
++}
++
++impl Dispatch<ExtImageCopyCaptureSessionV1, Log> for client::State {
++    fn event(
++        _: &mut Self,
++        _: &ExtImageCopyCaptureSessionV1,
++        event: ext_image_copy_capture_session_v1::Event,
++        log: &Log,
++        _: &Connection,
++        _: &QueueHandle<Self>,
++    ) {
++        use ext_image_copy_capture_session_v1::Event;
++        let event = match event {
++            Event::BufferSize { width, height } => format!("buffer_size {width} {height}"),
++            Event::ShmFormat {
++                format: WEnum::Value(format),
++            } => format!("shm_format {format:?}"),
++            Event::DmabufDevice { .. } => "dmabuf_device".to_owned(),
++            Event::DmabufFormat { .. } => "dmabuf_format".to_owned(),
++            Event::Done => "done".to_owned(),
++            Event::Stopped => "stopped".to_owned(),
++            _ => return,
++        };
++        log.lock().unwrap().push(event);
++    }
++}
+diff --git a/src/tests/mod.rs b/src/tests/mod.rs
+index a25d02f6..68314926 100644
+--- a/src/tests/mod.rs
++++ b/src/tests/mod.rs
+@@ -7,6 +7,7 @@ mod test_input_backend;
+ 
+ mod animations;
+ mod binds;
++mod cursor_capture;
+ mod floating;
+ mod fullscreen;
+ mod layer_shell;

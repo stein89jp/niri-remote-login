@@ -1,0 +1,259 @@
+From 02445f8e2069e22ea0a2d7d3f76ef538dba81084 Mon Sep 17 00:00:00 2001
+From: Niri-RDP rebase <niri-rdp@localhost>
+Date: Thu, 15 Oct 2026 13:21:55 +0900
+Subject: [PATCH 05/12] headless: select the EGL device with NIRI_RDP_RENDERER
+
+NIRI_RDP_RENDERER is auto (default), hardware or software; anything else
+fails renderer creation. Unless software is selected, hardware EGL devices are
+enumerated through the device platform (no seat, VT or DRM master), devices
+advertising EGL_NV_device_cuda first, and the first one that yields a
+renderer is used ("headless renderer: hardware EGL device", path, nvidia).
+hardware fails closed when none works; otherwise the surfaceless platform is
+the fallback ("headless renderer: surfaceless fallback"), which with
+LIBGL_ALWAYS_SOFTWARE keeps Mesa llvmpipe.
+
+Headless::primary_render_node() now returns the hardware renderer's render
+node (None for software devices), so ext-image-copy-capture can offer
+DMA-BUF buffers.
+
+Niri-RDP feature F4. Tests: backend::headless::remote_tests::
+renderer_policy_is_validated_before_any_egl_display,
+software_renderer_uses_surfaceless_llvmpipe_without_a_render_node and
+hardware_renderer_fails_closed_without_a_hardware_device.
+---
+ src/backend/headless.rs | 164 ++++++++++++++++++++++++++++++++++++++--
+ 1 file changed, 156 insertions(+), 8 deletions(-)
+
+diff --git a/src/backend/headless.rs b/src/backend/headless.rs
+index f8c31c96..4463a19b 100644
+--- a/src/backend/headless.rs
++++ b/src/backend/headless.rs
+@@ -15,7 +15,7 @@ use niri_config::OutputName;
+ use smithay::backend::allocator::dmabuf::Dmabuf;
+ use smithay::backend::drm::DrmNode;
+ use smithay::backend::egl::native::EGLSurfacelessDisplay;
+-use smithay::backend::egl::{EGLContext, EGLDisplay};
++use smithay::backend::egl::{EGLContext, EGLDevice, EGLDisplay};
+ use smithay::backend::renderer::element::RenderElementStates;
+ use smithay::backend::renderer::gles::GlesRenderer;
+ use smithay::backend::renderer::ImportDma;
+@@ -33,6 +33,8 @@ use crate::utils::{get_monotonic_time, logical_output};
+ 
+ pub struct Headless {
+     renderer: Option<GlesRenderer>,
++    /// Render node of a hardware renderer, for client and capture DMA-BUF allocation.
++    render_node: Option<DrmNode>,
+     ipc_outputs: Arc<Mutex<IpcOutputMap>>,
+     virtual_outputs: super::VirtualOutputs,
+ }
+@@ -41,6 +43,7 @@ impl Headless {
+     pub fn new() -> Self {
+         Self {
+             renderer: None,
++            render_node: None,
+             ipc_outputs: Default::default(),
+             virtual_outputs: super::VirtualOutputs::new(),
+         }
+@@ -54,20 +57,76 @@ impl Headless {
+             return Ok(());
+         }
+ 
+-        let mut renderer = unsafe {
+-            let display =
+-                EGLDisplay::new(EGLSurfacelessDisplay).context("error creating EGL display")?;
+-            let context = EGLContext::new(&display).context("error creating EGL context")?;
+-            GlesRenderer::new(context).context("error creating renderer")?
++        let policy = std::env::var("NIRI_RDP_RENDERER").unwrap_or_else(|_| "auto".into());
++        anyhow::ensure!(
++            matches!(policy.as_str(), "auto" | "hardware" | "software"),
++            "NIRI_RDP_RENDERER must be auto, hardware or software"
++        );
++        let mut renderer = None;
++        if policy != "software" {
++            // NVIDIA supports headless EGL through the device platform rather than
++            // Mesa's surfaceless platform. No seat, VT or DRM master is acquired.
++            match EGLDevice::enumerate() {
++                Ok(devices) => {
++                    let mut devices: Vec<_> = devices.filter(|d| !d.is_software()).collect();
++                    // Prefer the NVIDIA GPU on hybrid hosts to match NVENC, while
++                    // retaining other hardware as a fallback when it is inaccessible.
++                    devices
++                        .sort_by_key(|d| !d.extensions().iter().any(|e| e == "EGL_NV_device_cuda"));
++                    for device in devices {
++                        let path = device.render_device_path().ok();
++                        let nvidia = device
++                            .extensions()
++                            .iter()
++                            .any(|e| e == "EGL_NV_device_cuda");
++                        let attempt = unsafe { EGLDisplay::new(device) }
++                            .context("error creating device EGL display")
++                            .and_then(Self::renderer_for_display);
++                        match attempt {
++                            Ok(candidate) => {
++                                info!(?path, nvidia, "headless renderer: hardware EGL device");
++                                renderer = Some(candidate);
++                                break;
++                            }
++                            Err(err) => warn!(?path, "headless EGL device unavailable: {err:#}"),
++                        }
++                    }
++                }
++                Err(err) => warn!("headless EGL device enumeration unavailable: {err:#}"),
++            }
++        }
++        if renderer.is_none() && policy == "hardware" {
++            anyhow::bail!(
++                "no usable hardware headless EGL device; check driver and user device permissions"
++            );
++        }
++        let mut renderer = match renderer {
++            Some(renderer) => renderer,
++            None => {
++                info!("headless renderer: surfaceless fallback");
++                let display = unsafe { EGLDisplay::new(EGLSurfacelessDisplay) }
++                    .context("error creating fallback EGL display")?;
++                Self::renderer_for_display(display)?
++            }
+         };
+ 
+         resources::init(&mut renderer);
+         shaders::init(&mut renderer);
+ 
++        // Software rasterisers such as llvmpipe have no render node, so capture stays on SHM.
++        self.render_node = EGLDevice::device_for_display(renderer.egl_context().display())
++            .ok()
++            .filter(|device| !device.is_software())
++            .and_then(|device| device.try_get_render_node().ok().flatten());
+         self.renderer = Some(renderer);
+         Ok(())
+     }
+ 
++    fn renderer_for_display(display: EGLDisplay) -> anyhow::Result<GlesRenderer> {
++        let context = EGLContext::new(&display).context("error creating EGL context")?;
++        unsafe { GlesRenderer::new(context) }.context("error creating renderer")
++    }
++
+     /// Add an output for testing (uses lowercase naming like `headless-1`).
+     /// This is kept for backwards compatibility with tests.
+     pub fn add_output(&mut self, niri: &mut Niri, n: u8, size: (u16, u16)) {
+@@ -218,7 +277,7 @@ impl Headless {
+     }
+ 
+     pub fn primary_render_node(&mut self) -> Option<DrmNode> {
+-        None
++        self.render_node
+     }
+ 
+     pub fn render(&mut self, niri: &mut Niri, output: &Output) -> RenderResult {
+@@ -318,8 +377,10 @@ mod remote_tests {
+ 
+     use calloop::EventLoop;
+     use niri_config::Config;
++    use smithay::backend::egl::EGLDevice;
+     use smithay::reexports::wayland_server::Display;
+ 
++    use crate::backend::Backend;
+     use crate::niri::State;
+ 
+     const CHILD: &str = "NIRI_RDP_HEADLESS_TEST_CHILD";
+@@ -375,7 +436,10 @@ mod remote_tests {
+     fn session_startup_binds_wayland_0_with_default_output() {
+         if rerun_in_child(
+             "backend::headless::remote_tests::session_startup_binds_wayland_0_with_default_output",
+-            &[("LIBGL_ALWAYS_SOFTWARE", "1")],
++            &[
++                ("LIBGL_ALWAYS_SOFTWARE", "1"),
++                ("NIRI_RDP_RENDERER", "software"),
++            ],
+         ) {
+             return;
+         }
+@@ -564,4 +628,88 @@ mod remote_tests {
+             );
+         }
+     }
++
++    #[test]
++    fn renderer_policy_is_validated_before_any_egl_display() {
++        if rerun_in_child(
++            "backend::headless::remote_tests::renderer_policy_is_validated_before_any_egl_display",
++            &[("NIRI_RDP_RENDERER", "nvidia")],
++        ) {
++            return;
++        }
++
++        let (_event_loop, state) = headless_state(false);
++        let mut state = state.unwrap();
++        let Backend::Headless(headless) = &mut state.backend else {
++            unreachable!();
++        };
++        let err = headless.add_renderer().unwrap_err();
++        assert!(err.to_string().contains("NIRI_RDP_RENDERER"), "{err}");
++        assert!(headless.with_primary_renderer(|_| ()).is_none());
++        assert_eq!(headless.primary_render_node(), None);
++    }
++
++    #[test]
++    fn software_renderer_uses_surfaceless_llvmpipe_without_a_render_node() {
++        // glvnd would otherwise let another vendor (NVIDIA) serve the surfaceless platform;
++        // LIBGL_ALWAYS_SOFTWARE only selects llvmpipe within Mesa.
++        let mesa = ["/usr/share/glvnd/egl_vendor.d", "/etc/glvnd/egl_vendor.d"]
++            .into_iter()
++            .filter_map(|dir| std::fs::read_dir(dir).ok())
++            .flatten()
++            .filter_map(Result::ok)
++            .map(|entry| entry.path())
++            .find(|path| path.to_string_lossy().contains("mesa"))
++            .expect("the Mesa EGL vendor file must be installed");
++        if rerun_in_child(
++            "backend::headless::remote_tests::software_renderer_uses_surfaceless_llvmpipe_without_a_render_node",
++            &[
++                ("__EGL_VENDOR_LIBRARY_FILENAMES", mesa.to_str().unwrap()),
++                ("LIBGL_ALWAYS_SOFTWARE", "1"),
++                ("GALLIUM_DRIVER", "llvmpipe"),
++                ("NIRI_RDP_RENDERER", "software"),
++            ],
++        ) {
++            return;
++        }
++
++        let (_event_loop, state) = headless_state(false);
++        let mut state = state.unwrap();
++        let Backend::Headless(headless) = &mut state.backend else {
++            unreachable!();
++        };
++        headless.add_renderer().unwrap();
++        let software = headless
++            .with_primary_renderer(|renderer| {
++                EGLDevice::device_for_display(renderer.egl_context().display())
++                    .map_or(true, |device| device.is_software())
++            })
++            .unwrap();
++        assert!(software);
++        assert_eq!(headless.primary_render_node(), None);
++    }
++
++    #[test]
++    fn hardware_renderer_fails_closed_without_a_hardware_device() {
++        // With no EGL vendor, enumeration finds no device; "hardware" must not fall back.
++        if rerun_in_child(
++            "backend::headless::remote_tests::hardware_renderer_fails_closed_without_a_hardware_device",
++            &[
++                ("__EGL_VENDOR_LIBRARY_FILENAMES", "/nonexistent/egl-vendor.json"),
++                ("__EGL_VENDOR_LIBRARY_DIRS", "/nonexistent"),
++                ("NIRI_RDP_RENDERER", "hardware"),
++            ],
++        ) {
++            return;
++        }
++
++        let (_event_loop, state) = headless_state(false);
++        let mut state = state.unwrap();
++        let Backend::Headless(headless) = &mut state.backend else {
++            unreachable!();
++        };
++        let err = headless.add_renderer().unwrap_err();
++        assert!(err.to_string().contains("no usable hardware"), "{err}");
++        assert!(headless.with_primary_renderer(|_| ()).is_none());
++    }
+ }

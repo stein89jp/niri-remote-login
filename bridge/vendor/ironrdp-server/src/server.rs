@@ -1,6 +1,8 @@
 use core::cell::RefCell;
 use core::fmt;
 use core::net::{IpAddr, SocketAddr};
+#[cfg(feature = "egfx")]
+use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 #[cfg(feature = "usb")]
@@ -75,11 +77,21 @@ use crate::urbdrc::{
 use crate::{RdpdrServerFactory, SoundServerFactory, builder, capabilities};
 #[path = "clipboard_guard.rs"]
 mod clipboard_guard;
+#[path = "rdpeai_recycle.rs"]
+mod rdpeai_recycle;
 #[cfg(feature = "usb")]
 use ironrdp_rdpeusb::{InterfaceAlloc, server::UrbdrcControlServer, server::UrbdrcDeviceServer};
 
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
+
+#[cfg(feature = "egfx")]
+fn client_core_frame_ack_limit(capabilities: &[CapabilitySet]) -> Option<NonZeroU32> {
+    capabilities.iter().find_map(|capability| match capability {
+        CapabilitySet::FrameAcknowledge(capability) => NonZeroU32::new(capability.max_unacknowledged_frame_count),
+        _ => None,
+    })
+}
 const AUTO_RECONNECT_COOKIE_UPDATE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 
 /// How long a single [`ironrdp_acceptor::accept_finalize`] pass may take before
@@ -434,6 +446,15 @@ impl RdpServerDisplay for BoundDisplaySlot {
             self.default.pointer_capabilities(max_size);
         }
     }
+    fn pointer_cache_capabilities(&mut self, max_size: u16, cache_size: u16) {
+        let mut bound = self.bound.lock().expect("bound display lock poisoned");
+        if let Some(display) = bound.display.as_mut() {
+            display.pointer_cache_capabilities(max_size, cache_size);
+        } else {
+            drop(bound);
+            self.default.pointer_cache_capabilities(max_size, cache_size);
+        }
+    }
     async fn size(&mut self) -> DesktopSize {
         if let Some(mut lease) = BoundDisplayLease::take(&self.bound) {
             lease.display_mut().size().await
@@ -455,6 +476,14 @@ impl RdpServerDisplay for BoundDisplaySlot {
             lease.display_mut().monitor_count().await
         } else {
             self.default.monitor_count().await
+        }
+    }
+
+    async fn offers_display_control(&mut self) -> bool {
+        if let Some(mut lease) = BoundDisplayLease::take(&self.bound) {
+            lease.display_mut().offers_display_control().await
+        } else {
+            self.default.offers_display_control().await
         }
     }
 
@@ -1185,6 +1214,12 @@ pub enum ServerEvent {
     Rdpsnd(RdpsndServerMessage),
     Rdpdr(RdpdrServerMessage),
     Rdpeai(RdpeaiServerMessage),
+    /// Stop the client's audio capture by closing the open AUDIO_INPUT
+    /// channel, then offer a fresh one from the factory so a later Open needs
+    /// no reconnect. MS-RDPEAI has no stop PDU; closing the channel is how a
+    /// server releases the client's microphone. Ignored when no AUDIO_INPUT
+    /// channel is open.
+    RdpeaiRecycle,
     Echo(EchoServerMessage),
     SetCredentials(Credentials),
     /// Replace or clear the Server Auto-Reconnect Cookie.
@@ -1217,6 +1252,7 @@ impl fmt::Debug for ServerEvent {
             Self::Rdpsnd(..) => f.write_str("Rdpsnd(..)"),
             Self::Rdpdr(..) => f.write_str("Rdpdr(..)"),
             Self::Rdpeai(..) => f.write_str("Rdpeai(..)"),
+            Self::RdpeaiRecycle => f.write_str("RdpeaiRecycle"),
             Self::Echo(..) => f.write_str("Echo(..)"),
             Self::SetCredentials(..) => f.write_str("SetCredentials(..)"),
             Self::SetAutoReconnectCookie(Some(..)) => f.write_str("SetAutoReconnectCookie(Some(..))"),
@@ -1558,6 +1594,13 @@ struct ConnectionState {
     /// eligible for the hourly update when cookies are on request (see
     /// [`RdpServer::set_auto_reconnect_on_request`]).
     auto_reconnect_issued: bool,
+    /// The AUDIO_INPUT channel that replaced the pre-registered one after
+    /// [`ServerEvent::RdpeaiRecycle`]. DRDYNVC forgets a closed channel's
+    /// type, so the replacement is reachable only through this id.
+    rdpeai_channel: Option<u32>,
+    /// AUDIO_INPUT channels closed by a recycle whose late capture data is
+    /// still arriving; dropped instead of failing DRDYNVC.
+    rdpeai_closed: rdpeai_recycle::ClosedChannels,
 }
 
 impl ConnectionState {
@@ -2440,7 +2483,7 @@ impl RdpServer {
         self.gfx_handle.as_ref()
     }
 
-    fn attach_channels(&mut self, acceptor: &mut Acceptor, monitor_count: u32) {
+    async fn attach_channels(&mut self, acceptor: &mut Acceptor) {
         if let Some(cliprdr_factory) = self.cliprdr_factory.as_deref() {
             let backend = cliprdr_factory.build_cliprdr_backend();
 
@@ -2461,13 +2504,28 @@ impl RdpServer {
             acceptor.attach_static_channel(RdpdrServer::new(backend));
         }
 
-        let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display), monitor_count);
-        let dvc = dvc::DrdynvcServer::new()
-            .with_dynamic_channel(AInputHandler {
-                handler: Arc::clone(&self.handler),
-                active: Arc::clone(&self.advanced_input_active),
-            })
-            .with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)));
+        let dvc = dvc::DrdynvcServer::new().with_dynamic_channel(AInputHandler {
+            handler: Arc::clone(&self.handler),
+            active: Arc::clone(&self.advanced_input_active),
+        });
+
+        // `monitor_count` is only asked when the channel is offered, since its
+        // contract is tied to the channel opening. Both queries share one guard,
+        // so no other task can interleave between them.
+        let display_control_monitors = {
+            let mut display = self.display.lock().await;
+            if display.offers_display_control().await {
+                Some(display.monitor_count().await)
+            } else {
+                None
+            }
+        };
+        let dvc = if let Some(monitor_count) = display_control_monitors {
+            let dcs_backend = DisplayControlBackend::new(Arc::clone(&self.display), monitor_count);
+            dvc.with_dynamic_channel(DisplayControlServer::new(Box::new(dcs_backend)))
+        } else {
+            dvc
+        };
 
         let dvc = {
             let echo_handle = self.echo_handle.clone();
@@ -2491,14 +2549,9 @@ impl RdpServer {
         let dvc = {
             let mut dvc = dvc;
             if let Some(gfx_factory) = self.gfx_factory.as_deref() {
-                if let Some((bridge, handle)) = gfx_factory.build_server_with_handle() {
-                    self.gfx_handle = Some(handle);
-                    dvc = dvc.with_dynamic_channel(bridge);
-                } else {
-                    let handler = gfx_factory.build_gfx_handler();
-                    let gfx_server = ironrdp_egfx::server::GraphicsPipelineServer::new(handler);
-                    dvc = dvc.with_dynamic_channel(gfx_server);
-                }
+                let (processor, handle) = crate::gfx::build_server_and_handle(gfx_factory);
+                self.gfx_handle = Some(handle);
+                dvc = dvc.with_dynamic_channel(processor);
             }
             dvc
         };
@@ -2619,8 +2672,7 @@ impl RdpServer {
         // `accept_finalize`, which is where the acceptor first consumes the
         // static channel set (the MCS Connect Initial); `accept_begin`, already
         // done, stops at the security-upgrade gate before that.
-        let monitor_count = self.display.lock().await.monitor_count().await;
-        self.attach_channels(&mut candidate.acceptor, monitor_count);
+        self.attach_channels(&mut candidate.acceptor).await;
 
         self.finalize_negotiated(*candidate).await
     }
@@ -2767,7 +2819,6 @@ impl RdpServer {
         self.discard_stale_session_events().await;
 
         let size = self.display.lock().await.size().await;
-        let monitor_count = self.display.lock().await.monitor_count().await;
         let capabilities = capabilities::capabilities(&self.opts, size);
         let mut pending = PendingConnection::new(
             self.opts.security.clone(),
@@ -2783,7 +2834,7 @@ impl RdpServer {
             },
         );
 
-        self.attach_channels(pending.acceptor_mut(), monitor_count);
+        self.attach_channels(pending.acceptor_mut()).await;
 
         let Some(negotiated) = pending.negotiate_and_authenticate(stream, tls).await? else {
             return Ok(());
@@ -3647,11 +3698,12 @@ impl RdpServer {
                         .map_err(|e| ServerError::io("write_all", e))?;
                 }
                 ServerEvent::Rdpeai(msg) => {
+                    let tracked = conn.rdpeai_channel;
                     let Some(drdynvc) = conn.get_svc_processor::<dvc::DrdynvcServer>() else {
                         warn!("No drdynvc channel, dropping AUDIO_INPUT event");
                         continue;
                     };
-                    let Some(channel_id) = drdynvc.get_channel_id_by_type::<RdpeaiServer>() else {
+                    let Some(channel_id) = rdpeai_recycle::current_channel(drdynvc, tracked) else {
                         warn!("No AUDIO_INPUT dynamic channel, dropping event");
                         continue;
                     };
@@ -3696,6 +3748,44 @@ impl RdpServer {
                         .get_channel_id_by_type::<dvc::DrdynvcServer>()
                         .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
                     let data = server_encode_svc_messages(dvc_messages, drdynvc_channel_id, user_channel_id)
+                        .map_err(ServerError::encode)?;
+                    writer
+                        .write_all(&data)
+                        .await
+                        .map_err(|e| ServerError::io("write_all", e))?;
+                }
+                ServerEvent::RdpeaiRecycle => {
+                    // Like every AUDIO_INPUT event, a recycle that cannot apply is
+                    // dropped; only a failed write ends the connection.
+                    let Some(factory) = self.rdpeai_factory.as_deref() else {
+                        debug!("No AUDIO_INPUT factory, dropping recycle");
+                        continue;
+                    };
+                    let tracked = conn.rdpeai_channel;
+                    let Some(drdynvc) = conn.get_svc_processor::<dvc::DrdynvcServer>() else {
+                        debug!("No drdynvc channel, dropping AUDIO_INPUT recycle");
+                        continue;
+                    };
+                    let Some((recycled, created)) =
+                        rdpeai_recycle::recycle(drdynvc, tracked, || factory.build_backend())
+                    else {
+                        debug!("No open AUDIO_INPUT channel to recycle");
+                        continue;
+                    };
+                    if let Err(error) = created {
+                        warn!(%error, "AUDIO_INPUT channel closed but not re-created");
+                    }
+                    debug!(
+                        closed = recycled.closed,
+                        replacement = ?recycled.channel_id,
+                        "Recycled the AUDIO_INPUT channel"
+                    );
+                    conn.rdpeai_channel = recycled.channel_id;
+                    conn.rdpeai_closed.insert(recycled.closed);
+                    let drdynvc_channel_id = conn
+                        .get_channel_id_by_type::<dvc::DrdynvcServer>()
+                        .ok_or_else(|| ServerError::channel("DRDYNVC channel not found"))?;
+                    let data = server_encode_svc_messages(recycled.messages, drdynvc_channel_id, user_channel_id)
                         .map_err(ServerError::encode)?;
                     writer
                         .write_all(&data)
@@ -4729,6 +4819,13 @@ impl RdpServer {
             .await?;
         }
 
+        #[cfg(feature = "egfx")]
+        if let Some(gfx_handle) = self.gfx_handle.as_ref() {
+            let mut server = gfx_handle
+                .lock()
+                .map_err(|_| ServerError::reason("graphics server", "GfxServerHandle mutex poisoned"))?;
+            server.set_client_frame_ack_limit(client_core_frame_ack_limit(&result.capabilities));
+        }
         conn.static_channels = result.static_channels;
         conn.client_supports_heartbeat = result
             .client_early_capability_flags
@@ -4868,7 +4965,10 @@ impl RdpServer {
             else if large_pointer_flags.contains(LargePointerSupportFlags::UP_TO_384X384_PIXELS) { 384 }
             else if large_pointer_flags.contains(LargePointerSupportFlags::UP_TO_96X96_PIXELS) { 96 }
             else { 32 };
-        self.display.lock().await.pointer_capabilities(pointer_max_size);
+        self.display
+            .lock()
+            .await
+            .pointer_cache_capabilities(pointer_max_size, pointer_cache_size);
         let desktop_size = self.display.lock().await.size().await;
         let encoder = UpdateEncoder::new(
             desktop_size,
@@ -5197,14 +5297,40 @@ impl RdpServer {
                     return Ok(false);
                 }
 
+                // An oversize but well-formed clipboard message is skipped
+                // without buffering it; a dropped Format Data Response is
+                // replaced by a failed one so its request is still answered.
+                let mut clipboard_substitute = None;
                 if conn.get_channel_id_by_type::<CliprdrServer>() == Some(data.channel_id) {
-                    conn.clipboard_chunks
+                    match conn
+                        .clipboard_chunks
                         .accept(&data.user_data)
-                        .map_err(ServerError::channel)?;
+                        .map_err(ServerError::channel)?
+                    {
+                        clipboard_guard::ChunkVerdict::Accept => {}
+                        clipboard_guard::ChunkVerdict::Discard => return Ok(false),
+                        clipboard_guard::ChunkVerdict::Dropped { declared, substitute } => {
+                            warn!(declared, "Dropped an oversize clipboard message");
+                            match substitute {
+                                Some(substitute) => clipboard_substitute = Some(substitute),
+                                None => return Ok(false),
+                            }
+                        }
+                    }
+                }
+                let user_data = clipboard_substitute.as_deref().unwrap_or(&*data.user_data);
+                // Capture data the client sent before it processed a recycle's
+                // Close names a channel DRDYNVC no longer knows.
+                if !conn.rdpeai_closed.is_empty()
+                    && conn.get_channel_id_by_type::<dvc::DrdynvcServer>() == Some(data.channel_id)
+                    && conn.rdpeai_closed.drop_late_data(user_data)
+                {
+                    trace!("Dropped late data for a closed AUDIO_INPUT channel");
+                    return Ok(false);
                 }
                 if let Some(svc) = conn.static_channels.get_by_channel_id_mut(data.channel_id) {
                     let response_pdus = svc
-                        .process(&data.user_data)
+                        .process(user_data)
                         .map_err_kind("svc process", ServerErrorKind::Pdu)?;
                     if conn.get_channel_id_by_type::<dvc::DrdynvcServer>() == Some(data.channel_id) {
                         self.write_drdynvc_output(
@@ -6537,6 +6663,32 @@ mod cliprdr_error_tests {
             "the session must keep running after a refused clipboard message, got {state:?}"
         );
         assert!(writer.0.is_empty(), "a refused message has nothing to put on the wire");
+    }
+}
+
+#[cfg(all(test, feature = "egfx"))]
+mod frame_ack_limit_tests {
+    use super::*;
+    use ironrdp_pdu::rdp::capability_sets::FrameAcknowledge;
+    #[test]
+    fn absent_and_zero_core_limit_are_unconstrained() {
+        assert_eq!(client_core_frame_ack_limit(&[]), None);
+        assert_eq!(
+            client_core_frame_ack_limit(&[CapabilitySet::FrameAcknowledge(FrameAcknowledge {
+                max_unacknowledged_frame_count: 0
+            })]),
+            None
+        );
+    }
+    #[test]
+    fn nonzero_core_limit_is_preserved() {
+        assert_eq!(
+            client_core_frame_ack_limit(&[CapabilitySet::FrameAcknowledge(FrameAcknowledge {
+                max_unacknowledged_frame_count: 1
+            })])
+            .map(NonZeroU32::get),
+            Some(1)
+        );
     }
 }
 

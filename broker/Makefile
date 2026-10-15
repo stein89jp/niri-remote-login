@@ -10,14 +10,17 @@ niri-rdp-broker: broker.c
 broker-tests: tests.c broker.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) $(WARNINGS) -Wno-unused-function tests.c $(LDFLAGS) $(LDLIBS) -o $@
 check: broker-tests
+	rm -rf broker-test-root
 	./broker-tests
 clean:
 	rm -f niri-rdp-broker broker-tests
+	rm -rf broker-test-root
 install: niri-rdp-broker
 	@case "$(DESTDIR)" in /*) ;; *) printf '%s\n' 'Set an absolute staging DESTDIR; direct host installation is disabled.' >&2; exit 1 ;; esac
 	install -Dm755 niri-rdp-broker "$(DESTDIR)/usr/lib/niri-rdp/niri-rdp-broker"
 	install -Dm755 config/session-worker "$(DESTDIR)/usr/lib/niri-rdp/session-worker"
 	install -Dm755 config/session-audio "$(DESTDIR)/usr/lib/niri-rdp/session-audio"
+	install -Dm755 config/session-microphone "$(DESTDIR)/usr/lib/niri-rdp/session-microphone"
 	install -Dm755 config/session-desktop "$(DESTDIR)/usr/lib/niri-rdp/session-desktop"
 	install -Dm755 config/session-portals "$(DESTDIR)/usr/lib/niri-rdp/session-portals"
 	install -Dm755 config/session-environment "$(DESTDIR)/usr/lib/niri-rdp/session-environment"
@@ -28,5 +31,6 @@ install: niri-rdp-broker
 	install -Dm644 config/headless.kdl "$(DESTDIR)/etc/niri-rdp/headless.kdl"
 	install -Dm644 config/waybar.json "$(DESTDIR)/etc/niri-rdp/waybar.json"
 	install -Dm644 config/renderer.conf "$(DESTDIR)/etc/niri-rdp/renderer.conf"
+	install -Dm644 config/broker.conf "$(DESTDIR)/etc/niri-rdp/broker.conf"
 	install -Dm644 config/niri-rdp-broker.service "$(DESTDIR)/usr/lib/systemd/system/niri-rdp-broker.service"
 .PHONY: all check clean install

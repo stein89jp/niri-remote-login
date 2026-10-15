@@ -36,18 +36,38 @@ If another package owns either file, resolve that package's ownership before
 removing the file.
 
 Pacman preserves changed configuration as `.pacsave`; inspect it before removal.
-TLS identity files in `/etc/niri-rdp/tls` are generated on first start (or provided manually) and are not
-package-owned. Remove those files and the remaining project configuration only
-after deciding to discard the experiment. Keep backups if rollback is intended.
+This includes `/etc/niri-rdp/broker.conf` (left as
+`/etc/niri-rdp/broker.conf.pacsave` if you changed the grace period) and the
+other `/etc/niri-rdp` files. Remove the broker settings when discarding the
+experiment:
+
+```sh
+sudo rm -f -- /etc/niri-rdp/broker.conf /etc/niri-rdp/broker.conf.pacsave
+```
+
+If you copied the fail2ban example, `/etc/fail2ban/filter.d/niri-rdp.conf` and
+`/etc/fail2ban/jail.d/niri-rdp.local` are not package-owned. Remove both and run
+`sudo fail2ban-client reload` (or disable fail2ban if nothing else uses it).
+
+TLS identity files in `/etc/niri-rdp/tls`, including the `generated` marker that
+records a self-signed certificate for renewal, are generated on first start (or
+provided manually) and are not package-owned. Remove those files and the
+remaining project configuration only after deciding to discard the experiment. Keep backups if rollback is intended.
 If you enabled NVIDIA encoding, its copied drop-in
 `/etc/systemd/system/niri-rdp-frontend.service.d/nvidia.conf` is also not
 package-owned. Remove that file when discarding the experiment, then run
-`sudo systemctl daemon-reload` again.
+`sudo systemctl daemon-reload` again. If you keep it for a reinstall, copy the
+new package's drop-in over it afterwards as described in
+[install](install.md#optional-nvidia-encoding); older copies lack the device
+allow-list that NVENC now needs.
 The NVIDIA device-preparation helper is package-owned and is removed by pacman.
 If you installed the earlier manual workaround, also remove its
 local `/etc/systemd/system/niri-rdp-nvidia-devices.service` and
 `/etc/systemd/system/niri-rdp-frontend.service.d/nvidia-devices.conf`; pacman
 does not own those local files.
+The private PAM failure tally can optionally be removed with
+`sudo rm -rf /run/faillock-niri-rdp`. It is a tmpfs directory and is also
+cleared at reboot.
 The service user and `niri-rdp-users` group also remain; remove them only if they
 are unused. The dedicated human test account/home remains your choice; package
 removal never deletes user data or accounts.

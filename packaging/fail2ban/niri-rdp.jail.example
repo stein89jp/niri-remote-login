@@ -1,0 +1,23 @@
+# fail2ban jail for Niri-RDP. Example only: the package does not enable it.
+#
+# To use it, install fail2ban, copy niri-rdp.conf to
+# /etc/fail2ban/filter.d/niri-rdp.conf, copy this file to
+# /etc/fail2ban/jail.d/niri-rdp.local, uncomment the jail and set port to the
+# port of NIRI_RDP_LISTEN in /etc/niri-rdp/frontend.conf. Then run
+# "systemctl enable --now fail2ban" and check "fail2ban-client status niri-rdp".
+#
+# The frontend already delays repeated failures per client address and
+# pam_faillock locks an account after repeated failures; a ban additionally
+# drops the address at the firewall. Add your own client networks to
+# ignoreip so a mistyped password cannot lock you out of a remote-only host.
+
+#[niri-rdp]
+#enabled  = true
+#backend  = systemd
+#filter   = niri-rdp
+#port     = 33991
+#protocol = tcp
+#maxretry = 5
+#findtime = 10m
+#bantime  = 1h
+#ignoreip = 127.0.0.1/8 ::1

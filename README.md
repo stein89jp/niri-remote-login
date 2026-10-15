@@ -58,9 +58,10 @@ log out of its local graphical session before connecting remotely.** The broker
 rejects simultaneous local graphical sessions for the same account.
 
 The package creates the service account and authorization group through Arch's
-systemd hooks. The broker generates a self-signed certificate on first start,
-checks existing certificates, and preserves them across restarts. Verify its
-identity from the client; see the [installation guide](docs/install.md).
+systemd hooks. The broker generates a self-signed certificate on first start and
+renews it automatically shortly before it expires, which changes its fingerprint.
+Certificates you provide are checked and never replaced. Verify the identity from
+the client; see the [installation guide](docs/install.md#connect-with-windows-remote-desktop).
 Allow TCP 33991 in your existing firewall if necessary. The listener address and
 port are configurable in `/etc/niri-rdp/frontend.conf`.
 
@@ -68,9 +69,13 @@ Stock `/usr/bin/niri` stays alongside the patched
 `/usr/lib/niri-rdp/niri-headless`. The remote session has its own display and uses your Niri
 configuration. A dropped connection preserves the desktop and applications;
 reconnect with the same Linux account within 45 seconds of broker-observed
-disconnection to resume after fresh authentication. After that grace window,
-the broker logs out the desktop; the next login starts a fresh one.
-Logout, compositor exit, or broker shutdown ends the desktop. Client-selected resolution and
+disconnection to resume after fresh authentication. After that grace window
+(`grace_seconds` in `/etc/niri-rdp/broker.conf`), the broker logs out the
+desktop; the next login starts a fresh one.
+Logout, compositor exit, or broker shutdown ends the desktop. Remote desktops
+share `/tmp` with the account's other logins. The broker records logins,
+rejections and logouts with the client address in the journal; an optional
+fail2ban example is included but not enabled. Client-selected resolution and
 single-display live resizing are supported. Bitmap transport is the default;
 optional host NVIDIA NVENC H.264 encoding is available, with a 60 fps capture
 budget, reusable capture buffers and unchanged-frame suppression. The compositor
@@ -80,7 +85,19 @@ Version 1.5 adds bidirectional Unicode text clipboard, client-local cursor motio
 damage-aware capture and explicit remote DPI scaling. Optional GPU-resident
 capture/conversion/encoding and AVC444 improve performance and colored-text
 quality; see [performance controls](docs/performance.md). The accepted 48 kHz
-stereo PCM audio configuration is preserved.
+stereo PCM audio configuration is preserved; private audio-helper recovery and
+silent-loss detection improve its resilience.
+
+The clipboard carries Unicode text, HTML and images in both directions. Files are
+not supported: copying files in Windows leaves the Linux clipboard unchanged.
+
+Microphone redirection: with **Record from this computer** enabled in mstsc, the
+Windows microphone appears in the remote desktop as the default source
+**Remote microphone (RDP)** (48 kHz mono, about 0.8 Mbit/s upload). Windows
+records only while a remote application listens. `NIRI_RDP_MICROPHONE=off`
+disables it; see [remote microphone](docs/install.md#remote-microphone). The
+microphone path is separate from playback, and the accepted PCM playback
+configuration is unchanged.
 
 The remote desktop uses your existing Niri configuration, including its bindings,
 appearance and startup applications. It starts DankMaterialShell privately when
@@ -118,11 +135,28 @@ checkout. Export a portable source package with `makepkg --allsource` from the
 build folder. Dependency fetching happens during preparation; compilation and
 Rust package checks use pinned lockfiles offline. Never run makepkg as root.
 
+`make check` runs the Python, broker and bridge tests offline, after
+`make lint` (`cargo fmt --check` and Clippy with `-D warnings` for the bridge).
+The historical `poc/` transport prototype is no longer part of `make check`, and
+nothing it builds is packaged; run it separately with `make check-poc` (and then
+`make check-transport` for its opt-in FreeRDP interop test).
+Cargo dependencies are looked up in `bridge/.cargo-cache` (and `poc/.cargo-cache`
+for `check-poc`) first. If those are missing or empty, `$CARGO_HOME`, then the
+makepkg cache under `packaging/arch/niri-rdp/src/cargo-home`, then `~/.cargo`
+are used. To fill the project-local caches over the network, run `make fetch`
+once. You can still name a cache directly with `BRIDGE_CARGO_HOME=` or
+`POC_CARGO_HOME=`. GitHub Actions runs `make fetch` and `make check` in an Arch
+Linux container (`.github/workflows/check.yml`); lab, namespace and GPU
+integrations are not run there.
+
 The separate-package source export is still available:
 
 ```sh
 python3 scripts/prepare-release.py
 ```
+
+It bundles the packaged sources, tests, `prototype/`, `lab/` and checkpoints;
+the historical `poc/` prototype and the local `research/` copies are left out.
 
 Publish binary packages, matching source bundles, and checksums through GitHub
 Releases, together with dependency-source information and license notices; see
@@ -130,7 +164,10 @@ Releases, together with dependency-source information and license notices; see
 Local release downloads, build caches, package staging trees, and raw
 validation evidence are ignored. Historical checkpoints record earlier source
 inventories and test results; the obsolete 0.1.0 binary delivery is retained in
-Git history.
+Git history, and the 0.1.0-era validation record is in
+[docs/archive](docs/archive/validation-0.1.md). The
+[release history](docs/upgrade.md#release-history) maps the "release N" names in
+older notes to package versions.
 
 Run Python tests with:
 
@@ -155,12 +192,3 @@ binaries linked to Arch's GPL-enabled FFmpeg require GPL-compliant distribution.
 License texts, third-party notices, matching source bundles, and dependency-source
 links are available with the [release downloads](https://github.com/stein89jp/niri-remote-login/releases).
 See [docs/licensing.md](docs/licensing.md) for component scope and source access.
-
-The performance upgrade adds damage-aware bitmap updates, responsive bounded
-input/resize handling, cached login pixels, ACK baseline recovery, separate cursor
-updates, private text clipboard and client/explicit DPI scaling. Optional AVC444,
-GPU capture and measured quality profiles are described in
-[performance controls](docs/performance.md). The accepted PCM audio combination
-is preserved; private helper recovery and silent-loss detection improve resilience.
-Actual Windows acceptance remains a post-install check in
-[acceptance](docs/acceptance.md).

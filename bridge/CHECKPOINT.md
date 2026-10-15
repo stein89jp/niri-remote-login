@@ -3,7 +3,7 @@
 ## Decisions and exact dependencies
 
 - RDP is entirely upstream IronRDP, git revision
-  `bf019ca502d1e52616853a5ded68c885cec1e322`. crates.io `ironrdp-server=0.13.0`
+  `7b976a6965c96c76ff949313e174ea55dada8c44`. crates.io `ironrdp-server=0.13.0`
   was rejected for this implementation because it lacks the credential validator
   and authenticated desktop binder hooks needed by the PAM/session broker.
 - Minimum Rust 1.94. Actual compile/test: Arch Rust

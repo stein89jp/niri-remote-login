@@ -143,6 +143,28 @@ class AudioStartupTests(unittest.TestCase):
         self.assertEqual(run.call_count, 3)
         self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.25, 0.5])
 
+    def supervise_with_fake_clock(self, run_seconds):
+        clock = [1000.0]
+        durations = iter(run_seconds)
+
+        def run(*_):
+            clock[0] += next(durations)
+            raise RuntimeError("failed")
+        with patch.object(self.module, "run_graph", side_effect=run) as run_graph, \
+                patch.object(self.module.time, "monotonic", side_effect=lambda: clock[0]), \
+                patch.object(self.module.time, "sleep") as sleep:
+            with self.assertRaisesRegex(RuntimeError, "failed"):
+                self.module.supervise_graph(Path("/private"), {})
+        return run_graph.call_count, [call.args[0] for call in sleep.call_args_list]
+
+    def test_graph_attempts_reset_after_ten_healthy_minutes_and_stay_finite(self):
+        # A crash after ten healthy minutes renews the budget; the next rapid
+        # failures exhaust it again rather than retrying forever.
+        self.assertEqual(self.supervise_with_fake_clock([1, 600, 1, 1]), (4, [0.25, 0.25, 0.5]))
+
+    def test_graph_attempts_do_not_reset_before_ten_healthy_minutes(self):
+        self.assertEqual(self.supervise_with_fake_clock([1, 599.9, 1]), (3, [0.25, 0.5]))
+
     def test_capture_rejects_older_unframed_readiness_without_starting_monitor(self):
         client, capture = socket.socketpair()
         client.sendall(b"A")
@@ -154,42 +176,66 @@ class AudioStartupTests(unittest.TestCase):
 
 
 class SessionWorkerRecoveryTests(unittest.TestCase):
+    def run_worker(self, directory, healthy_run_attempt=None, desktop_seconds=4.5, replacements=()):
+        root = Path(directory)
+        binaries = root / "bin"
+        binaries.mkdir()
+        worker = (ROOT / "broker/config/session-worker").read_text().replace(
+            "/usr/lib/niri-rdp", str(binaries)).replace(
+            "/etc/niri-rdp/renderer.conf", str(root / "renderer.conf"))
+        for old, new in replacements:
+            self.assertIn(old, worker)
+            worker = worker.replace(old, new)
+        (root / "worker").write_text(worker)
+        # This private helper fixture fails before readiness, except that the
+        # selected attempt first runs for three seconds.
+        (binaries / "session-audio").write_text("#!/usr/bin/python3\nimport os,time\nfrom pathlib import Path\n"
+            "p=Path(os.environ['NIRI_RDP_RUNTIME_DIR'])/'audio-attempts'\n"
+            "with p.open('a') as f: f.write('attempt\\n')\n"
+            f"if len(p.read_text().splitlines()) == {healthy_run_attempt!r}: time.sleep(3)\n"
+            "raise SystemExit(1)\n")
+        (binaries / "niri-headless").write_text("#!/usr/bin/python3\nimport os,time\nfrom pathlib import Path\n"
+            "p=Path(os.environ['NIRI_RDP_RUNTIME_DIR'])\n(p/'desktop-started').write_text(str(os.getpid()))\n"
+            f"time.sleep({desktop_seconds!r})\n(p/'desktop-finished').touch()\n")
+        for executable in binaries.iterdir():
+            executable.chmod(0o700)
+        environment = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory + "/config",
+                           NIRI_RDP_RUNTIME_DIR=directory)
+        process = subprocess.Popen(["/usr/bin/sh", str(root / "worker"), "--environment-ready"],
+                                   env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   start_new_session=True)
+        try:
+            _, errors = process.communicate(timeout=desktop_seconds + 4.5)
+        finally:
+            if process.poll() is None:
+                os.killpg(process.pid, signal.SIGKILL)
+                process.wait()
+        self.assertEqual(process.returncode, 0, errors.decode())
+        self.assertTrue((root / "desktop-started").exists())
+        self.assertTrue((root / "desktop-finished").exists())
+        return (root / "audio-attempts").read_text().splitlines(), errors
+
     def test_audio_startup_failure_does_not_end_desktop_and_restarts_are_bounded(self):
         with tempfile.TemporaryDirectory(prefix="niri-audio-worker-") as directory:
-            root = Path(directory)
-            binaries = root / "bin"
-            binaries.mkdir()
-            worker = (ROOT / "broker/config/session-worker").read_text().replace(
-                "/usr/lib/niri-rdp", str(binaries)).replace(
-                "/etc/niri-rdp/renderer.conf", str(root / "renderer.conf"))
-            (root / "worker").write_text(worker)
-            # This private helper fixture always fails before readiness. The
-            # shell must still run its desktop and exhaust exactly two retries.
-            (binaries / "session-audio").write_text("#!/usr/bin/python3\nimport os\nfrom pathlib import Path\n"
-                "p=Path(os.environ['NIRI_RDP_RUNTIME_DIR'])/'audio-attempts'\n"
-                "with p.open('a') as f: f.write('attempt\\n')\nraise SystemExit(1)\n")
-            (binaries / "niri-headless").write_text("#!/usr/bin/python3\nimport os,time\nfrom pathlib import Path\n"
-                "p=Path(os.environ['NIRI_RDP_RUNTIME_DIR'])\n(p/'desktop-started').write_text(str(os.getpid()))\n"
-                "time.sleep(4.5)\n(p/'desktop-finished').touch()\n")
-            for executable in binaries.iterdir():
-                executable.chmod(0o700)
-            environment = dict(os.environ, HOME=directory, XDG_CONFIG_HOME=directory + "/config",
-                               NIRI_RDP_RUNTIME_DIR=directory)
-            process = subprocess.Popen(["/usr/bin/sh", str(root / "worker"), "--environment-ready"],
-                                       env=environment, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                       start_new_session=True)
-            try:
-                _, errors = process.communicate(timeout=9)
-                self.assertEqual(process.returncode, 0, errors.decode())
-                self.assertTrue((root / "desktop-started").exists())
-                self.assertTrue((root / "desktop-finished").exists())
-                self.assertEqual((root / "audio-attempts").read_text().splitlines(), ["attempt"] * 3)
-                self.assertIn(b"starting desktop without audio", errors)
-                self.assertIn(b"restart 2 of 2", errors)
-            finally:
-                if process.poll() is None:
-                    os.killpg(process.pid, signal.SIGKILL)
-                    process.wait()
+            # The shell must still run its desktop and exhaust exactly two retries.
+            attempts, errors = self.run_worker(directory)
+            self.assertEqual(attempts, ["attempt"] * 3)
+            self.assertIn(b"starting desktop without audio", errors)
+            self.assertIn(b"restart 2 of 2", errors)
+
+    def test_healthy_helper_run_renews_restart_budget_and_rapid_failures_stay_bounded(self):
+        with tempfile.TemporaryDirectory(prefix="niri-audio-worker-") as directory:
+            # Two rapid failures exhaust the budget; the third helper then runs
+            # longer than the (shortened) healthy period, earning two more
+            # restarts. Rapid failures afterwards end supervision again, and
+            # time spent dead afterwards never renews it.
+            attempts, errors = self.run_worker(
+                directory, healthy_run_attempt=3, desktop_seconds=8.5,
+                replacements=(("audio_healthy_seconds=600", "audio_healthy_seconds=2"),
+                              ('sleep "$audio_restarts"', "sleep 0.1")))
+            self.assertEqual(attempts, ["attempt"] * 5)
+            self.assertEqual(errors.count(b"restart 1 of 2"), 2, errors.decode())
+            self.assertEqual(errors.count(b"restart 2 of 2"), 2, errors.decode())
 
 
 class CaptureBackpressureTests(unittest.TestCase):

@@ -38,31 +38,31 @@ rand = "0.9"
 tokio = { version = "1", features = ["net", "macros", "sync", "rt", "time"] }
 tokio-rustls = "0.26" # public
 async-trait = "0.1"
-ironrdp-async = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.10" }
-ironrdp-ainput = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.8" }
-ironrdp-connector = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.10" } # public
-ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.2" }
-ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.3", optional = true }
-ironrdp-error = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.2", features = ["std"] } # public
-ironrdp-nscodec = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.2", optional = true, features = ["encoder"] }
-ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.9" } # public
-ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.8" } # public
-ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.7" } # public
-ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.8" } # public
-ironrdp-echo = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.4" } # public
-ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.8" } # public
-ironrdp-tokio = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.10", features = ["reqwest"] }
-ironrdp-acceptor = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.10" } # public
-ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.9" } # public
-ironrdp-rdpdr = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.7" } # public
-ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.9" } # public
-ironrdp-rdpei = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.1" } # public
-ironrdp-rdpeai = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.1" } # public
-ironrdp-rdpeusb = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.1", optional = true }
-ironrdp-usb = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.1", optional = true }
-ironrdp-rdpemt = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.1" } # public
-ironrdp-rdpeudp = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.1" } # public
-ironrdp-rdpeudp-tokio = { git = "https://github.com/Devolutions/IronRDP", rev = "bf019ca502d1e52616853a5ded68c885cec1e322", version = "0.1" } # public
+ironrdp-async = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.10" }
+ironrdp-ainput = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.8" }
+ironrdp-connector = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.10" } # public
+ironrdp-core = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.2" }
+ironrdp-egfx = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.3", optional = true }
+ironrdp-error = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.2", features = ["std"] } # public
+ironrdp-nscodec = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.2", optional = true, features = ["encoder"] }
+ironrdp-pdu = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.9" } # public
+ironrdp-svc = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.8" } # public
+ironrdp-cliprdr = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.7" } # public
+ironrdp-displaycontrol = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.8" } # public
+ironrdp-echo = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.4" } # public
+ironrdp-dvc = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.8" } # public
+ironrdp-tokio = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.10", features = ["reqwest"] }
+ironrdp-acceptor = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.10" } # public
+ironrdp-graphics = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.9" } # public
+ironrdp-rdpdr = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.7" } # public
+ironrdp-rdpsnd = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.9" } # public
+ironrdp-rdpei = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.1" } # public
+ironrdp-rdpeai = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.1" } # public
+ironrdp-rdpeusb = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.1", optional = true }
+ironrdp-usb = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.1", optional = true }
+ironrdp-rdpemt = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.1" } # public
+ironrdp-rdpeudp = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.1" } # public
+ironrdp-rdpeudp-tokio = { git = "https://github.com/Devolutions/IronRDP", rev = "7b976a6965c96c76ff949313e174ea55dada8c44", version = "0.1" } # public
 tracing = { version = "0.1", features = ["log"] }
 x509-cert = { version = "0.3", optional = true }
 rustls-pemfile = { version = "2.2", optional = true }

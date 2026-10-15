@@ -20,9 +20,12 @@ RuntimeDirectoryMode=0755
 RuntimeDirectoryPreserve=yes
 KillMode=control-group
 TimeoutStopSec=30
+# The broker drops both for itself; desktops get the PAM session's umask
+# (or 022) and a core limit of 0/unlimited before switching to the user.
 LimitCORE=0
 UMask=0077
-PrivateTmp=yes
+# No PrivateTmp: desktops inherit this mount namespace and, like sshd and
+# GDM sessions, must share /tmp with the user's other logins.
 # Session children inherit mount namespaces. Keep their homes writable.
 # A stricter broker mount namespace requires a separate worker launch service.
 # PAM opens a logind scope and performs credential switching: do not add

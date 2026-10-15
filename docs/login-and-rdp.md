@@ -34,7 +34,7 @@ Sources: [FreeRDP project](https://github.com/FreeRDP/FreeRDP), [peer API](https
 
 ### Pinned IronRDP findings
 
-Local inspected source: `research/upstream/IronRDP`, revision `bf019ca502d1e52616853a5ded68c885cec1e322`; these are selected downloaded files, not a full buildable checkout. `ironrdp-server` manifest identifies version 0.13.0 and Rust minimum 1.94. Do not assume crates.io releases have every API in this revision.
+Inspected source: selected files from IronRDP revision `bf019ca502d1e52616853a5ded68c885cec1e322`, listed with URLs and SHA-256 digests in `research/upstream/manifest.json` (the copies themselves are local research files, not tracked); not a full buildable checkout. The bridge now pins IronRDP `7b976a6965c96c76ff949313e174ea55dada8c44`, with the modified server under `bridge/vendor/`. `ironrdp-server` manifest identifies version 0.13.0 and Rust minimum 1.94. Do not assume crates.io releases have every API in this revision.
 
 - `RdpServerInputHandler` receives scancode/Unicode keyboard and absolute/relative mouse events; the adapter still must map these into the selected compositor input mechanism.
 - `CredentialValidator::validate_received` distinguishes Client Info credentials from CredSSP-delegated credentials. Rejection/backend errors reject setup.

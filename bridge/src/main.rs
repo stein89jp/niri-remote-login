@@ -3,7 +3,16 @@ use ironrdp_server::{
     DesktopSize, KeyboardEvent, MouseEvent, PostConnectionAction, RdpServer, RdpServerDisplay,
     RdpServerDisplayUpdates, RdpServerInputHandler, ServerError, ServerResult, TlsIdentityCtx,
 };
-use niri_rdp_bridge::{broker::Broker, listen_addr, server_error, video::Video, wayland::Desktop};
+use niri_rdp_bridge::{
+    MicrophoneMode,
+    broker::Broker,
+    listen_addr,
+    microphone::Microphone,
+    performance::{ConnectionStats, connection as connection_stats},
+    server_error,
+    video::Video,
+    wayland::Desktop,
+};
 use std::{
     net::SocketAddr,
     os::unix::net::UnixStream,
@@ -79,10 +88,23 @@ struct Lifecycle {
     broker: Option<Arc<Broker>>,
     loopback_only: bool,
     clipboard: niri_rdp_bridge::clipboard::Clipboard,
+    video: Option<Video>,
+    stats: &'static ConnectionStats,
+    /// Where the one disconnect summary line goes (stderr, so the journal).
+    emit: fn(&str),
+}
+fn emit_to_journal(line: &str) {
+    eprintln!("{line}");
 }
 impl ConnectionHandler for Lifecycle {
     fn on_accept(&mut self, p: SocketAddr) -> bool {
-        !self.loopback_only || p.ip().is_loopback()
+        let accepted = !self.loopback_only || p.ip().is_loopback();
+        // Connection rejection happens before this hook, so an accepted peer
+        // is the one connection whose credentials are validated next.
+        if accepted && let Some(broker) = &self.broker {
+            broker.begin_connection(Some(p.ip()));
+        }
+        accepted
     }
     fn on_disconnected(
         &mut self,
@@ -98,6 +120,18 @@ impl ConnectionHandler for Lifecycle {
                 error.report()
             );
         }
+        // Exactly one payload-free summary per served connection: the server
+        // calls this hook once after every connection, however it ended.
+        let avc444 = self
+            .video
+            .as_ref()
+            .is_some_and(|video| video.avc444_negotiated());
+        (self.emit)(
+            &self
+                .stats
+                .take()
+                .line(peer, duration, error.is_some(), avc444),
+        );
         if let Some(active) = &self.active
             && let Some(desktop) = active.lock().unwrap().take()
         {
@@ -105,6 +139,7 @@ impl ConnectionHandler for Lifecycle {
         }
         if let Some(b) = &self.broker {
             b.discard();
+            b.begin_connection(None);
         }
         PostConnectionAction::Continue
     }
@@ -138,6 +173,11 @@ async fn main() -> anyhow::Result<()> {
     if let Some(video) = &video {
         audio = audio.with_video(video.clone());
     }
+    // Separate from playback: its own channel, thread, queue and socket.
+    let microphone = match MicrophoneMode::from_env()? {
+        MicrophoneMode::Auto => Some(Microphone::default()),
+        MicrophoneMode::Off => None,
+    };
     let mut server = if mode == "broker" {
         let broker = Arc::new(
             Broker::new(
@@ -146,7 +186,9 @@ async fn main() -> anyhow::Result<()> {
                 video.clone(),
             )
             .with_audio(audio.clone())
-            .with_clipboard(clipboard.clone()),
+            .with_microphone(microphone.clone())
+            .with_clipboard(clipboard.clone())
+            .with_login_limits(niri_rdp_bridge::login::LoginLimits::from_env()?),
         );
         // PAM receives ClientInfo credentials within authenticated server TLS.
         // Arbitrary PAM passwords do not supply a server-side NLA/NTLM secret.
@@ -161,6 +203,11 @@ async fn main() -> anyhow::Result<()> {
             }))
             .with_gfx_factory(video.as_ref().map(|v| Box::new(v.clone()) as _))
             .with_sound_factory(Some(Box::new(audio.factory())))
+            .with_rdpeai_factory(
+                microphone
+                    .as_ref()
+                    .map(|microphone| Box::new(microphone.factory()) as _),
+            )
             .with_cliprdr_factory(Some(Box::new(clipboard.clone())))
             .with_connection_policy(ConnectionPolicy::Reject)
             .with_connection_handler(Some(Box::new(Lifecycle {
@@ -168,6 +215,9 @@ async fn main() -> anyhow::Result<()> {
                 active: None,
                 loopback_only: false,
                 clipboard: clipboard.clone(),
+                video: video.clone(),
+                stats: connection_stats(),
+                emit: emit_to_journal,
             })))
             .build();
         server.set_credential_validator(Some(broker.clone()));
@@ -197,6 +247,9 @@ async fn main() -> anyhow::Result<()> {
                 active: Some(active.clone()),
                 loopback_only: true,
                 clipboard: clipboard.clone(),
+                video: video.clone(),
+                stats: connection_stats(),
+                emit: emit_to_journal,
             })))
             .build();
         server.set_credentials(Some(Credentials {
@@ -242,6 +295,9 @@ mod tests {
             broker: None,
             loopback_only: false,
             clipboard: Default::default(),
+            video: None,
+            stats: Box::leak(Box::default()),
+            emit: |_| {},
         };
         let remote = "192.168.1.50:50000".parse().unwrap();
         assert!(lifecycle.on_accept(remote));
@@ -249,5 +305,126 @@ mod tests {
         assert!(!lifecycle.on_accept(remote));
         assert!(lifecycle.on_accept("127.0.0.1:50000".parse().unwrap()));
         assert!(lifecycle.on_accept("[::1]:50000".parse().unwrap()));
+    }
+
+    #[test]
+    fn lifecycle_hands_the_served_peer_to_the_broker_and_clears_it() {
+        let broker = Arc::new(Broker::new(
+            PathBuf::from("/nonexistent-niri-rdp-test.sock"),
+            "HEADLESS-1".into(),
+            None,
+        ));
+        let mut lifecycle = Lifecycle {
+            active: None,
+            broker: Some(broker.clone()),
+            loopback_only: false,
+            clipboard: Default::default(),
+            video: None,
+            stats: Box::leak(Box::default()),
+            emit: |_| {},
+        };
+        let peer: SocketAddr = "192.168.1.50:50000".parse().unwrap();
+        assert!(lifecycle.on_accept(peer));
+        assert_eq!(broker.current_peer(), Some(peer.ip()));
+        lifecycle.on_disconnected(peer, Duration::from_secs(1), None);
+        assert_eq!(broker.current_peer(), None);
+        lifecycle.loopback_only = true;
+        assert!(!lifecycle.on_accept(peer));
+        assert_eq!(broker.current_peer(), None);
+    }
+
+    thread_local! {
+        static SUMMARIES: std::cell::RefCell<Vec<String>> = const { std::cell::RefCell::new(Vec::new()) };
+    }
+    fn record_summary(line: &str) {
+        SUMMARIES.with(|lines| lines.borrow_mut().push(line.to_owned()));
+    }
+    fn summaries() -> Vec<String> {
+        SUMMARIES.with(|lines| lines.borrow().clone())
+    }
+    fn recording_lifecycle(stats: &'static ConnectionStats) -> Lifecycle {
+        Lifecycle {
+            active: None,
+            broker: None,
+            loopback_only: true,
+            clipboard: Default::default(),
+            video: None,
+            stats,
+            emit: record_summary,
+        }
+    }
+
+    #[test]
+    fn every_disconnect_emits_one_summary_and_resets_its_counters() {
+        use niri_rdp_bridge::performance::Counter;
+        let stats: &'static ConnectionStats = Box::leak(Box::default());
+        let mut lifecycle = recording_lifecycle(stats);
+        let peer: SocketAddr = "127.0.0.1:50000".parse().unwrap();
+        stats.add(Counter::VideoFrames, 3);
+        stats.add(Counter::ClipboardToClient, 2);
+        lifecycle.on_disconnected(peer, Duration::from_secs(2), None);
+        let lines = summaries();
+        assert_eq!(lines.len(), 1);
+        assert!(lines[0].starts_with(
+            "RDP connection summary peer=127.0.0.1:50000 duration_s=2.0 result=ok video_codec=h264"
+        ));
+        assert!(lines[0].contains(" frames=3 ") && lines[0].contains(" clipboard_to_client=2 "));
+        // An abrupt or failed connection still gets exactly one line, and the
+        // previous connection's counters do not leak into it.
+        let error = server_error("connection reset");
+        lifecycle.on_disconnected(peer, Duration::from_millis(300), Some(&error));
+        let lines = summaries();
+        assert_eq!(lines.len(), 2);
+        assert!(lines[1].contains(" result=error video_codec=bitmap "));
+        assert!(lines[1].contains(" frames=0 ") && lines[1].contains(" clipboard_to_client=0 "));
+        assert!(
+            !lines[1].contains("connection reset"),
+            "the summary carries no error text"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn abruptly_dropped_tcp_connections_each_emit_one_summary() {
+        use std::io::Write;
+        let stats: &'static ConnectionStats = Box::leak(Box::default());
+        tokio::task::LocalSet::new()
+            .run_until(async move {
+                let mut server = RdpServer::builder()
+                    .with_addr((std::net::Ipv4Addr::LOCALHOST, 0))
+                    .with_no_security()
+                    .with_no_input()
+                    .with_no_display()
+                    .with_connection_handler(Some(Box::new(recording_lifecycle(stats))))
+                    .build();
+                let events = server.event_sender().clone();
+                let run = tokio::task::spawn_local(async move {
+                    let _ = Box::pin(server.run()).await;
+                });
+                let addr = loop {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    let _ = events.send(ironrdp_server::ServerEvent::GetLocalAddr(tx));
+                    if let Ok(Some(addr)) = rx.await {
+                        break addr;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                };
+                for expected in 1..=2 {
+                    let mut client = std::net::TcpStream::connect(addr).unwrap();
+                    // A truncated X.224 header, then an abrupt close.
+                    client.write_all(&[0x03, 0x00]).unwrap();
+                    drop(client);
+                    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                    while summaries().len() < expected && std::time::Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    assert_eq!(summaries().len(), expected);
+                }
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                let lines = summaries();
+                assert_eq!(lines.len(), 2, "no duplicate summary lines");
+                assert!(lines.iter().all(|line| line.contains(" result=error ")));
+                run.abort();
+            })
+            .await;
     }
 }

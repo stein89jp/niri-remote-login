@@ -18,8 +18,11 @@ if [ -f /etc/niri-rdp/renderer.conf ]; then
     }
 fi
 case "$renderer" in
-    auto|hardware) unset LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER ;;
-    software) export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe ;;
+    auto|hardware) unset LIBGL_ALWAYS_SOFTWARE GALLIUM_DRIVER __EGL_VENDOR_LIBRARY_FILENAMES ;;
+    # glvnd would otherwise let another installed vendor (NVIDIA) serve the
+    # surfaceless platform; restricting EGL to Mesa makes llvmpipe certain.
+    software) export LIBGL_ALWAYS_SOFTWARE=1 GALLIUM_DRIVER=llvmpipe \
+                  __EGL_VENDOR_LIBRARY_FILENAMES=/usr/share/glvnd/egl_vendor.d/50_mesa.json ;;
     *) echo 'renderer.conf must contain auto, hardware or software' >&2; exit 1 ;;
 esac
 export NIRI_RDP_RENDERER="$renderer"
@@ -27,8 +30,16 @@ unset DISPLAY WAYLAND_DISPLAY WAYLAND_SOCKET NIRI_SOCKET SSH_AUTH_SOCK
 export PIPEWIRE_RUNTIME_DIR="$NIRI_RDP_RUNTIME_DIR"
 export PIPEWIRE_REMOTE=pipewire-0
 export PULSE_SERVER="unix:$NIRI_RDP_RUNTIME_DIR/pulse/native"
+# Boot-time centiseconds from /proc/uptime: monotonic, no subprocess. If it
+# is unreadable, no helper run ever counts as healthy (the old fixed budget).
+uptime_now() {
+    read -r uptime _ < /proc/uptime 2>/dev/null || uptime=0.00
+    uptime_cs=$((${uptime%.*} * 100 + 1${uptime#*.} - 100))
+}
 /usr/lib/niri-rdp/session-audio &
 audio_pid=$!
+uptime_now
+audio_started=$uptime_cs
 attempt=0
 while [ ! -S "$NIRI_RDP_RUNTIME_DIR/audio-0" ]; do
     kill -0 "$audio_pid" 2>/dev/null || { echo 'remote audio unavailable; starting desktop without audio' >&2; break; }
@@ -67,28 +78,83 @@ wrapper += 'spawn-at-startup "/usr/lib/niri-rdp/session-portals"\n'
 wrapper += 'spawn-at-startup "/usr/lib/niri-rdp/session-autostart"\n'
 pathlib.Path(sys.argv[2]).write_text(wrapper)
 PY
+# The remote microphone helper is separate from playback: its own socket
+# (audio-in-0), its own pw-cat restart budget and its own two retries below.
+# Nothing waits for it; a missing microphone never delays or ends the desktop.
+/usr/lib/niri-rdp/session-microphone &
+mic_pid=$!
+uptime_now
+mic_started=$uptime_cs
+mic_restarts=0
+mic_healthy_seconds=600
+mic_supervised=1
+mic_retry_ticks=0
 # Keep the private helper supervised after Niri starts. A healthy desktop is
-# independent of ancillary audio. Restart the helper at most twice per desktop;
-# its own graph supervisor has three finite attempts. Never use shared services.
+# independent of ancillary audio. Restart the helper at most twice in a row; a
+# helper that ran ten healthy minutes earns a fresh budget, so restarts stay
+# finite in any window without losing audio for days. Its own graph supervisor
+# has three finite attempts. Never use shared services.
 /usr/lib/niri-rdp/niri-headless --config "$NIRI_RDP_RUNTIME_DIR/config.kdl" &
 desktop_pid=$!
 audio_restarts=0
+audio_healthy_seconds=600
+audio_supervised=1
 cleanup() {
     trap - EXIT TERM INT
     kill "$desktop_pid" "$audio_pid" 2>/dev/null || :
+    kill "$mic_pid" 2>/dev/null || :
     wait "$desktop_pid" 2>/dev/null || :
     wait "$audio_pid" 2>/dev/null || :
+    wait "$mic_pid" 2>/dev/null || :
 }
 trap cleanup EXIT
 trap 'exit 0' TERM INT
 while kill -0 "$desktop_pid" 2>/dev/null; do
-    if ! kill -0 "$audio_pid" 2>/dev/null && [ "$audio_restarts" -lt 2 ]; then
+    if [ "$audio_supervised" -eq 1 ] && ! kill -0 "$audio_pid" 2>/dev/null; then
         wait "$audio_pid" 2>/dev/null || :
-        audio_restarts=$((audio_restarts + 1))
-        sleep "$audio_restarts"
-        /usr/lib/niri-rdp/session-audio &
-        audio_pid=$!
-        echo "private audio helper restart $audio_restarts of 2; active clients reconnect for fresh capture" >&2
+        # Judge health once, at exit: time spent dead never earns a reset.
+        uptime_now
+        if [ $((uptime_cs - audio_started)) -ge $((audio_healthy_seconds * 100)) ]; then
+            audio_restarts=0
+        fi
+        if [ "$audio_restarts" -lt 2 ]; then
+            audio_restarts=$((audio_restarts + 1))
+            sleep "$audio_restarts"
+            /usr/lib/niri-rdp/session-audio &
+            audio_pid=$!
+            uptime_now
+            audio_started=$uptime_cs
+            echo "private audio helper restart $audio_restarts of 2; active clients reconnect for fresh capture" >&2
+        else
+            audio_supervised=0
+        fi
+    fi
+    # Microphone retries count loop ticks instead of sleeping, so they never
+    # delay playback supervision. Same finite policy, separate variables.
+    if [ "$mic_supervised" -eq 1 ]; then
+        if [ "$mic_retry_ticks" -gt 0 ]; then
+            mic_retry_ticks=$((mic_retry_ticks - 1))
+            if [ "$mic_retry_ticks" -eq 0 ]; then
+                /usr/lib/niri-rdp/session-microphone &
+                mic_pid=$!
+                uptime_now
+                mic_started=$uptime_cs
+            fi
+        elif ! kill -0 "$mic_pid" 2>/dev/null; then
+            wait "$mic_pid" 2>/dev/null || :
+            uptime_now
+            if [ $((uptime_cs - mic_started)) -ge $((mic_healthy_seconds * 100)) ]; then
+                mic_restarts=0
+            fi
+            if [ "$mic_restarts" -lt 2 ]; then
+                mic_restarts=$((mic_restarts + 1))
+                mic_retry_ticks=$((mic_restarts * 2))
+                echo "remote microphone helper stopped; retry $mic_restarts/2" >&2
+            else
+                mic_supervised=0
+                echo 'remote microphone helper stopped; microphone off for this session' >&2
+            fi
+        fi
     fi
     sleep 0.5
 done

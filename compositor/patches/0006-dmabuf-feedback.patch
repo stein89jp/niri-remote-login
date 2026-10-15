@@ -1,0 +1,105 @@
+From 38c6d8973891aeab0570b3ebb16eb62dea2776bd Mon Sep 17 00:00:00 2001
+From: Niri-RDP rebase <niri-rdp@localhost>
+Date: Thu, 15 Oct 2026 13:22:38 +0900
+Subject: [PATCH 06/12] headless: advertise hardware DMA-BUF with render-node
+ feedback
+
+After the renderer is created, a headless session on a hardware EGL device
+creates the zwp_linux_dmabuf_v1 global with default feedback for the
+device's render node (plain formats if no render node), and logs
+"headless renderer: advertised hardware DMA-BUF formats". Software devices
+and renderers without DMA-BUF formats get no global, so clients stay on SHM.
+Accelerated clients and the Niri-RDP zero-copy GPU capture depend on it.
+
+Niri-RDP feature F5. Test: backend::headless::remote_tests::
+software_renderer_uses_surfaceless_llvmpipe_without_a_render_node (no global).
+---
+ src/backend/headless.rs | 44 ++++++++++++++++++++++++++++++++++++++++-
+ src/niri.rs             |  1 +
+ 2 files changed, 44 insertions(+), 1 deletion(-)
+
+diff --git a/src/backend/headless.rs b/src/backend/headless.rs
+index 4463a19b..518f0aab 100644
+--- a/src/backend/headless.rs
++++ b/src/backend/headless.rs
+@@ -23,11 +23,12 @@ use smithay::output::{Mode, Output, PhysicalProperties, Subpixel};
+ use smithay::reexports::calloop::timer::{TimeoutAction, Timer};
+ use smithay::reexports::wayland_protocols::wp::presentation_time::server::wp_presentation_feedback;
+ use smithay::utils::Size;
++use smithay::wayland::dmabuf::DmabufFeedbackBuilder;
+ use smithay::wayland::presentation::Refresh;
+ 
+ use super::{IpcOutputMap, OutputId, RenderResult};
+ use crate::frame_clock::FrameClock;
+-use crate::niri::{Niri, RedrawState};
++use crate::niri::{Niri, RedrawState, State};
+ use crate::render_helpers::{resources, shaders};
+ use crate::utils::{get_monotonic_time, logical_output};
+ 
+@@ -127,6 +128,45 @@ impl Headless {
+         unsafe { GlesRenderer::new(context) }.context("error creating renderer")
+     }
+ 
++    /// Advertise zwp_linux_dmabuf_v1 for a hardware renderer, with default feedback for its
++    /// render node. Returns whether the global was created.
++    pub fn create_dmabuf_global(&mut self, niri: &mut Niri) -> bool {
++        let Some(renderer) = self.renderer.as_ref() else {
++            return false;
++        };
++        let display = renderer.egl_context().display();
++        let Ok(device) = EGLDevice::device_for_display(display) else {
++            return false;
++        };
++        if device.is_software() {
++            return false;
++        }
++        // Allow accelerated applications to submit GPU buffers rather than
++        // downloading every window to SHM before the compositor uploads it again.
++        let formats = renderer.dmabuf_formats();
++        if formats.iter().next().is_none() {
++            return false;
++        }
++        let feedback = device
++            .try_get_render_node()
++            .ok()
++            .flatten()
++            .and_then(|node| {
++                DmabufFeedbackBuilder::new(node.dev_id(), formats.clone())
++                    .build()
++                    .ok()
++            });
++        if let Some(feedback) = feedback {
++            niri.dmabuf_state
++                .create_global_with_default_feedback::<State>(&niri.display_handle, &feedback);
++        } else {
++            niri.dmabuf_state
++                .create_global::<State>(&niri.display_handle, formats);
++        }
++        info!("headless renderer: advertised hardware DMA-BUF formats");
++        true
++    }
++
+     /// Add an output for testing (uses lowercase naming like `headless-1`).
+     /// This is kept for backwards compatibility with tests.
+     pub fn add_output(&mut self, niri: &mut Niri, n: u8, size: (u16, u16)) {
+@@ -687,6 +727,8 @@ mod remote_tests {
+             .unwrap();
+         assert!(software);
+         assert_eq!(headless.primary_render_node(), None);
++        // Applications keep SHM: a software renderer gets no DMA-BUF global.
++        assert!(!headless.create_dmabuf_global(&mut state.niri));
+     }
+ 
+     #[test]
+diff --git a/src/niri.rs b/src/niri.rs
+index dac4db30..6c8fbe70 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -803,6 +803,7 @@ impl State {
+                 headless
+                     .add_renderer()
+                     .context("failed to initialize headless renderer")?;
++                headless.create_dmabuf_global(&mut state.niri);
+                 headless
+                     .create_virtual_output(&mut state.niri, 1920, 1080, 60)
+                     .map_err(anyhow::Error::msg)

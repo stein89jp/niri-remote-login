@@ -1,7 +1,54 @@
-# Compositor checkpoint — 2026-10-10
+# Compositor checkpoint — 2026-10-15 (rebase onto upstream main)
 
 Ownership: `compositor/` and `lab/`. No host package, PAM, service, GNOME, GDM,
 power policy or physical device configuration was changed.
+
+## Current pin and series
+
+PLAN2 rebased the compositor from PR #3953 head `0be60b7` (plus two private
+patches) onto upstream Niri `main` `fc9e8c425e2267d877a65918f030c86f3c698179`
+(v26.04 + 193 commits), Smithay `8a270232f1bfc416c781273c98a3f52a812a0bba`.
+The decision record is `artifacts/design/niri-rebase-decision.md`. PR #3953 is
+still open and unmerged; patch 0001 carries it rebased (two trivial conflict
+hunks plus the new `max_bpc` IPC field). Archive SHA256
+`d7e8b62923429eba4187990cb94a9466e3df8840632f6302cd1c0fe20fa450d9`; Cargo.lock
+SHA256 `a3774f2ee8da8ff96a1a7e9c4f795578fb60918724e1a4feb4618375f1809bc6`,
+unchanged by the series. Per-patch hashes are in `pins.json`; the old pin is
+under `previous` there for rollback.
+
+The twelve patches (see [README](README.md)) add 2,815 and remove 66 lines,
+of which about 1,150 are tests (`src/tests/remote_input.rs`,
+`src/tests/cursor_capture.rs`) and 161 are upstream PR documentation
+(`docs/Virtual-Outputs.md`). Dropped because upstream now provides them: the
+keybinding-routed virtual keyboard rewrite, held-key release on disconnect,
+Fcitx forwarded-key grab bypass and wheel v120. The private
+`niri-rdp-cursor-v1` protocol was replaced by upstream ext-image-copy-capture
+cursor sessions plus the small no-echo patch 0011 and the drag-icon patch 0012.
+
+Files created by the series, which makepkg's `prepare()` moves aside when
+reusing a src tree: `docs/Virtual-Outputs.md`, `src/utils/private_startup.rs`,
+`src/tests/remote_input.rs`, `src/tests/cursor_capture.rs`.
+
+The archive plus the series applied with `patch -Np1` is byte-identical to the
+scratch branch `rebase/main-fc9e8c42` at `cfaad5f1`. `upstream/` was refreshed
+to that tree, and `lab/build-niri.sh --offline` passed (debug). With the lab
+sysroot and a private `XDG_RUNTIME_DIR`, `--lib backend::headless` passed 8
+tests, `tests::remote_input` 9, `tests::cursor_capture` 7, and the combined
+`-- tests::remote_input tests::cursor_capture utils::private_startup` run 19.
+Lab integration (capture, input, Fcitx/Mozc, NVIDIA/NVENC, clipboard,
+performance) and the installed Windows checks are PLAN2 Phase 5.
+
+The packages ship the compositor and bridge in lockstep: the combined package
+provides `niri-rdp-headless=26.04.remote2-1`, and the split bridge package
+depends on `niri-rdp-headless>=26.04.remote2-1`, because the bridge now uses
+cursor sessions and `no_keymap` virtual keyboards and needs patch 0011.
+
+The sections below are the original 2026-10-10 PR #3953 checkpoint, kept as
+history. Their patch names, hashes and test counts describe the previous pin.
+
+---
+
+# History: compositor checkpoint — 2026-10-10 (PR #3953 pin, superseded)
 
 ## Decision and exact source
 
@@ -21,10 +68,10 @@ SHM bridge. PR3953 has an explicit `NIRI_BACKEND=headless` path, renderer startu
 imports, without physical seat input acquisition. We selected PR3953, using SHM
 capture and existing Wayland virtual-input protocols only.
 
-All archive, lockfile, Smithay and extracted libseat pins are in `pins.json`.
-The Niri archive SHA256 is
+The archive, lockfile, Smithay and extracted libseat pins of that time are
+under `previous` in `pins.json`. The Niri archive SHA256 was
 `680374cae233d2ed1e0f8474aeb017e36872b30b9e291ce43b1521724b8fe2a9`.
-Cargo.lock SHA256 is
+Cargo.lock SHA256 was
 `e71d9d5b104d297bc1185cebb4d7eb203f374c668c5739e41927e15a0b1e668c`.
 Selected Smithay: `ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef`. Exact read-only
 Arch library/toolchain package versions observed during this build are also in
@@ -121,7 +168,7 @@ that stronger result; do not infer Windows compatibility from it.
 The release results and binary hash below describe the original startup/bounds
 patch before dynamic-resolution support. The current patch was rebuilt in debug
 mode; both headless lifecycle and resize regressions pass, and the patch applies
-cleanly to the pinned source archive. Its current checksum is in `pins.json`.
+cleanly to the pinned source archive. Its checksum is under `previous` in `pins.json`.
 
 Release build PASS: `cargo build --release --locked --offline
 --no-default-features`, `CARGO_BUILD_JOBS=2`, elapsed 4m01s. Unstripped binary

@@ -1,0 +1,237 @@
+From 706b9b18fefc643216c5014b0cd1a8393649b06e Mon Sep 17 00:00:00 2001
+From: Niri-RDP rebase <niri-rdp@localhost>
+Date: Thu, 15 Oct 2026 13:24:53 +0900
+Subject: [PATCH 07/12] headless: prepare private session activation before
+ autostart
+
+When the headless backend runs in a Niri-RDP broker session
+(NIRI_RDP_RUNTIME_DIR is set), niri runs the fixed helper
+/usr/lib/niri-rdp/session-autostart --prepare with the configured child
+environment before any startup application, so Fcitx5/IBus and the private
+D-Bus activation environment are ready first. While it runs, the event loop
+keeps dispatching and flushing clients (10 ms steps), so input-method Wayland
+roundtrips cannot deadlock startup. The helper is killed after 15 s; failure,
+timeout, wait and spawn errors are logged and startup continues.
+
+The wait loop lives in utils::private_startup so it can be tested.
+
+Niri-RDP feature F6. Tests: utils::private_startup::tests.
+---
+ src/main.rs                  |  15 +++-
+ src/utils/mod.rs             |   1 +
+ src/utils/private_startup.rs | 161 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 176 insertions(+), 1 deletion(-)
+ create mode 100644 src/utils/private_startup.rs
+
+diff --git a/src/main.rs b/src/main.rs
+index b3b8db7b..d1155680 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -24,7 +24,7 @@ use niri::utils::spawning::{
+     spawn, spawn_sh, store_and_increase_nofile_rlimit, CHILD_DISPLAY, CHILD_ENV,
+     REMOVE_ENV_RUST_BACKTRACE, REMOVE_ENV_RUST_LIB_BACKTRACE,
+ };
+-use niri::utils::{cause_panic, version, watcher, xwayland, IS_SYSTEMD_SERVICE};
++use niri::utils::{cause_panic, private_startup, version, watcher, xwayland, IS_SYSTEMD_SERVICE};
+ use niri_config::{Config, ConfigPath};
+ use niri_ipc::socket::SOCKET_PATH_ENV;
+ use sd_notify::NotifyState;
+@@ -230,6 +230,19 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
+         env::remove_var("DISPLAY");
+     }
+ 
++    // Private remote sessions must publish their activation environment before
++    // startup applications can activate an input method or desktop service.
++    if headless && env::var_os("NIRI_RDP_RUNTIME_DIR").is_some() {
++        let mut setup = Command::new(private_startup::PREPARE_COMMAND);
++        setup.arg("--prepare");
++        private_startup::prepare_private_session(
++            &mut event_loop,
++            &mut state,
++            setup,
++            std::time::Duration::from_secs(15),
++        )?;
++    }
++
+     if cli.session {
+         // We're starting as a session. Import our variables.
+         import_environment();
+diff --git a/src/utils/mod.rs b/src/utils/mod.rs
+index 6d513eb6..4b22df04 100644
+--- a/src/utils/mod.rs
++++ b/src/utils/mod.rs
+@@ -38,6 +38,7 @@ use crate::handlers::KdeDecorationsModeState;
+ use crate::niri::ClientState;
+ 
+ pub mod id;
++pub mod private_startup;
+ pub mod region;
+ pub mod scale;
+ pub mod signals;
+diff --git a/src/utils/private_startup.rs b/src/utils/private_startup.rs
+new file mode 100644
+index 00000000..b3778b7f
+--- /dev/null
++++ b/src/utils/private_startup.rs
+@@ -0,0 +1,161 @@
++//! Activation preparation for private remote (Niri-RDP) headless sessions.
++
++use std::process::Command;
++use std::time::{Duration, Instant};
++
++use calloop::EventLoop;
++
++use crate::niri::State;
++use crate::utils::spawning::CHILD_ENV;
++
++/// Fixed helper that publishes the activation environment to the session's private D-Bus bus.
++pub const PREPARE_COMMAND: &str = "/usr/lib/niri-rdp/session-autostart";
++
++/// How [`prepare_private_session`] ended.
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++pub enum PrepareOutcome {
++    Succeeded,
++    Failed,
++    TimedOut,
++    WaitFailed,
++    SpawnFailed,
++}
++
++/// Runs a private session's activation preparation before startup applications are spawned.
++///
++/// The command gets the configured child environment. While it runs, the event loop keeps
++/// dispatching, because input methods need Wayland roundtrips to finish loading. A command that
++/// outlives `timeout` is killed. Failures are logged and startup continues.
++pub fn prepare_private_session(
++    event_loop: &mut EventLoop<'static, State>,
++    state: &mut State,
++    mut command: Command,
++    timeout: Duration,
++) -> Result<PrepareOutcome, calloop::Error> {
++    for variable in &CHILD_ENV.read().unwrap().0 {
++        if let Some(value) = &variable.value {
++            command.env(&variable.name, value);
++        } else {
++            command.env_remove(&variable.name);
++        }
++    }
++
++    let mut child = match command.spawn() {
++        Ok(child) => child,
++        Err(error) => {
++            warn!("could not prepare private desktop activation: {error}");
++            return Ok(PrepareOutcome::SpawnFailed);
++        }
++    };
++
++    let deadline = Instant::now() + timeout;
++    let outcome = loop {
++        match child.try_wait() {
++            Ok(Some(status)) => {
++                if status.success() {
++                    return Ok(PrepareOutcome::Succeeded);
++                }
++                warn!("private desktop activation preparation failed: {status}");
++                return Ok(PrepareOutcome::Failed);
++            }
++            Ok(None) if Instant::now() < deadline => {
++                // Input methods need Wayland roundtrips to finish loading.
++                // Keep the display responsive while holding startup apps.
++                if let Err(error) = event_loop.dispatch(Some(Duration::from_millis(10)), state) {
++                    let _ = child.kill();
++                    let _ = child.wait();
++                    return Err(error);
++                }
++                state.refresh_and_flush_clients();
++            }
++            Ok(None) => {
++                warn!("private desktop activation preparation timed out");
++                break PrepareOutcome::TimedOut;
++            }
++            Err(error) => {
++                warn!("could not wait for private desktop activation: {error}");
++                break PrepareOutcome::WaitFailed;
++            }
++        }
++    };
++
++    let _ = child.kill();
++    let _ = child.wait();
++    Ok(outcome)
++}
++
++#[cfg(test)]
++mod tests {
++    use std::cell::Cell;
++    use std::rc::Rc;
++
++    use calloop::timer::{TimeoutAction, Timer};
++    use niri_config::Config;
++    use smithay::reexports::wayland_server::Display;
++
++    use super::*;
++
++    fn prepare(command: Command, timeout: Duration) -> (PrepareOutcome, bool) {
++        let mut event_loop = EventLoop::<State>::try_new().unwrap();
++        let mut state = State::new(
++            Config::default(),
++            event_loop.handle(),
++            event_loop.get_signal(),
++            Display::new().unwrap(),
++            true,
++            false,
++            false,
++        )
++        .unwrap();
++
++        // Records whether the event loop kept dispatching while the command ran.
++        let dispatched = Rc::new(Cell::new(false));
++        let flag = dispatched.clone();
++        event_loop
++            .handle()
++            .insert_source(
++                Timer::from_duration(Duration::from_millis(1)),
++                move |_, _, _| {
++                    flag.set(true);
++                    TimeoutAction::Drop
++                },
++            )
++            .unwrap();
++
++        let outcome = prepare_private_session(&mut event_loop, &mut state, command, timeout);
++        (outcome.unwrap(), dispatched.get())
++    }
++
++    fn sh(script: &str) -> Command {
++        let mut command = Command::new("/bin/sh");
++        command.args(["-c", script]);
++        command
++    }
++
++    #[test]
++    fn preparation_dispatches_the_event_loop_until_the_helper_exits() {
++        let (outcome, dispatched) = prepare(sh("sleep 0.2"), Duration::from_secs(15));
++        assert_eq!(outcome, PrepareOutcome::Succeeded);
++        assert!(dispatched);
++    }
++
++    #[test]
++    fn failed_or_missing_helpers_do_not_stop_startup() {
++        let (outcome, _) = prepare(sh("exit 3"), Duration::from_secs(15));
++        assert_eq!(outcome, PrepareOutcome::Failed);
++
++        let missing = Command::new("/nonexistent/niri-rdp/session-autostart");
++        let (outcome, dispatched) = prepare(missing, Duration::from_secs(15));
++        assert_eq!(outcome, PrepareOutcome::SpawnFailed);
++        assert!(!dispatched);
++    }
++
++    #[test]
++    fn helper_is_killed_after_the_deadline() {
++        let start = Instant::now();
++        let (outcome, dispatched) = prepare(sh("exec sleep 30"), Duration::from_millis(200));
++        assert_eq!(outcome, PrepareOutcome::TimedOut);
++        assert!(dispatched);
++        assert!(start.elapsed() < Duration::from_secs(10));
++    }
++}

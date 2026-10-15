@@ -5,11 +5,15 @@
   "spacing": 12,
   "modules-left": ["custom/launcher", "niri/workspaces"],
   "modules-center": ["niri/window"],
-  "modules-right": ["tray", "clock"],
+  "modules-right": ["privacy", "tray", "clock"],
   "custom/launcher": {
     "format": "Applications",
     "tooltip": false,
     "on-click": "fuzzel"
+  },
+  "privacy": {
+    "icon-size": 16,
+    "modules": [{"type": "audio-in", "tooltip": true}]
   },
   "niri/window": {"max-length": 60},
   "clock": {"format": "{:%a %H:%M}"}

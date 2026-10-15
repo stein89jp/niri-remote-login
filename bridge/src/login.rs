@@ -1,5 +1,9 @@
 //! Restricted TLS login screen. No Wayland connection exists before PAM accepts.
-use crate::{broker, video::Video, wayland::Desktop};
+use crate::{
+    broker::{self, LoginThrottle},
+    video::Video,
+    wayland::Desktop,
+};
 use ironrdp_displaycontrol::pdu::DisplayControlMonitorLayout;
 use ironrdp_server::{
     BoundConnection, DesktopSize, DisplayUpdate, KeyboardEvent, MouseButton, MouseEvent,
@@ -7,12 +11,93 @@ use ironrdp_server::{
 };
 use std::{
     cell::RefCell,
+    net::IpAddr,
     num::{NonZeroU16, NonZeroUsize},
+    ops::RangeInclusive,
     path::PathBuf,
     sync::{Arc, Mutex},
     time::{Duration, Instant},
 };
 use xkbcommon::xkb;
+
+/// Bounds how long an unauthenticated peer may hold the single RDP slot on
+/// the login screen. Both limits stop applying once a desktop is attached.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LoginLimits {
+    /// Disconnect after this long without a submitted login attempt.
+    pub idle: Duration,
+    /// Disconnect after this long on the login screen in total.
+    pub total: Duration,
+}
+impl Default for LoginLimits {
+    fn default() -> Self {
+        Self {
+            idle: Duration::from_secs(60),
+            total: Duration::from_secs(120),
+        }
+    }
+}
+impl LoginLimits {
+    pub const IDLE_SECS: RangeInclusive<u64> = 10..=600;
+    pub const TOTAL_SECS: RangeInclusive<u64> = 30..=1800;
+
+    /// Parse `NIRI_RDP_LOGIN_IDLE_SECS` and `NIRI_RDP_LOGIN_TIMEOUT_SECS`.
+    pub fn from_env() -> anyhow::Result<Self> {
+        fn variable(name: &str) -> anyhow::Result<Option<String>> {
+            match std::env::var(name) {
+                Ok(value) => Ok(Some(value)),
+                Err(std::env::VarError::NotPresent) => Ok(None),
+                Err(_) => anyhow::bail!("{name} must contain valid Unicode"),
+            }
+        }
+        Self::parse(
+            variable("NIRI_RDP_LOGIN_IDLE_SECS")?.as_deref(),
+            variable("NIRI_RDP_LOGIN_TIMEOUT_SECS")?.as_deref(),
+        )
+    }
+    pub fn parse(idle: Option<&str>, total: Option<&str>) -> anyhow::Result<Self> {
+        fn seconds(
+            name: &str,
+            value: Option<&str>,
+            default: Duration,
+            range: RangeInclusive<u64>,
+        ) -> anyhow::Result<Duration> {
+            let error = || {
+                anyhow::anyhow!(
+                    "{name} must be an integer within {}..{}",
+                    range.start(),
+                    range.end()
+                )
+            };
+            let Some(value) = value else {
+                return Ok(default);
+            };
+            let value = value.parse::<u64>().map_err(|_| error())?;
+            anyhow::ensure!(range.contains(&value), error());
+            Ok(Duration::from_secs(value))
+        }
+        let default = Self::default();
+        let limits = Self {
+            idle: seconds(
+                "NIRI_RDP_LOGIN_IDLE_SECS",
+                idle,
+                default.idle,
+                Self::IDLE_SECS,
+            )?,
+            total: seconds(
+                "NIRI_RDP_LOGIN_TIMEOUT_SECS",
+                total,
+                default.total,
+                Self::TOTAL_SECS,
+            )?,
+        };
+        anyhow::ensure!(
+            limits.idle <= limits.total,
+            "NIRI_RDP_LOGIN_IDLE_SECS must not exceed NIRI_RDP_LOGIN_TIMEOUT_SECS"
+        );
+        Ok(limits)
+    }
+}
 
 // Avoid retaining submitted passwords after a failed attempt or disconnect.
 struct Password(String);
@@ -38,6 +123,8 @@ enum LoginFailure {
     MissingCredentials,
     Rejected,
     DesktopUnavailable,
+    DesktopInUse,
+    LocalSession,
 }
 impl LoginFailure {
     fn message(&self) -> &'static str {
@@ -45,6 +132,17 @@ impl LoginFailure {
             Self::MissingCredentials => "Enter your username and password.",
             Self::Rejected => "Login denied. Check account and password.",
             Self::DesktopUnavailable => "Desktop unavailable. Try again.",
+            Self::DesktopInUse => "Desktop in use by another connection.",
+            Self::LocalSession => "A local desktop session is still open.",
+        }
+    }
+}
+impl From<broker::Denial> for LoginFailure {
+    fn from(denial: broker::Denial) -> Self {
+        match denial {
+            broker::Denial::Rejected => Self::Rejected,
+            broker::Denial::AlreadyAttached => Self::DesktopInUse,
+            broker::Denial::LocalSession => Self::LocalSession,
         }
     }
 }
@@ -67,9 +165,12 @@ struct State {
     failure: Option<LoginFailure>,
     attempts: u8,
     retry_at: Instant,
+    opened: tokio::time::Instant,
+    last_submit: tokio::time::Instant,
     stopped: bool,
     desktop: Option<Desktop>,
     pointer_max_size: u16,
+    pointer_cache_size: u16,
     pending_layout: Option<DisplayControlMonitorLayout>,
     suppressed: bool,
     refresh_epoch: u64,
@@ -82,7 +183,25 @@ pub struct Login {
     output: String,
     video: Option<Video>,
     audio: crate::audio::Audio,
+    microphone: Option<crate::microphone::Microphone>,
     clipboard: crate::clipboard::Clipboard,
+    limits: LoginLimits,
+    source: Option<(LoginThrottle, IpAddr)>,
+}
+impl State {
+    /// When the form disconnects unless a login attempt is submitted. Neither
+    /// limit runs while PAM or desktop startup is in progress, nor afterwards.
+    fn deadline(&self, limits: LoginLimits) -> Option<tokio::time::Instant> {
+        if self.busy || self.desktop.is_some() {
+            return None;
+        }
+        Some((self.last_submit + limits.idle).min(self.opened + limits.total))
+    }
+    /// Forward this activation's pointer ceiling and client cache size; the
+    /// desktop's pointer cache stays disabled without the cache size.
+    fn replay_pointer_capabilities(&self, desktop: &mut Desktop) {
+        desktop.pointer_cache_capabilities(self.pointer_max_size, self.pointer_cache_size);
+    }
 }
 impl Login {
     pub fn new(
@@ -145,9 +264,12 @@ impl Login {
                 failure: None,
                 attempts: 0,
                 retry_at: Instant::now(),
+                opened: tokio::time::Instant::now(),
+                last_submit: tokio::time::Instant::now(),
                 stopped: false,
                 desktop: None,
                 pointer_max_size: 0,
+                pointer_cache_size: 0,
                 pending_layout: None,
                 suppressed: false,
                 refresh_epoch: 0,
@@ -157,8 +279,20 @@ impl Login {
             output,
             video,
             audio: Default::default(),
+            microphone: None,
             clipboard: Default::default(),
+            limits: LoginLimits::default(),
+            source: None,
         }
+    }
+    pub fn with_limits(mut self, limits: LoginLimits) -> Self {
+        self.limits = limits;
+        self
+    }
+    /// Share the frontend's per-source failure backoff with this form.
+    pub fn with_throttle(mut self, throttle: LoginThrottle, source: Option<IpAddr>) -> Self {
+        self.source = source.map(|source| (throttle, source));
+        self
     }
     pub fn with_audio(mut self, audio: crate::audio::Audio) -> Self {
         self.audio = audio;
@@ -167,6 +301,35 @@ impl Login {
     pub fn with_clipboard(mut self, clipboard: crate::clipboard::Clipboard) -> Self {
         self.clipboard = clipboard;
         self
+    }
+    /// `None` when the microphone is off: its descriptor is then dropped.
+    pub fn with_microphone(mut self, microphone: Option<crate::microphone::Microphone>) -> Self {
+        self.microphone = microphone;
+        self
+    }
+    /// Open the form explaining why authenticated credentials opened no desktop.
+    pub fn with_notice(self, denial: Option<broker::Denial>) -> Self {
+        if let Some(denial) = denial {
+            self.state.lock().unwrap().failure = Some(denial.into());
+        }
+        self
+    }
+    #[cfg(test)]
+    pub(crate) fn failure_message(&self) -> Option<&'static str> {
+        self.state
+            .lock()
+            .unwrap()
+            .failure
+            .as_ref()
+            .map(LoginFailure::message)
+    }
+    #[cfg(test)]
+    pub(crate) fn limits(&self) -> LoginLimits {
+        self.limits
+    }
+    #[cfg(test)]
+    pub(crate) fn source(&self) -> Option<IpAddr> {
+        self.source.as_ref().map(|(_, source)| *source)
     }
     pub fn bound(&self) -> BoundConnection {
         BoundConnection {
@@ -178,6 +341,9 @@ impl Login {
         let mut state = self.state.lock().unwrap();
         state.stopped = true;
         self.audio.clear();
+        if let Some(microphone) = &self.microphone {
+            microphone.clear();
+        }
         self.clipboard.clear();
         state.password.clear();
         state.compose.reset();
@@ -202,10 +368,26 @@ impl Login {
             {
                 return;
             }
+            state.last_submit = tokio::time::Instant::now();
             if state.username.is_empty() || state.password.0.is_empty() {
                 state.compose.reset();
                 state.unicode = Default::default();
                 state.failure = Some(LoginFailure::MissingCredentials);
+                drop(state);
+                self.notify();
+                return;
+            }
+            // During a source backoff, answer like PAM would without asking
+            // it: the same generic message, per-form attempt and retry pause.
+            if self
+                .source
+                .as_ref()
+                .is_some_and(|(throttle, source)| throttle.blocked(*source))
+            {
+                state.compose.reset();
+                state.unicode = Default::default();
+                state.password.clear();
+                Self::reject(&mut state);
                 drop(state);
                 self.notify();
                 return;
@@ -223,31 +405,53 @@ impl Login {
         let output = self.output.clone();
         let changed = self.changed.clone();
         let audio = self.audio.clone();
+        let microphone = self.microphone.clone();
         let clipboard = self.clipboard.clone();
+        let source = self.source.clone();
         // PAM and compositor startup may block; neither runs in the RDP loop.
         std::thread::spawn(move || {
-            let result = broker::open(&path, &username, &password.0).and_then(|session| {
-                let Some(session) = session else {
-                    return Ok(None);
+            let peer = source.as_ref().map(|(_, source)| *source);
+            let opened = broker::open(&path, &username, &password.0, peer);
+            if let Some((throttle, source)) = &source {
+                match &opened {
+                    Ok(Ok(_)) => throttle.record_success(*source),
+                    // PAM accepted the password even though no desktop opened.
+                    Ok(Err(denial)) if denial.authenticated() => throttle.record_success(*source),
+                    Ok(Err(_)) => throttle.record_failure(*source),
+                    // Broker or desktop failures say nothing about the password.
+                    Err(_) => {}
+                }
+            }
+            let result = opened.and_then(|session| {
+                let session = match session {
+                    Ok(session) => session,
+                    Err(denial) => return Ok(Err(denial)),
                 };
                 if state
                     .upgrade()
                     .is_none_or(|state| state.lock().unwrap().stopped)
                 {
-                    return Ok(None);
+                    return Ok(Ok(None));
                 }
                 let desktop = Desktop::start(session.socket, output, size, Some(session.lease))?;
-                Ok(Some((desktop, session.audio)))
+                Ok(Ok(Some((desktop, session.audio, session.microphone))))
             });
             drop(password);
             if let Some(state) = state.upgrade() {
                 let mut state = state.lock().unwrap();
                 state.busy = false;
+                // Time spent waiting for PAM does not count as idle form time.
+                state.last_submit = tokio::time::Instant::now();
                 match result {
-                    Ok(Some((mut desktop, audio_socket))) if !state.stopped => {
+                    Ok(Ok(Some((mut desktop, audio_socket, microphone_socket))))
+                        if !state.stopped =>
+                    {
                         audio.attach(audio_socket);
+                        if let Some(microphone) = &microphone {
+                            microphone.attach(microphone_socket);
+                        }
                         desktop.attach_clipboard(clipboard.clone());
-                        desktop.pointer_capabilities(state.pointer_max_size);
+                        state.replay_pointer_capabilities(&mut desktop);
                         desktop.set_output_suppressed(state.suppressed);
                         if let Some(layout) = state.pending_layout.take() {
                             desktop.request_layout(layout);
@@ -286,14 +490,14 @@ impl Login {
                         }
                         state.desktop = Some(desktop);
                     }
-                    Ok(Some((desktop, _))) => desktop.stop(),
-                    Ok(None) => {
-                        state.failure = Some(LoginFailure::Rejected);
-                        state.attempts += 1;
+                    Ok(Ok(Some((desktop, _, _)))) => desktop.stop(),
+                    // The form closed while PAM ran.
+                    Ok(Ok(None)) => {}
+                    Ok(Err(broker::Denial::Rejected)) => Self::reject(&mut state),
+                    // Not a password failure: no attempt is consumed.
+                    Ok(Err(denial)) => {
+                        state.failure = Some(denial.into());
                         state.retry_at = Instant::now() + Duration::from_secs(2);
-                        if state.attempts >= 5 {
-                            state.stopped = true;
-                        }
                     }
                     Err(error) => {
                         eprintln!("remote desktop startup failed: {error}");
@@ -305,6 +509,19 @@ impl Login {
                 changed.send_modify(|generation| *generation = generation.wrapping_add(1));
             }
         });
+    }
+    fn reject(state: &mut State) {
+        state.failure = Some(LoginFailure::Rejected);
+        state.attempts += 1;
+        state.retry_at = Instant::now() + Duration::from_secs(2);
+        if state.attempts >= 5 {
+            state.stopped = true;
+        }
+    }
+    /// Close the form once its idle or total deadline has passed.
+    fn expire(&self) {
+        eprintln!("RDP login screen closed: no successful login before its deadline");
+        self.stop();
     }
     fn character(&self, character: char) {
         if character.is_control() {
@@ -547,10 +764,14 @@ impl RdpServerDisplay for Login {
         self.notify();
     }
     fn pointer_capabilities(&mut self, max_size: u16) {
+        self.pointer_cache_capabilities(max_size, 0);
+    }
+    fn pointer_cache_capabilities(&mut self, max_size: u16, cache_size: u16) {
         let mut state = self.state.lock().unwrap();
         state.pointer_max_size = max_size;
+        state.pointer_cache_size = cache_size;
         if let Some(mut desktop) = state.desktop.clone() {
-            desktop.pointer_capabilities(max_size);
+            state.replay_pointer_capabilities(&mut desktop);
         }
     }
     async fn size(&mut self) -> DesktopSize {
@@ -623,10 +844,22 @@ impl RdpServerDisplayUpdates for Updates {
                 });
                 continue;
             }
-            let suppressed = self.login.state.lock().unwrap().suppressed;
+            let (suppressed, deadline) = {
+                let state = self.login.state.lock().unwrap();
+                (state.suppressed, state.deadline(self.login.limits))
+            };
+            if deadline.is_some_and(|deadline| tokio::time::Instant::now() >= deadline) {
+                self.login.expire();
+                return Ok(None);
+            }
             if suppressed && self.delivered_initial {
-                if self.rx.changed().await.is_err() {
-                    return Ok(None);
+                tokio::select! {
+                    changed = self.rx.changed() => {
+                        if changed.is_err() {
+                            return Ok(None);
+                        }
+                    }
+                    _ = until(deadline) => {}
                 }
                 continue;
             }
@@ -660,9 +893,16 @@ impl RdpServerDisplayUpdates for Updates {
                     }
                 }
                 _ = tokio::time::sleep_until(self.repaint) => {}
+                _ = until(deadline) => continue,
             }
             self.first = true;
         }
+    }
+}
+async fn until(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(deadline) => tokio::time::sleep_until(deadline).await,
+        None => std::future::pending().await,
     }
 }
 thread_local! {
@@ -1051,10 +1291,37 @@ fn glyph(character: char) -> [u8; 7] {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{
-        io::{Read, Write},
-        os::unix::net::UnixListener,
-    };
+    use std::{io::Write, os::unix::net::UnixListener};
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn display_wrappers_deliver_negotiated_pointer_cache_size_to_desktop() {
+        use crate::wayland::lifecycle_tests::{fake_desktop, repeated_pointer_is_cached};
+        let size = DesktopSize {
+            width: 64,
+            height: 64,
+        };
+        // Broker path: activation precedes sign-in; the attach replays it.
+        let mut form = login("alice");
+        form.pointer_cache_capabilities(96, 25);
+        let (mut desktop, _frames) = fake_desktop(size);
+        form.state
+            .lock()
+            .unwrap()
+            .replay_pointer_capabilities(&mut desktop);
+        assert!(repeated_pointer_is_cached(&desktop).await);
+        // Reactivation after sign-in forwards at once, including a client
+        // without a pointer cache.
+        form.state.lock().unwrap().desktop = Some(desktop.clone());
+        form.pointer_cache_capabilities(96, 0);
+        assert!(!repeated_pointer_is_cached(&desktop).await);
+        form.pointer_cache_capabilities(96, 25);
+        assert!(repeated_pointer_is_cached(&desktop).await);
+        // Direct path with RDPGFX: VideoDisplay wraps the desktop.
+        let (desktop, _frames) = fake_desktop(size);
+        let mut display = crate::video::Video::default().display(desktop.clone());
+        display.pointer_cache_capabilities(96, 25);
+        assert!(repeated_pointer_is_cached(&desktop).await);
+    }
 
     fn keyboard_map(model: &str, layout: &str) -> String {
         let context = xkb::Context::new(xkb::CONTEXT_NO_FLAGS);
@@ -1575,20 +1842,22 @@ mod tests {
         let (release, released) = std::sync::mpsc::channel();
         let worker = std::thread::spawn(move || {
             let (mut socket, _) = listener.accept().unwrap();
-            let mut header = [0; 8];
-            socket.read_exact(&mut header).unwrap();
-            let length = usize::from(u16::from_be_bytes([header[4], header[5]]))
-                + usize::from(u16::from_be_bytes([header[6], header[7]]));
-            let mut credentials = vec![0; length];
-            socket.read_exact(&mut credentials).unwrap();
-            assert_eq!(credentials, b"aliceincorrect");
-            credentials.fill(0);
+            let mut request = broker::read_test_request(&mut socket);
+            assert_eq!(request.username, b"alice");
+            assert_eq!(request.password, b"incorrect");
+            // The form forwards its client address to the broker.
+            assert_eq!(request.peer, Some("192.0.2.7".parse().unwrap()));
+            request.password.fill(0);
             ready.send(()).unwrap();
             released.recv_timeout(Duration::from_secs(2)).unwrap();
-            socket.write_all(b"NRB1\x01").unwrap();
+            socket.write_all(b"NRB2\x01").unwrap();
             listener.set_nonblocking(true).unwrap();
             assert!(listener.accept().is_err());
         });
+        let throttle = LoginThrottle::default();
+        let source: IpAddr = "192.0.2.7".parse().unwrap();
+        // An earlier free failure: this rejection starts the backoff.
+        throttle.record_failure(source);
         let mut login = Login::new(
             path,
             "HEADLESS-1".into(),
@@ -1598,7 +1867,8 @@ mod tests {
                 height: 600,
             },
             "alice",
-        );
+        )
+        .with_throttle(throttle.clone(), Some(source));
         for character in "incorrect".chars() {
             login.character(character);
         }
@@ -1619,6 +1889,167 @@ mod tests {
         assert_eq!(state.attempts, 1);
         drop(state);
         worker.join().unwrap();
+        // The rejection counts against the source, not just this form.
+        assert!(throttle.blocked(source));
+    }
+
+    #[tokio::test]
+    async fn login_screen_backoff_rejects_generically_without_contacting_pam() {
+        let throttle = LoginThrottle::default();
+        let source: IpAddr = "192.0.2.7".parse().unwrap();
+        throttle.record_failure(source);
+        throttle.record_failure(source);
+        // A nonexistent broker would surface as DesktopUnavailable if contacted.
+        let form = login("alice").with_throttle(throttle.clone(), Some(source));
+        for attempt in 1..=5 {
+            form.state.lock().unwrap().retry_at = Instant::now();
+            form.character('x');
+            form.submit();
+            let state = form.state.lock().unwrap();
+            assert!(!state.busy);
+            assert_eq!(state.failure, Some(LoginFailure::Rejected));
+            assert_eq!(state.attempts, attempt);
+            assert!(state.password.0.is_empty());
+            assert!(state.retry_at > Instant::now());
+            assert_eq!(state.stopped, attempt == 5);
+        }
+        // Rejections during backoff do not extend it.
+        assert_eq!(throttle.len(), 1);
+        // Without a source, the same form would reach the (missing) broker.
+        let unthrottled = login("alice").with_throttle(throttle, None);
+        unthrottled.character('x');
+        unthrottled.submit();
+        // The startup thread may finish before we look, so wait for its
+        // result: only a broker contact can report DesktopUnavailable.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while unthrottled.state.lock().unwrap().busy {
+            assert!(Instant::now() < deadline);
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let state = unthrottled.state.lock().unwrap();
+        assert_eq!(state.failure, Some(LoginFailure::DesktopUnavailable));
+        assert_eq!(state.attempts, 0);
+    }
+
+    #[test]
+    fn login_limits_parse_strict_bounds() {
+        assert_eq!(
+            LoginLimits::parse(None, None).unwrap(),
+            LoginLimits::default()
+        );
+        assert_eq!(
+            LoginLimits::parse(Some("10"), Some("30")).unwrap(),
+            LoginLimits {
+                idle: Duration::from_secs(10),
+                total: Duration::from_secs(30),
+            }
+        );
+        assert_eq!(
+            LoginLimits::parse(Some("600"), Some("1800")).unwrap().total,
+            Duration::from_secs(1800)
+        );
+        for (idle, total) in [
+            (Some("9"), None),
+            (Some("601"), Some("1800")),
+            (None, Some("29")),
+            (None, Some("1801")),
+            (Some("0"), None),
+            (Some("-1"), None),
+            (Some(" 60"), None),
+            (Some("60s"), None),
+            (Some(""), None),
+            (Some("90"), Some("60")),
+            (Some("121"), None),
+        ] {
+            assert!(
+                LoginLimits::parse(idle, total).is_err(),
+                "{idle:?} {total:?} accepted"
+            );
+        }
+    }
+
+    #[test]
+    fn deadline_is_earliest_of_idle_and_total_and_pauses_while_busy() {
+        let limits = LoginLimits {
+            idle: Duration::from_secs(60),
+            total: Duration::from_secs(120),
+        };
+        let login = login("alice");
+        let mut state = login.state.lock().unwrap();
+        let opened = state.opened;
+        state.last_submit = opened;
+        assert_eq!(state.deadline(limits), Some(opened + limits.idle));
+        state.last_submit = opened + Duration::from_secs(50);
+        assert_eq!(
+            state.deadline(limits),
+            Some(opened + Duration::from_secs(110))
+        );
+        state.last_submit = opened + Duration::from_secs(100);
+        assert_eq!(state.deadline(limits), Some(opened + limits.total));
+        state.busy = true;
+        assert_eq!(state.deadline(limits), None);
+    }
+
+    fn short_limits(idle_ms: u64, total_ms: u64) -> LoginLimits {
+        LoginLimits {
+            idle: Duration::from_millis(idle_ms),
+            total: Duration::from_millis(total_ms),
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_login_screen_disconnects_at_deadline_even_when_suppressed() {
+        for suppress in [false, true] {
+            let started = tokio::time::Instant::now();
+            let mut login = login("alice").with_limits(short_limits(100, 10_000));
+            let mut updates = login.updates().await.unwrap();
+            assert!(updates.next_update().await.unwrap().is_some());
+            if suppress {
+                login.set_output_suppressed(true);
+            }
+            // Typing is not a submit and does not extend the idle deadline.
+            login.character('a');
+            let end = tokio::time::timeout(Duration::from_secs(5), async {
+                loop {
+                    if updates.next_update().await.unwrap().is_none() {
+                        break;
+                    }
+                }
+            })
+            .await;
+            assert!(end.is_ok(), "idle login form was not closed");
+            assert!(started.elapsed() >= Duration::from_millis(100));
+            let state = login.state.lock().unwrap();
+            assert!(state.stopped);
+            assert!(state.password.0.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn submits_extend_idle_but_not_total_login_deadline() {
+        let started = tokio::time::Instant::now();
+        let mut login = login("").with_limits(short_limits(150, 450));
+        let mut updates = login.updates().await.unwrap();
+        let submitter = login.clone();
+        let poke = tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(Duration::from_millis(40)).await;
+                // An empty form still counts as a submitted attempt.
+                submitter.submit();
+            }
+        });
+        let end = tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if updates.next_update().await.unwrap().is_none() {
+                    break;
+                }
+            }
+        })
+        .await;
+        poke.abort();
+        assert!(end.is_ok(), "total login deadline was not enforced");
+        assert!(started.elapsed() >= Duration::from_millis(450));
+        assert!(login.state.lock().unwrap().stopped);
     }
 
     #[tokio::test]
@@ -1629,15 +2060,11 @@ mod tests {
         let worker = std::thread::spawn(move || {
             for _ in 0..6 {
                 let (mut socket, _) = listener.accept().unwrap();
-                let mut header = [0; 8];
-                socket.read_exact(&mut header).unwrap();
-                let length = usize::from(u16::from_be_bytes([header[4], header[5]]))
-                    + usize::from(u16::from_be_bytes([header[6], header[7]]));
-                let mut credentials = vec![0; length];
-                socket.read_exact(&mut credentials).unwrap();
-                credentials.fill(0);
+                let mut request = broker::read_test_request(&mut socket);
+                assert_eq!(request.peer, None);
+                request.password.fill(0);
                 // PAM accepted, but the broker's desktop worker failed.
-                socket.write_all(b"NRB1\x02").unwrap();
+                socket.write_all(b"NRB2\x02").unwrap();
             }
         });
         let login = Login::new(
@@ -1668,5 +2095,68 @@ mod tests {
             assert!(state.retry_at > Instant::now());
         }
         worker.join().unwrap();
+    }
+
+    #[tokio::test]
+    async fn authenticated_denials_explain_themselves_without_consuming_attempts() {
+        let folder = tempfile::tempdir().unwrap();
+        let path = folder.path().join("broker.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let worker = std::thread::spawn(move || {
+            for status in [4u8, 5, 4] {
+                let (mut socket, _) = listener.accept().unwrap();
+                let mut request = broker::read_test_request(&mut socket);
+                assert_eq!(request.peer, Some("192.0.2.7".parse().unwrap()));
+                request.password.fill(0);
+                socket.write_all(&[b'N', b'R', b'B', b'2', status]).unwrap();
+            }
+        });
+        let throttle = LoginThrottle::default();
+        let source: IpAddr = "192.0.2.7".parse().unwrap();
+        throttle.record_failure(source);
+        let login = Login::new(
+            path,
+            "HEADLESS-1".into(),
+            None,
+            DesktopSize {
+                width: 800,
+                height: 600,
+            },
+            "alice",
+        )
+        .with_throttle(throttle.clone(), Some(source));
+        for expected in [
+            LoginFailure::DesktopInUse,
+            LoginFailure::LocalSession,
+            LoginFailure::DesktopInUse,
+        ] {
+            login.state.lock().unwrap().retry_at = Instant::now();
+            login.character('a');
+            login.submit();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while login.state.lock().unwrap().busy {
+                assert!(Instant::now() < deadline);
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+            let state = login.state.lock().unwrap();
+            assert_eq!(state.failure, Some(expected));
+            assert_ne!(state.failure, Some(LoginFailure::Rejected));
+            assert_eq!(state.attempts, 0);
+            assert!(!state.stopped);
+            assert!(state.password.0.is_empty());
+            assert!(state.desktop.is_none());
+            assert!(state.retry_at > Instant::now());
+        }
+        worker.join().unwrap();
+        // PAM accepted the password, so the source's earlier failure is cleared.
+        assert_eq!(throttle.len(), 0);
+        assert_eq!(
+            LoginFailure::from(broker::Denial::Rejected),
+            LoginFailure::Rejected
+        );
+        // Messages fit the form beside the keyboard hint.
+        for failure in [LoginFailure::DesktopInUse, LoginFailure::LocalSession] {
+            assert!(failure.message().len() <= 41);
+        }
     }
 }

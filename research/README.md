@@ -1,9 +1,12 @@
 # Research evidence
 
-`upstream/` contains selected source files downloaded from pinned public commits,
-not full buildable checkouts. The manifest records repository, commit date,
-source URL, file size and SHA-256 digest. Files retain upstream licensing; they are research
-references, not copied into the implementation.
+`upstream/` holds selected source files downloaded from pinned public commits,
+not full buildable checkouts. Only `upstream/manifest.json` is tracked: it
+records repository, commit date, source URL, file size and SHA-256 digest, so
+the copies can be fetched again and verified. The copies themselves are local
+research references (superseded by `bridge/vendor/` and `compositor/pins.json`),
+not copied into the implementation, not shipped and not part of release source
+bundles. They retain upstream licensing.
 
 The Niri manifest declares GPL-3.0-or-later; the included standard license text
 comes from Arch's installed SPDX license collection. IronRDP's MIT/Apache

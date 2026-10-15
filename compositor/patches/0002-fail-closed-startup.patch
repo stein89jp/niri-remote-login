@@ -1,0 +1,174 @@
+From 1401fcec486ef63b13b14d5043c2ef059bef8e83 Mon Sep 17 00:00:00 2001
+From: Niri-RDP rebase <niri-rdp@localhost>
+Date: Thu, 15 Oct 2026 13:17:45 +0900
+Subject: [PATCH 02/12] headless: fail closed at startup and bind wayland-0
+
+A remote headless session with no usable renderer or default output now
+fails State::new instead of showing a black desktop that never captures.
+The headless backend binds the deterministic socket name wayland-0 in its
+broker-owned private runtime directory instead of auto-discovering one.
+
+Niri-RDP feature F1. Tests: backend::headless::remote_tests::
+session_startup_binds_wayland_0_with_default_output and
+session_startup_fails_closed_without_a_renderer.
+---
+ src/backend/headless.rs | 110 ++++++++++++++++++++++++++++++++++++++++
+ src/niri.rs             |  18 +++++--
+ 2 files changed, 123 insertions(+), 5 deletions(-)
+
+diff --git a/src/backend/headless.rs b/src/backend/headless.rs
+index 4034f836..02031095 100644
+--- a/src/backend/headless.rs
++++ b/src/backend/headless.rs
+@@ -247,3 +247,113 @@ impl Default for Headless {
+         Self::new()
+     }
+ }
++
++#[cfg(test)]
++mod remote_tests {
++    use std::error::Error;
++    use std::path::PathBuf;
++    use std::process::Command;
++
++    use calloop::EventLoop;
++    use niri_config::Config;
++    use smithay::reexports::wayland_server::Display;
++
++    use crate::niri::State;
++
++    const CHILD: &str = "NIRI_RDP_HEADLESS_TEST_CHILD";
++
++    /// Reruns `test` in a child process with `env` and a private `XDG_RUNTIME_DIR`.
++    ///
++    /// The environment, EGL and listening sockets are process-wide, so changing them inside the
++    /// parallel test harness would race other tests. Returns `true` in the parent, which has
++    /// then checked the child's result, and `false` in the child, which should run the test body.
++    fn rerun_in_child(test: &str, env: &[(&str, &str)]) -> bool {
++        if std::env::var_os(CHILD).is_some() {
++            return false;
++        }
++
++        let leaf = test.rsplit("::").next().unwrap();
++        let runtime_dir =
++            std::env::temp_dir().join(format!("niri-headless-{}-{leaf}", std::process::id()));
++        std::fs::create_dir(&runtime_dir).unwrap();
++        let status = Command::new(std::env::current_exe().unwrap())
++            .args(["--exact", test, "--nocapture"])
++            .env(CHILD, "1")
++            .env("XDG_RUNTIME_DIR", &runtime_dir)
++            .env_remove("WAYLAND_DISPLAY")
++            .envs(env.iter().copied())
++            .status()
++            .unwrap();
++        std::fs::remove_dir_all(&runtime_dir).unwrap();
++        assert!(status.success(), "{test} failed in its child process");
++        true
++    }
++
++    fn runtime_dir() -> PathBuf {
++        PathBuf::from(std::env::var_os("XDG_RUNTIME_DIR").unwrap())
++    }
++
++    pub(super) fn headless_state(
++        create_wayland_socket: bool,
++    ) -> (EventLoop<'static, State>, Result<State, Box<dyn Error>>) {
++        let event_loop = EventLoop::<State>::try_new().unwrap();
++        let state = State::new(
++            Config::default(),
++            event_loop.handle(),
++            event_loop.get_signal(),
++            Display::new().unwrap(),
++            true,
++            create_wayland_socket,
++            false,
++        );
++        (event_loop, state)
++    }
++
++    #[test]
++    fn session_startup_binds_wayland_0_with_default_output() {
++        if rerun_in_child(
++            "backend::headless::remote_tests::session_startup_binds_wayland_0_with_default_output",
++            &[("LIBGL_ALWAYS_SOFTWARE", "1")],
++        ) {
++            return;
++        }
++
++        let (_event_loop, state) = headless_state(true);
++        let state = state.unwrap();
++        assert_eq!(
++            state.niri.socket_name.as_deref(),
++            Some("wayland-0".as_ref())
++        );
++        assert!(runtime_dir().join("wayland-0").exists());
++        let outputs: Vec<_> = state.niri.global_space.outputs().collect();
++        assert_eq!(outputs.len(), 1);
++        assert_eq!(outputs[0].name(), "HEADLESS-1");
++        let mode = outputs[0].current_mode().unwrap();
++        assert_eq!(mode.size, (1920, 1080).into());
++        assert_eq!(mode.refresh, 60_000);
++    }
++
++    #[test]
++    fn session_startup_fails_closed_without_a_renderer() {
++        // An EGL vendor list with no vendors makes every EGL display unavailable.
++        if rerun_in_child(
++            "backend::headless::remote_tests::session_startup_fails_closed_without_a_renderer",
++            &[
++                (
++                    "__EGL_VENDOR_LIBRARY_FILENAMES",
++                    "/nonexistent/egl-vendor.json",
++                ),
++                ("__EGL_VENDOR_LIBRARY_DIRS", "/nonexistent"),
++            ],
++        ) {
++            return;
++        }
++
++        let (event_loop, state) = headless_state(true);
++        let err = state.err().expect("startup must fail without a renderer");
++        assert!(err.to_string().contains("headless renderer"), "{err}");
++        // Dropping the event loop releases the socket that was bound before the failure.
++        drop(event_loop);
++        assert!(!runtime_dir().join("wayland-0").exists());
++    }
++}
+diff --git a/src/niri.rs b/src/niri.rs
+index 9ed0397a..dac4db30 100644
+--- a/src/niri.rs
++++ b/src/niri.rs
+@@ -800,12 +800,13 @@ impl State {
+ 
+         if headless && create_wayland_socket {
+             if let Backend::Headless(headless) = &mut state.backend {
+-                if let Err(err) = headless.add_renderer() {
+-                    warn!("failed to initialize headless renderer: {err:?}");
+-                }
++                headless
++                    .add_renderer()
++                    .context("failed to initialize headless renderer")?;
+                 headless
+                     .create_virtual_output(&mut state.niri, 1920, 1080, 60)
+-                    .unwrap();
++                    .map_err(anyhow::Error::msg)
++                    .context("failed to create default headless output")?;
+             }
+         }
+ 
+@@ -2700,7 +2701,14 @@ impl Niri {
+             .unwrap();
+ 
+         let socket_name = create_wayland_socket.then(|| {
+-            let socket_source = ListeningSocketSource::new_auto().unwrap();
++            // A remote headless session has a broker-owned private runtime directory.
++            // Bind a deterministic socket there; never discover a local desktop socket.
++            let socket_source = if matches!(backend, Backend::Headless(_)) {
++                ListeningSocketSource::with_name("wayland-0")
++            } else {
++                ListeningSocketSource::new_auto()
++            }
++            .expect("failed to bind Wayland socket");
+             let socket_name = socket_source.socket_name().to_os_string();
+             event_loop
+                 .insert_source(socket_source, move |client, _, state| {
