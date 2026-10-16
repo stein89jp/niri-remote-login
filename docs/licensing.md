@@ -38,22 +38,23 @@ External drivers and the Windows RDP client remain subject to their own terms.
 
 ## Source for the published installer
 
-Release `v1.5.5` carries the `1.5.5-1` installer
-(`niri-remote-login-1.5.5-1-x86_64.pkg.tar.zst`), built from the source tagged
-`v1.5.5`. It includes the compositor rebase onto upstream Niri `main`,
-microphone redirection, image and HTML clipboard, login, PAM and TLS hardening
-and the NVENC tuning, along with the README's author section and MIT copyright
+Release `v1.5.6` carries the `1.5.6-1` installer
+(`niri-remote-login-1.5.6-1-x86_64.pkg.tar.zst`), built from the source tagged
+`v1.5.6`. It adds the headless frame-pacing patch and the delay-based H.264
+frame window to the compositor rebase onto upstream Niri `main`, microphone
+redirection, image and HTML clipboard, login, PAM and TLS hardening and the
+NVENC tuning of 1.5.5, along with the README's author section and MIT copyright
 notice for Rikard Stein.
 
-Download these files from the [release](https://github.com/stein89jp/niri-remote-login/releases/tag/v1.5.5):
+Download these files from the [release](https://github.com/stein89jp/niri-remote-login/releases/tag/v1.5.6):
 
-- [Matching source-build bundle](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.5/niri-remote-login-1.5.5-1.src.tar.gz).
-- [Dependency-source index](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.5/DEPENDENCY-SOURCES.json).
-- [License texts and third-party notices](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.5/THIRD-PARTY-NOTICES.txt).
-- [README with author attribution](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.5/README.md) and [MIT license](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.5/LICENSE), also included in the installer and source bundle.
-- [SHA256SUMS](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.5/SHA256SUMS), covering the installer and these source/notice assets.
+- [Matching source-build bundle](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.6/niri-remote-login-1.5.6-1.src.tar.gz).
+- [Dependency-source index](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.6/DEPENDENCY-SOURCES.json).
+- [License texts and third-party notices](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.6/THIRD-PARTY-NOTICES.txt).
+- [README with author attribution](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.6/README.md) and [MIT license](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.6/LICENSE), also included in the installer and source bundle.
+- [SHA256SUMS](https://github.com/stein89jp/niri-remote-login/releases/download/v1.5.6/SHA256SUMS), covering the installer and these source/notice assets.
 
-The earlier [`v1.5` release](https://github.com/stein89jp/niri-remote-login/releases/tag/v1.5) keeps its `1.5-1` installer with
+The earlier [`v1.5.5`](https://github.com/stein89jp/niri-remote-login/releases/tag/v1.5.5) and [`v1.5`](https://github.com/stein89jp/niri-remote-login/releases/tag/v1.5) releases keep their `1.5.5-1` and `1.5-1` installers, each with
 its own matching source bundle, dependency-source index, notices and checksums.
 
 The source-build bundle is the preserved `makepkg --allsource` output. It contains
@@ -65,7 +66,7 @@ source index records that identity and the source archive's checksum.
 Extract the bundle and build as an unprivileged user on a prepared Arch builder:
 
 ```sh
-tar -xzf niri-remote-login-1.5.5-1.src.tar.gz
+tar -xzf niri-remote-login-1.5.6-1.src.tar.gz
 cd niri-remote-login
 makepkg
 ```
@@ -93,7 +94,8 @@ The principal upstream sources are:
 | FFmpeg upstream | [FFmpeg 9.0.2 source archive](https://ffmpeg.org/releases/ffmpeg-9.0.2.tar.xz). |
 | Arch FFmpeg packaging | [Exact packaging revision `5c4a25f039c060c421a1cd887551d491dff4d55d`](https://gitlab.archlinux.org/archlinux/packaging/packages/ffmpeg/-/tree/5c4a25f039c060c421a1cd887551d491dff4d55d), tagged `2-9.0.2-2`. Its recipe supplies the distribution's source inputs and build configuration. |
 
-These are the current source pins, used by the `1.5.5-1` source bundle. The
+These are the current source pins, used by the `1.5.6-1` source bundle; the
+`1.5.5-1` bundle used the same pins without patch 0013. The
 earlier `1.5-1` source bundle retains the pins it was built from, including Niri `0be60b742762905b7bee1ea67bb5a2fb00859bf0` with two
 maintained patches and Smithay `ff5fa7df392cecfba049ffed55cdaa4e98a8e7ef`.
 The license inventory is unchanged by the rebase.

@@ -1,5 +1,12 @@
 # Validation record
 
+Release `1.5.6-1` (`v1.5.6`) packages the 2026-10-17 graphics frame window
+entry below and the headless frame-pacing patch 0013 recorded in the
+[compositor checkpoint](../compositor/CHECKPOINT.md) on top of `1.5.5-1`. On
+2026-10-17 the user confirmed, after installing a package built from this
+source, that the lag is fixed in Windows 10 mstsc on this host. Lab integration
+for patch 0013 and the remaining 1.5.5 acceptance checks are still pending.
+
 Release `1.5.5-1` (`v1.5.5`) packages the work recorded in the 2026-10-15
 entries below. Their results are automated, namespace, lab and package checks;
 the installed-host Windows 10 mstsc checks for this release are pending in
