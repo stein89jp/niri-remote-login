@@ -3,7 +3,7 @@
 # The bridge needs the rebased compositor series (cursor sessions, no_keymap
 # keyboards); keep this minimum equal to niri-rdp-headless pkgver-pkgrel.
 pkgname=niri-remote-login
-pkgver=1.5.5
+pkgver=1.5.6
 pkgrel=1
 pkgdesc='Niri RDP host bridge and PAM/logind session broker'
 arch=('x86_64')

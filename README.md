@@ -16,10 +16,10 @@ From the directory containing the downloaded package, run:
 
 ```sh
 sudo pacman -Syu
-sudo pacman -U ./niri-remote-login-1.5.5-1-x86_64.pkg.tar.zst
+sudo pacman -U ./niri-remote-login-1.5.6-1-x86_64.pkg.tar.zst
 ```
 
-The example uses version `1.5.5-1`; replace the filename if you downloaded a
+The example uses version `1.5.6-1`; replace the filename if you downloaded a
 different release. Pacman installs the package and its required runtime
 dependencies. Continue with the account authorization and service setup below.
 
@@ -81,7 +81,11 @@ optional host NVIDIA NVENC H.264 encoding is available, with a 60 fps capture
 budget, reusable capture buffers and unchanged-frame suppression. The compositor
 prefers hardware EGL rendering, including NVIDIA, with software fallback.
 
-Version 1.5.5 rebases the compositor onto current upstream Niri and adds
+Version 1.5.6 fixes choppy remote motion. The headless compositor now presents
+frames on a fixed refresh clock and keeps sending frame callbacks while the
+pointer moves, and the H.264 frame window grows with the connection delay
+instead of staying at two frames, which had held internet sessions to about
+20–30 fps. Version 1.5.5 rebased the compositor onto current upstream Niri and added
 microphone redirection, image and HTML clipboard, login-screen time limits with
 per-address backoff, a failed-login lockout private to niri-rdp, automatic TLS
 certificate renewal, a hardened frontend service, a login audit journal and a
