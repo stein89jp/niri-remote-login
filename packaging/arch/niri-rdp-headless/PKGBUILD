@@ -4,7 +4,7 @@
 # niri-rdp-headless>=26.04.remote2-1, so both packages must be upgraded together.
 pkgname=niri-rdp-headless
 pkgver=26.04.remote2
-pkgrel=1
+pkgrel=2
 pkgdesc='Niri main with the rebased PR3953 headless backend for isolated remote-login sessions'
 arch=('x86_64')
 license=('GPL-3.0-or-later')
@@ -23,7 +23,8 @@ _patches=(0001-headless-backend.patch
           0009-unicode-keymap-restore.patch
           0010-remote-input-regressions.patch
           0011-cursor-motion-echo.patch
-          0012-cursor-dnd-icon.patch)
+          0012-cursor-dnd-icon.patch
+          0013-headless-frame-pacing.patch)
 source=("niri-$_revision.tar.gz::https://codeload.github.com/niri-wm/niri/tar.gz/$_revision"
         "${_patches[@]}"
         'collect-licenses.py')
@@ -41,6 +42,7 @@ sha256sums=('d7e8b62923429eba4187990cb94a9466e3df8840632f6302cd1c0fe20fa450d9'
             '@SHA256:0010-remote-input-regressions.patch@'
             '@SHA256:0011-cursor-motion-echo.patch@'
             '@SHA256:0012-cursor-dnd-icon.patch@'
+            '@SHA256:0013-headless-frame-pacing.patch@'
             '@SHA256:collect-licenses.py@')
 
 prepare() {

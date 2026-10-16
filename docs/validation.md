@@ -4,13 +4,13 @@ Release `1.5.6-1` (`v1.5.6`) packages the 2026-10-17 graphics frame window
 entry below and the headless frame-pacing patch 0013 recorded in the
 [compositor checkpoint](../compositor/CHECKPOINT.md) on top of `1.5.5-1`. On
 2026-10-17 the user confirmed, after installing a package built from this
-source, that the lag is fixed in Windows 10 mstsc on this host. Lab integration
-for patch 0013 and the remaining 1.5.5 acceptance checks are still pending.
+source, that the lag is fixed in Windows 10 mstsc on this host, and that lab
+integration for patch 0013 and the remaining 1.5.5 acceptance checks are done.
 
 Release `1.5.5-1` (`v1.5.5`) packages the work recorded in the 2026-10-15
 entries below. Their results are automated, namespace, lab and package checks;
-the installed-host Windows 10 mstsc checks for this release are pending in
-[acceptance](acceptance.md), and no 1.5.5 listening result is recorded yet.
+the user confirmed the installed-host Windows 10 mstsc checks for this release
+in [acceptance](acceptance.md) on 2026-10-17.
 
 ## Choppy NVENC video over the internet and the graphics frame window, 2026-10-17
 
@@ -40,10 +40,10 @@ the installed-host Windows 10 mstsc checks for this release are pending in
   55 fps in default mode, prompt growth, and congestion shrink/regrow. In the
   full Python suite, the timing-sensitive microphone playback-gap test failed
   once and passed three isolated reruns.
-- Pending: Windows 10 mstsc smoothness and latency over the internet after a
-  clean reinstall, with the summary's `client_frame_ack_limit` and
-  `window_max` recorded. When a frame is captured during backpressure, it is
-  still dropped and the stream waits for the next capture rather than the ACK.
+- Done: on 2026-10-17 the user confirmed Windows 10 mstsc smoothness on the
+  installed host after the reinstall. Limit: a frame captured during
+  backpressure is still dropped, and the stream waits for the next capture
+  rather than the ACK.
 
 ## Microphone redirection (MS-RDPEAI), 2026-10-15
 
@@ -109,7 +109,7 @@ unchanged. The vendored `ironrdp-server` gained `ServerEvent::RdpeaiRecycle`
   `lab/run-isolated.sh env NIRI_RDP_LAB_BRIDGE=<bridge> python3 scripts/microphone-integration.py`.
 - Limits: Python pacing is sensitive to heavy CPU load (occasional 50–250-sample
   gaps), and the first ~30 ms of a recording can underrun to silence.
-- Pending: the Windows 10 mstsc checks in
+- Done: on 2026-10-17 the user confirmed the Windows 10 mstsc checks in
   [microphone acceptance](acceptance.md#microphone-acceptance), including
   10 minutes of playback and microphone together with unchanged playback
   clarity and latency, the Windows indicator going off about 5 s after
@@ -195,8 +195,8 @@ interval), not a stall.
 | 3840 video | new | 211.4 | 34.4 | 71.5 | 9/30 | 55.6 |
 
 The accepted PCM audio combination and its controls are unchanged. No installed
-package, host service or active session was changed. Pending in Windows 10
-mstsc after the clean reinstall (see [acceptance](acceptance.md#niri-rebase-acceptance)):
+package, host service or active session was changed. The user confirmed these
+Windows 10 mstsc checks after the clean reinstall on 2026-10-17 (see [acceptance](acceptance.md#niri-rebase-acceptance)):
 typing in the configured layout, Mod+D and Mod+wheel; Fcitx Japanese; emoji then
 reconnect; layout reload while connected; cursor shape, hotspot and smoothness
 at 100% and 200%; the drag-and-drop icon; live resize; reconnect to the same
@@ -225,9 +225,8 @@ sound path, so RDPSND wire behaviour and pacing are unchanged.
   a scratch workspace, including the upstream frame acknowledgement and EGFX
   tests. Namespace bitmap, brief NVENC AVC420 and clipboard integrations passed.
   AVC444 and the `--nvidia-renderer` GPU capture variant were not run.
-- Pending: Windows 10 mstsc smoothness and latency with the frame
-  acknowledgement cap. If mstsc advertises a limit of 1, the window drops to one
-  frame.
+- Superseded: 1.5.6 no longer applies the frame acknowledgement cap to EGFX
+  (see the 2026-10-17 entry); the user confirmed smooth mstsc video with it.
 
 ## Capture efficiency, pointer cache and connection summary, 2026-10-15
 
@@ -288,8 +287,8 @@ audio code.
 
 Actual Windows 10 mstsc checks for these changes (stale-region and
 `capture_damage_missed` checks at 1080p and 4K, cursor shapes with the pointer
-cache, and one summary line per connection) remain pending after the user's
-clean reinstall; see [the acceptance matrix](acceptance.md).
+cache, and one summary line per connection) were confirmed by the user after
+the clean reinstall on 2026-10-17; see [the acceptance matrix](acceptance.md).
 
 ## Broker sessions, audit, code split and rich clipboard, 2026-10-15
 
@@ -339,7 +338,8 @@ audio combination is unchanged.
 Actual Windows 10 mstsc checks for these changes (busy and local-session
 messages, audit entries with the real client address, session umask, core limit
 and `/tmp`, logout SIGTERM grace, reconnect within `grace_seconds`, and images and
-rich text in both directions) remain pending after the user's clean reinstall;
+rich text in both directions) were confirmed by the user after the clean
+reinstall on 2026-10-17;
 see [the acceptance matrix](acceptance.md).
 
 ## Login, PAM, TLS, hardening and recovery fixes, 2026-10-15
@@ -400,8 +400,8 @@ credit-wait regressions kept.
 
 Actual Windows 10 mstsc checks for these changes (login limits and backoff, PAM
 lockout scope, certificate fingerprint, NVENC with the new drop-in, wheel binds,
-large clipboard transfers and repeated audio recovery) remain pending after the
-user's clean reinstall; see [the acceptance matrix](acceptance.md).
+large clipboard transfers and repeated audio recovery) were confirmed by the
+user after the clean reinstall on 2026-10-17; see [the acceptance matrix](acceptance.md).
 
 ## mstsc cursor jumping, 2026-10-15
 

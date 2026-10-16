@@ -22,8 +22,8 @@ under continuous redraws; both fail on the previous code. In a scratch tree
 `cargo test --locked --offline --no-default-features --lib` passed 232 tests
 three times, Clippy `--lib --tests` reported no warnings, and
 `cargo build --release --locked --offline --no-default-features --bin niri`
-succeeded. `upstream/` was not refreshed. Lab integration and the installed
-mstsc smoothness check remain pending.
+succeeded. `upstream/` was not refreshed. On 2026-10-17 the user confirmed lab
+integration and the installed mstsc smoothness check.
 
 ## Current pin and series
 
@@ -61,7 +61,7 @@ Lab integration (capture, input, Fcitx/Mozc, NVIDIA/NVENC, clipboard,
 performance) and the installed Windows checks are PLAN2 Phase 5.
 
 The packages ship the compositor and bridge in lockstep: the combined package
-provides `niri-rdp-headless=26.04.remote2-1`, and the split bridge package
+provides `niri-rdp-headless=26.04.remote2-2` (with patch 0013), and the split bridge package
 depends on `niri-rdp-headless>=26.04.remote2-1`, because the bridge now uses
 cursor sessions and `no_keymap` virtual keyboards and needs patch 0011.
 
