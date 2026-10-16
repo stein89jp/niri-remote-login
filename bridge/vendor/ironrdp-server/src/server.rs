@@ -1,8 +1,6 @@
 use core::cell::RefCell;
 use core::fmt;
 use core::net::{IpAddr, SocketAddr};
-#[cfg(feature = "egfx")]
-use core::num::NonZeroU32;
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use core::time::Duration;
 #[cfg(feature = "usb")]
@@ -85,10 +83,23 @@ use ironrdp_rdpeusb::{InterfaceAlloc, server::UrbdrcControlServer, server::Urbdr
 /// TCP listen backlog size for the RDP server socket.
 const LISTENER_BACKLOG: u32 = 1024;
 
-#[cfg(feature = "egfx")]
-fn client_core_frame_ack_limit(capabilities: &[CapabilitySet]) -> Option<NonZeroU32> {
+/// Last client core Frame Acknowledge capability seen at activation, plus one;
+/// zero when absent. Read by [`take_client_frame_ack_capability`].
+static CLIENT_FRAME_ACK_CAPABILITY: AtomicU32 = AtomicU32::new(0);
+
+/// The client's advertised core Frame Acknowledge `maxUnacknowledgedFrameCount`
+/// from the most recent activation, if any, resetting it for the next
+/// connection. Recorded for logging only: it is not applied to RDPGFX.
+pub fn take_client_frame_ack_capability() -> Option<u32> {
+    match CLIENT_FRAME_ACK_CAPABILITY.swap(0, Ordering::Relaxed) {
+        0 => None,
+        value => Some(value - 1),
+    }
+}
+
+fn advertised_frame_ack_capability(capabilities: &[CapabilitySet]) -> Option<u32> {
     capabilities.iter().find_map(|capability| match capability {
-        CapabilitySet::FrameAcknowledge(capability) => NonZeroU32::new(capability.max_unacknowledged_frame_count),
+        CapabilitySet::FrameAcknowledge(capability) => Some(capability.max_unacknowledged_frame_count),
         _ => None,
     })
 }
@@ -4819,13 +4830,14 @@ impl RdpServer {
             .await?;
         }
 
-        #[cfg(feature = "egfx")]
-        if let Some(gfx_handle) = self.gfx_handle.as_ref() {
-            let mut server = gfx_handle
-                .lock()
-                .map_err(|_| ServerError::reason("graphics server", "GfxServerHandle mutex poisoned"))?;
-            server.set_client_frame_ack_limit(client_core_frame_ack_limit(&result.capabilities));
-        }
+        // The core Frame Acknowledge capability (MS-RDPRFX 2.2.1.3) bounds
+        // surface-command frame markers. RDPGFX has its own FrameAcknowledge
+        // flow control, so do not cap the EGFX window with it: mstsc's value
+        // limited WAN delivery to about two frames per ACK delay. Record it.
+        CLIENT_FRAME_ACK_CAPABILITY.store(
+            advertised_frame_ack_capability(&result.capabilities).map_or(0, |count| count.saturating_add(1)),
+            Ordering::Relaxed,
+        );
         conn.static_channels = result.static_channels;
         conn.client_supports_heartbeat = result
             .client_early_capability_flags
@@ -6666,29 +6678,21 @@ mod cliprdr_error_tests {
     }
 }
 
-#[cfg(all(test, feature = "egfx"))]
+#[cfg(test)]
 mod frame_ack_limit_tests {
     use super::*;
     use ironrdp_pdu::rdp::capability_sets::FrameAcknowledge;
     #[test]
-    fn absent_and_zero_core_limit_are_unconstrained() {
-        assert_eq!(client_core_frame_ack_limit(&[]), None);
-        assert_eq!(
-            client_core_frame_ack_limit(&[CapabilitySet::FrameAcknowledge(FrameAcknowledge {
-                max_unacknowledged_frame_count: 0
-            })]),
-            None
-        );
-    }
-    #[test]
-    fn nonzero_core_limit_is_preserved() {
-        assert_eq!(
-            client_core_frame_ack_limit(&[CapabilitySet::FrameAcknowledge(FrameAcknowledge {
-                max_unacknowledged_frame_count: 1
-            })])
-            .map(NonZeroU32::get),
-            Some(1)
-        );
+    fn advertised_core_limit_is_recorded_including_zero() {
+        assert_eq!(advertised_frame_ack_capability(&[]), None);
+        for count in [0, 2] {
+            assert_eq!(
+                advertised_frame_ack_capability(&[CapabilitySet::FrameAcknowledge(FrameAcknowledge {
+                    max_unacknowledged_frame_count: count
+                })]),
+                Some(count)
+            );
+        }
     }
 }
 

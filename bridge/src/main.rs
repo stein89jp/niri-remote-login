@@ -126,6 +126,8 @@ impl ConnectionHandler for Lifecycle {
             .video
             .as_ref()
             .is_some_and(|video| video.avc444_negotiated());
+        self.stats
+            .set_client_frame_ack(ironrdp_server::take_client_frame_ack_capability());
         (self.emit)(
             &self
                 .stats

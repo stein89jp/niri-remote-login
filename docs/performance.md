@@ -24,9 +24,19 @@ before desktop capture starts.
 | `NIRI_RDP_GOP_SECONDS` | 1–3600, default 30; periodic NVENC IDR safety net. Refresh, resize, resume, frame drops and other recovery points still force IDRs immediately |
 | `NIRI_RDP_GPU_DEVICE` | Optional NVIDIA DRM render node, for example `/dev/dri/renderD128`; otherwise readable render nodes are probed in order. Applies to `auto` GPU capture |
 | `NIRI_RDP_SCALE` | `client` or explicit 1.0–5.0; an explicit value takes precedence over client Display Control scale metadata |
-| `NIRI_RDP_ADAPTIVE_GRAPHICS` | `1` opts into coordinated FPS and a bounded graphics window; `0` (default) retains the established cadence/window while comparisons are collected |
+| `NIRI_RDP_ADAPTIVE_GRAPHICS` | `1` opts into coordinated FPS, which lowers the cadence with the bitrate level (not below 10); `0` (default) keeps the configured FPS. Either way the graphics credit window follows the measured ACK delay (2–8 frames, see below) |
 | `NIRI_RDP_MICROPHONE` | `auto` (default) offers mstsc microphone redirection (MS-RDPEAI `AUDIO_INPUT`, 48 kHz mono PCM preferred, about 0.8 Mbit/s upload while a remote application records); `off` offers no channel. Separate from playback; see [remote microphone](install.md#remote-microphone) |
 | `NIRI_RDP_DIAGNOSTICS` | `1` enables bounded timing/counter reports, including `idr_frames`, `deferred_rate_increase_frames`, `bitrate_level_decreases` and `bitrate_level_increases`; ordinary operation avoids diagnostic aggregation |
+
+H.264 frames are limited by a graphics credit window: frames sent but not yet
+acknowledged by the client. It starts at 2 per graphics context and, on each
+healthy acknowledgement, grows to cover the measured ACK delay at the target
+FPS plus two, at most 8. Congestion shrinks it one frame per 500 ms; after a
+reduction it regrows only after 3 s of healthy delivery and no recent audio
+congestion. The client's core Frame Acknowledge capability (MS-RDPRFX surface
+commands) does not cap it: RDPGFX has its own acknowledgements. Two fixed
+credits limited Windows 10 mstsc over a ~33 ms RTT internet path to about
+20 fps.
 
 GPU capture needs the packaged NVIDIA frontend drop-in described in
 [the installation instructions](install.md#optional-nvidia-encoding). It sets
@@ -66,7 +76,7 @@ ends with one always-on `RDP connection summary` journal line, independent of
 `NIRI_RDP_DIAGNOSTICS`:
 
 ```text
-RDP connection summary peer=192.0.2.10:50123 duration_s=60.0 result=ok video_codec=h264 video_mode=avc420 frames=3600 idr_frames=4 video_avg_kbps=1000 audio_codec=pcm audio_waves=3000 audio_discarded_blocks=5 audio_credit_waits=6 audio_codec_recoveries=7 clipboard_to_client=8 clipboard_from_client=9 clipboard_timeouts=10 clipboard_oversize_drops=11 mic=pcm_48000_mono mic_opens=2 mic_packets=1306 mic_bytes=2507520 mic_dropped=0 mic_errors=0
+RDP connection summary peer=192.0.2.10:50123 duration_s=60.0 result=ok video_codec=h264 video_mode=avc420 frames=3600 idr_frames=4 video_avg_kbps=1000 audio_codec=pcm audio_waves=3000 audio_discarded_blocks=5 audio_credit_waits=6 audio_codec_recoveries=7 clipboard_to_client=8 clipboard_from_client=9 clipboard_timeouts=10 clipboard_oversize_drops=11 mic=pcm_48000_mono mic_opens=2 mic_packets=1306 mic_bytes=2507520 mic_dropped=0 mic_errors=0 client_frame_ack_limit=2 window_max=8 window_avg=7.8
 ```
 
 It records the peer address, duration, `result=ok` or `error`, video codec and
@@ -75,7 +85,11 @@ discarded capture blocks, credit waits and codec recoveries, clipboard transfers
 each way, clipboard timeouts and oversize drops. The microphone fields give the
 recording format (`mic=none` when Windows never recorded), successful opens,
 packets and bytes received, audio frames dropped by the bounded queues, and
-failed or unanswered opens, invalid packets and helper connection errors. `video_codec=bitmap
+failed or unanswered opens, invalid packets and helper connection errors.
+`client_frame_ack_limit` is the client's advertised core Frame Acknowledge
+capability (`none` when absent); it is logged only and does not limit RDPGFX.
+`window_max` and `window_avg` give the largest and mean graphics credit window
+over sent H.264 frames (0 when none were sent). `video_codec=bitmap
 video_mode=none` means no H.264 frames were sent; bitmap frames are not counted.
 The line carries counts, durations and the peer address only: no usernames,
 error text, clipboard content or credentials.

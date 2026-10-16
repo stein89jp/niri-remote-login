@@ -744,7 +744,7 @@ A clipboard message over the size limit is dropped and that paste fails; the
 session continues. Enable clipboard in mstsc Local Resources.
 
 [Performance controls](performance.md) document optional AVC444, GPU capture,
-quality profiles, coordinated graphics cadence/window, total link budget and
+quality profiles, the graphics frame window, coordinated cadence, total link budget and
 diagnostics. Existing speed/AVC420/SHM defaults and the accepted PCM audio controls
 remain the baseline. New audio framing and helper supervision are packaged with
 the frontend; a clean reinstall starts matching components. Audio failure permits

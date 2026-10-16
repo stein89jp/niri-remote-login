@@ -5,6 +5,39 @@ entries below. Their results are automated, namespace, lab and package checks;
 the installed-host Windows 10 mstsc checks for this release are pending in
 [acceptance](acceptance.md), and no 1.5.5 listening result is recorded yet.
 
+## Choppy NVENC video over the internet and the graphics frame window, 2026-10-17
+
+- Finding: on the installed 1.5.5 host, Windows 10 mstsc over the internet
+  (~33 ms TCP RTT, no loss, sender mostly application-limited) felt locked to
+  about 30 fps. The headless output reported 1920x1080 at 60 Hz and the NVENC
+  FPS ceiling was 60. `nvidia-smi encodersessions` measured 18–24 encoded fps
+  while a window was dragged over YouTube playback, at about 3.5–5 Mbit/s,
+  under the 12 Mbit/s ceiling. A local-network Android Windows App session had
+  been smooth.
+- Cause: the graphics credit window stayed at two unacknowledged frames, so
+  delivery was bounded by two frames per ACK delay. It grew only with
+  `NIRI_RDP_ADAPTIVE_GRAPHICS=1`, and since the IronRDP 7b976a6 bump the
+  client's core Frame Acknowledge capability also capped it. Setting
+  `NIRI_RDP_ADAPTIVE_GRAPHICS=1` on the installed host gave no noticeable
+  improvement, consistent with mstsc's advertised value holding the window.
+- Change: activation records but no longer applies the core Frame Acknowledge
+  capability to EGFX (a local `ironrdp-server` change, see its `UPSTREAM`). The
+  window grows by default to the measured ACK delay times the target FPS plus
+  two (2–8), at once on a healthy link and after 3 s of health following a
+  congestion reduction; congestion still shrinks it every 500 ms. Coordinated
+  FPS remains opt-in. The connection summary adds `client_frame_ack_limit`,
+  `window_max` and `window_avg`.
+- Results: bridge `cargo test` (264 unit tests plus integration targets),
+  `make lint`, and the vendored crate's 42 unit tests in a scratch workspace
+  passed. New regressions model 33, 60 and 100 ms ACK delays reaching at least
+  55 fps in default mode, prompt growth, and congestion shrink/regrow. In the
+  full Python suite, the timing-sensitive microphone playback-gap test failed
+  once and passed three isolated reruns.
+- Pending: Windows 10 mstsc smoothness and latency over the internet after a
+  clean reinstall, with the summary's `client_frame_ack_limit` and
+  `window_max` recorded. When a frame is captured during backpressure, it is
+  still dropped and the stream waits for the next capture rather than the ACK.
+
 ## Microphone redirection (MS-RDPEAI), 2026-10-15
 
 `PLAN3` added mstsc **Record from this computer**: the Windows microphone

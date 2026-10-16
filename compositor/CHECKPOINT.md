@@ -3,6 +3,28 @@
 Ownership: `compositor/` and `lab/`. No host package, PAM, service, GNOME, GDM,
 power policy or physical device configuration was changed.
 
+## Headless frame pacing — 2026-10-17
+
+Patch 0013 fixes choppy remote motion. The headless backend restarted its
+simulated vblank timer a full refresh interval after each render, so frames
+lasted 16.7 ms plus render time. Redraws queued while the timer was pending ran
+at once and restarted it, so continuous pointer motion kept it from firing.
+That timer was the only source of headless frame callbacks (headless rendering
+never records primary scanout outputs), leaving applications on the 1 s
+fallback timer while the pointer moved. `render()` now presents at the next
+frame-clock boundary and waits in `WaitingForVBlank`; the timer sends frame
+callbacks for every surface on the output each refresh, then runs the pending
+redraw or animation frame.
+
+Two `tests::remote_input` regressions cover the fixed phase and frame callbacks
+under continuous redraws; both fail on the previous code. In a scratch tree
+(archive plus 0001–0013 with `patch -Np1`, byte-identical to the tested tree)
+`cargo test --locked --offline --no-default-features --lib` passed 232 tests
+three times, Clippy `--lib --tests` reported no warnings, and
+`cargo build --release --locked --offline --no-default-features --bin niri`
+succeeded. `upstream/` was not refreshed. Lab integration and the installed
+mstsc smoothness check remain pending.
+
 ## Current pin and series
 
 PLAN2 rebased the compositor from PR #3953 head `0be60b7` (plus two private
@@ -16,7 +38,7 @@ SHA256 `a3774f2ee8da8ff96a1a7e9c4f795578fb60918724e1a4feb4618375f1809bc6`,
 unchanged by the series. Per-patch hashes are in `pins.json`; the old pin is
 under `previous` there for rollback.
 
-The twelve patches (see [README](README.md)) add 2,815 and remove 66 lines,
+Patches 0001–0012 (see [README](README.md)) add 2,815 and remove 66 lines,
 of which about 1,150 are tests (`src/tests/remote_input.rs`,
 `src/tests/cursor_capture.rs`) and 161 are upstream PR documentation
 (`docs/Virtual-Outputs.md`). Dropped because upstream now provides them: the

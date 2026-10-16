@@ -3,8 +3,8 @@
 This directory pins upstream Niri `main` at
 `fc9e8c425e2267d877a65918f030c86f3c698179` (v26.04 plus later upstream work,
 Smithay `8a270232f1bfc416c781273c98a3f52a812a0bba`) and carries a feature
-series of twelve patches. Patch 0001 is the unmerged headless backend of
-upstream PR #3953 (head `0be60b7`), rebased onto that `main`; patches 0002–0012
+series of thirteen patches. Patch 0001 is the unmerged headless backend of
+upstream PR #3953 (head `0be60b7`), rebased onto that `main`; patches 0002–0013
 are the Niri-RDP features, one per patch, so a future rebase fails per feature.
 See [CHECKPOINT.md](CHECKPOINT.md) for decisions, exact results and remaining
 machine tests, and [pins.json](pins.json) for exact revisions and hashes. The
@@ -25,6 +25,7 @@ pins.json for rollback. The normal Niri executable is not replaced.
 | `0010-remote-input-regressions` | Tests for the bridge's keyboard/pointer contract |
 | `0011-cursor-motion-echo` | Cursor sessions do not echo a client's own virtual-pointer motion |
 | `0012-cursor-dnd-icon` | Cursor captures include the drag-and-drop icon |
+| `0013-headless-frame-pacing` | Fixed-phase simulated vblank; frame callbacks every refresh during redraws |
 
 For a fresh source tree, obtain the archive URL in pins.json, verify its SHA256,
 extract it into a disposable build directory, and apply every file listed in

@@ -117,7 +117,7 @@ prepare() {
       mv "$generated" "$previous/${generated##*/}"
     fi
   done
-  # The ordered 0001-0012 series: rebased PR3953 headless backend, then features.
+  # The ordered 0001-0013 series: rebased PR3953 headless backend, then features.
   local patch_file
   for patch_file in "$srcdir/niri-remote-login-$pkgver"/compositor/patches/*.patch; do
     patch -Np1 -i "$patch_file"

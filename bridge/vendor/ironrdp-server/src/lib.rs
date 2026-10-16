@@ -57,6 +57,7 @@ pub use server::{
     CredentialDecision, CredentialValidationError, CredentialValidator, Credentials, ErrorInfoDisconnectHandle,
     ExactMatchCredentialValidator, PostConnectionAction, RdpServer, RdpServerOptions, RdpServerSecurity, ServerEvent,
     ServerEventSender, StaticChannelFactory, TransportTls, pick_remotefx_entropy_coder,
+    take_client_frame_ack_capability,
 };
 pub use sound::{RdpsndServerHandler, RdpsndServerMessage, SoundServerFactory};
 #[cfg(feature = "usb")]

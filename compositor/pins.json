@@ -6,7 +6,7 @@
     "revision": "fc9e8c425e2267d877a65918f030c86f3c698179",
     "pull_request": 3953,
     "pull_request_head": "0be60b742762905b7bee1ea67bb5a2fb00859bf0",
-    "pull_request_note": "PR 3953 (headless backend, unmerged) is carried rebased onto upstream main as patch 0001; patches 0002-0012 are the Niri-RDP feature series",
+    "pull_request_note": "PR 3953 (headless backend, unmerged) is carried rebased onto upstream main as patch 0001; patches 0002-0013 are the Niri-RDP feature series",
     "archive_url": "https://codeload.github.com/niri-wm/niri/tar.gz/fc9e8c425e2267d877a65918f030c86f3c698179",
     "archive_sha256": "d7e8b62923429eba4187990cb94a9466e3df8840632f6302cd1c0fe20fa450d9",
     "cargo_lock_sha256": "a3774f2ee8da8ff96a1a7e9c4f795578fb60918724e1a4feb4618375f1809bc6",
@@ -25,7 +25,8 @@
       "patches/0009-unicode-keymap-restore.patch",
       "patches/0010-remote-input-regressions.patch",
       "patches/0011-cursor-motion-echo.patch",
-      "patches/0012-cursor-dnd-icon.patch"
+      "patches/0012-cursor-dnd-icon.patch",
+      "patches/0013-headless-frame-pacing.patch"
     ],
     "patched_cargo_lock_sha256": "a3774f2ee8da8ff96a1a7e9c4f795578fb60918724e1a4feb4618375f1809bc6",
     "patch_sha256_by_path": {
@@ -40,7 +41,8 @@
       "patches/0009-unicode-keymap-restore.patch": "19a079c64c2187fa7e00a3f03ac52b47cc9fb9b2d042904caec5c8d34c503044",
       "patches/0010-remote-input-regressions.patch": "a191d5b9a23b00b4a1dff70e109d84be985640c3eacff7721d175fbb0f88499b",
       "patches/0011-cursor-motion-echo.patch": "7e74fa505cd488d548b18720f4020106c61947e5bfbf1a8027beb47c1ec9f14a",
-      "patches/0012-cursor-dnd-icon.patch": "02de8076e29cac46bd7764537159f05abdb5fb065006b96c4fef38e3ec42e339"
+      "patches/0012-cursor-dnd-icon.patch": "02de8076e29cac46bd7764537159f05abdb5fb065006b96c4fef38e3ec42e339",
+      "patches/0013-headless-frame-pacing.patch": "d3b447c296e94d43a8deccbca5da468cf4772251c2bb6bad032d7e8d90e2072b"
     },
     "package_version": "26.04.remote2-1"
   },

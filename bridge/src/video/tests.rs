@@ -1426,8 +1426,9 @@ fn client_frame_ack_ceiling_bounds_the_adaptive_window_through_one_gate() {
     use std::num::NonZeroU32;
     let (mut stream, mut events) = updates(vec![]);
     advertise(&stream.handle, true);
-    // The protocol server applies the core Frame Acknowledge capability at
-    // activation; the bridge's adaptive window stays the configured value.
+    // Activation no longer applies the client's core Frame Acknowledge
+    // capability to EGFX, but any ceiling set on the protocol server still
+    // clamps through the same single gate as the bridge's adaptive window.
     stream
         .handle
         .lock()

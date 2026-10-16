@@ -24,10 +24,10 @@ pub(crate) struct AdaptiveBitrate {
     fps_ceiling: u32,
     window: u32,
     last_window_change: Instant,
+    last_window_reduction: Option<Instant>,
     last_queue: u32,
     last_ack: Option<Instant>,
     last_send: Option<Instant>,
-    send_interval: Option<Duration>,
     joint: bool,
     diagnostics: Telemetry,
     last_audio_congestion: Option<Instant>,
@@ -43,7 +43,7 @@ impl AdaptiveBitrate {
     const BUDGET: Duration = Duration::from_millis(150);
     /// Minimum spacing between bitrate level decreases.
     const REDUCE_INTERVAL: Duration = Duration::from_secs(1);
-    /// The opt-in joint credit window keeps its established reduction pace.
+    /// The credit window keeps its established reduction pace.
     const WINDOW_REDUCE_INTERVAL: Duration = Duration::from_millis(500);
     const RECOVER_INTERVAL: Duration = Duration::from_secs(3);
     /// Healthy acknowledgements required before raising the bitrate a level.
@@ -65,10 +65,10 @@ impl AdaptiveBitrate {
             fps_ceiling: 60,
             window: 2,
             last_window_change: now,
+            last_window_reduction: None,
             last_queue: 0,
             last_ack: None,
             last_send: None,
-            send_interval: None,
             joint: false,
             diagnostics: Telemetry::from_env(),
             last_audio_congestion: None,
@@ -146,8 +146,8 @@ impl AdaptiveBitrate {
         self.last_ack = None;
         self.last_queue = 0;
         self.window = 2;
+        self.last_window_reduction = None;
         self.last_send = None;
-        self.send_interval = None;
     }
     pub(crate) fn audio_congested(&mut self, now: Instant) {
         self.last_audio_congestion = Some(
@@ -183,13 +183,6 @@ impl AdaptiveBitrate {
     }
     pub(crate) fn sent(&mut self, id: u32, now: Instant) {
         if let Some(previous) = self.last_send {
-            let interval = now.saturating_duration_since(previous);
-            if !interval.is_zero() {
-                self.send_interval = Some(
-                    self.send_interval
-                        .map_or(interval, |previous| previous * 3 / 4 + interval / 4),
-                );
-            }
             self.diagnostics
                 .sample("send_cadence", now.saturating_duration_since(previous));
         }
@@ -197,6 +190,7 @@ impl AdaptiveBitrate {
         self.diagnostics.count("sent_frames", 1);
         self.diagnostics
             .count("window_samples", u64::from(self.window));
+        connection().record_window(self.window);
         if !self.suspended {
             // Track the same bounded window configured in the protocol server.
             if self.sent.len() >= self.window as usize {
@@ -208,13 +202,13 @@ impl AdaptiveBitrate {
     }
     fn congested(&mut self, now: Instant) {
         self.healthy_since = None;
-        if self.joint
-            && self.window > 2
+        if self.window > 2
             && now.saturating_duration_since(self.last_window_change)
                 >= Self::WINDOW_REDUCE_INTERVAL
         {
             self.window -= 1;
             self.last_window_change = now;
+            self.last_window_reduction = Some(now);
         }
         if now.saturating_duration_since(self.last_change) >= Self::REDUCE_INTERVAL
             && self.level + 1 < self.levels.len()
@@ -304,26 +298,24 @@ impl AdaptiveBitrate {
             return;
         }
         let healthy = *self.healthy_since.get_or_insert(now);
-        // Allow enough credits for the measured round trip, but never more than
-        // eight. Increase one at a time after a stable interval; congestion
-        // reduces the window and FPS together. No capture queue is introduced.
-        let measured_fps = self
-            .send_interval
-            .filter(|duration| !duration.is_zero())
-            .map_or(self.frame_rate(), |duration| {
-                ((1_000_000 / duration.as_micros().max(1)).clamp(1, u128::from(self.frame_rate())))
-                    as u32
-            });
-        let desired =
-            (elapsed.as_micros() * u128::from(measured_fps) / 1_000_000 + 2).clamp(2, 8) as u32;
-        if self.joint
-            && now.saturating_duration_since(healthy) >= Self::RECOVER_INTERVAL
-            && now.saturating_duration_since(self.last_window_change) >= Self::RECOVER_INTERVAL
+        // Allow enough credits for the measured round trip at the target
+        // cadence, but never more than eight. Two credits cap delivery at two
+        // frames per ACK delay, about 20fps on a 100ms WAN path to mstsc. The
+        // measured send rate is itself window-limited, so size from the target
+        // FPS. Grow at once on a healthy link; after congestion shrank the
+        // window, wait for a stable interval. No capture queue is introduced.
+        let desired = (elapsed.as_micros() * u128::from(self.frame_rate()) / 1_000_000 + 2)
+            .clamp(2, 8) as u32;
+        if desired > self.window
+            && self.last_window_reduction.is_none_or(|at| {
+                now.saturating_duration_since(at) >= Self::RECOVER_INTERVAL
+                    && now.saturating_duration_since(healthy) >= Self::RECOVER_INTERVAL
+            })
             && self
                 .last_audio_congestion
                 .is_none_or(|at| now.saturating_duration_since(at) >= Self::RECOVER_INTERVAL)
         {
-            self.window = self.window.saturating_add(1).min(desired);
+            self.window = desired;
             self.last_window_change = now;
         }
         if self.level > 0
@@ -634,6 +626,12 @@ pub struct ConnectionStats {
     audio_codec: AtomicU8,
     /// Last opened microphone format: rate << 8 | channels, 0 for none.
     microphone: AtomicU32,
+    /// Client core Frame Acknowledge capability plus one, 0 when absent.
+    client_frame_ack: AtomicU32,
+    /// Graphics credit window: largest, and sum/count over sent frames.
+    window_max: AtomicU32,
+    window_sum: AtomicU64,
+    window_sends: AtomicU64,
 }
 impl Default for ConnectionStats {
     fn default() -> Self {
@@ -646,6 +644,10 @@ impl ConnectionStats {
             counters: [const { AtomicU64::new(0) }; Counter::COUNT],
             audio_codec: AtomicU8::new(0),
             microphone: AtomicU32::new(0),
+            client_frame_ack: AtomicU32::new(0),
+            window_max: AtomicU32::new(0),
+            window_sum: AtomicU64::new(0),
+            window_sends: AtomicU64::new(0),
         }
     }
     pub fn add(&self, counter: Counter, value: u64) {
@@ -663,12 +665,31 @@ impl ConnectionStats {
         self.microphone
             .store(rate << 8 | u32::from(channels), Ordering::Relaxed);
     }
+    /// Record the client's advertised core Frame Acknowledge capability
+    /// (MS-RDPRFX maxUnacknowledgedFrameCount). It does not cap RDPGFX.
+    pub fn set_client_frame_ack(&self, advertised: Option<u32>) {
+        self.client_frame_ack.store(
+            advertised.map_or(0, |count| count.saturating_add(1)),
+            Ordering::Relaxed,
+        );
+    }
+    /// Record the graphics credit window in force for one sent frame.
+    pub fn record_window(&self, window: u32) {
+        self.window_max.fetch_max(window, Ordering::Relaxed);
+        self.window_sum
+            .fetch_add(u64::from(window), Ordering::Relaxed);
+        self.window_sends.fetch_add(1, Ordering::Relaxed);
+    }
     /// Read and reset every counter for the next connection.
     pub fn take(&self) -> ConnectionSummary {
         ConnectionSummary {
             counters: std::array::from_fn(|i| self.counters[i].swap(0, Ordering::Relaxed)),
             audio_codec: AudioCodec::from_u8(self.audio_codec.swap(0, Ordering::Relaxed)),
             microphone: self.microphone.swap(0, Ordering::Relaxed),
+            client_frame_ack: self.client_frame_ack.swap(0, Ordering::Relaxed),
+            window_max: self.window_max.swap(0, Ordering::Relaxed),
+            window_sum: self.window_sum.swap(0, Ordering::Relaxed),
+            window_sends: self.window_sends.swap(0, Ordering::Relaxed),
         }
     }
 }
@@ -685,6 +706,10 @@ pub struct ConnectionSummary {
     counters: [u64; Counter::COUNT],
     audio_codec: AudioCodec,
     microphone: u32,
+    client_frame_ack: u32,
+    window_max: u32,
+    window_sum: u64,
+    window_sends: u64,
 }
 impl ConnectionSummary {
     pub fn get(&self, counter: Counter) -> u64 {
@@ -714,7 +739,8 @@ impl ConnectionSummary {
              video_avg_kbps={kbps} audio_codec={} audio_waves={} audio_discarded_blocks={} \
              audio_credit_waits={} audio_codec_recoveries={} clipboard_to_client={} \
              clipboard_from_client={} clipboard_timeouts={} clipboard_oversize_drops={} \
-             mic={} mic_opens={} mic_packets={} mic_bytes={} mic_dropped={} mic_errors={}",
+             mic={} mic_opens={} mic_packets={} mic_bytes={} mic_dropped={} mic_errors={} \
+             client_frame_ack_limit={} window_max={} window_avg={:.1}",
             duration.as_secs_f64(),
             if failed { "error" } else { "ok" },
             self.get(Counter::VideoIdrFrames),
@@ -733,6 +759,12 @@ impl ConnectionSummary {
             self.get(Counter::MicBytes),
             self.get(Counter::MicDropped),
             self.get(Counter::MicErrors),
+            match self.client_frame_ack {
+                0 => "none".into(),
+                value => (value - 1).to_string(),
+            },
+            self.window_max,
+            self.window_sum as f64 / self.window_sends.max(1) as f64,
         )
     }
     fn microphone_name(&self) -> String {
@@ -856,6 +888,10 @@ mod tests {
         }
         stats.set_audio_codec(AudioCodec::Pcm);
         stats.set_microphone_format(48_000, 1);
+        stats.set_client_frame_ack(Some(2));
+        for window in [2, 4, 8, 8] {
+            stats.record_window(window);
+        }
         let summary = stats.take();
         let peer = "192.0.2.10:50123".parse().unwrap();
         assert_eq!(
@@ -865,7 +901,8 @@ mod tests {
              audio_codec=pcm audio_waves=3000 audio_discarded_blocks=5 audio_credit_waits=6 \
              audio_codec_recoveries=7 clipboard_to_client=8 clipboard_from_client=9 \
              clipboard_timeouts=10 clipboard_oversize_drops=11 mic=pcm_48000_mono mic_opens=15 \
-             mic_packets=12 mic_bytes=13 mic_dropped=14 mic_errors=16"
+             mic_packets=12 mic_bytes=13 mic_dropped=14 mic_errors=16 \
+             client_frame_ack_limit=2 window_max=8 window_avg=5.5"
         );
         assert!(
             summary
@@ -879,8 +916,16 @@ mod tests {
         assert!(line.contains(" video_codec=bitmap video_mode=none frames=0 "));
         assert!(line.contains(" video_avg_kbps=0 audio_codec=none "));
         assert!(line.ends_with(
-            " mic=none mic_opens=0 mic_packets=0 mic_bytes=0 mic_dropped=0 mic_errors=0"
+            " mic=none mic_opens=0 mic_packets=0 mic_bytes=0 mic_dropped=0 mic_errors=0 \
+             client_frame_ack_limit=none window_max=0 window_avg=0.0"
         ));
+        stats.set_client_frame_ack(Some(0));
+        assert!(
+            stats
+                .take()
+                .line(peer, Duration::ZERO, false, false)
+                .contains(" client_frame_ack_limit=0 ")
+        );
         stats.set_microphone_format(44_100, 2);
         assert!(
             stats
@@ -1145,12 +1190,86 @@ mod tests {
         assert_eq!(rate.frame_rate(), 30);
         assert_eq!(
             rate.max_frames_in_flight(),
-            2,
-            "sparse source frames need no larger credit window"
+            5,
+            "credits cover the 100ms ACK delay at the 30fps target"
         );
         rate.audio_congested(start + Duration::from_secs(31));
         assert!(rate.frame_rate() < 30);
         assert!(!rate.permits_refinement(start + Duration::from_secs(31)));
+        rate.reset_frames();
+        assert_eq!(rate.max_frames_in_flight(), 2);
+    }
+
+    /// Model a fixed ACK delay at a 60fps source and return frames delivered
+    /// in the final ten seconds of a 30-second run.
+    fn delivered_over_wan(rate: &mut AdaptiveBitrate, start: Instant, ack_ms: u64) -> u32 {
+        let mut flight = VecDeque::new();
+        let (mut id, mut next, mut delivered) = (0, 0, 0);
+        for ms in 0..30_000 {
+            let now = start + Duration::from_millis(ms);
+            while flight.front().is_some_and(|&(_, ack)| ack <= ms) {
+                let (id, _) = flight.pop_front().unwrap();
+                rate.acknowledged(id, 0, now);
+                if ms >= 20_000 {
+                    delivered += 1;
+                }
+            }
+            rate.check_stall(now);
+            if ms >= next && flight.len() < rate.max_frames_in_flight() as usize {
+                rate.sent(id, now);
+                flight.push_back((id, ms + ack_ms));
+                id += 1;
+                next = ms + 17;
+            }
+            assert!(flight.len() <= 8);
+        }
+        delivered
+    }
+
+    #[test]
+    fn default_window_grows_past_two_credits_on_a_healthy_wan_path() {
+        // Two fixed credits measured 18-24fps from Windows 10 mstsc at ~33ms
+        // RTT. Without joint FPS adaptation, the window still follows the
+        // ACK delay so delivery reaches the 60fps target.
+        for ack_ms in [33, 60, 100] {
+            let start = Instant::now();
+            let mut rate = AdaptiveBitrate::new(12_000_000, start);
+            rate.set_frame_rate_ceiling(60);
+            let delivered = delivered_over_wan(&mut rate, start, ack_ms);
+            assert!(rate.max_frames_in_flight() > 2, "{ack_ms}ms");
+            assert!(
+                delivered >= 550,
+                "{ack_ms}ms ACK delay delivered only {delivered} frames in 10s"
+            );
+            assert_eq!(rate.frame_rate(), 60, "FPS coordination stays opt-in");
+        }
+    }
+
+    #[test]
+    fn default_window_grows_promptly_and_congestion_shrinks_it() {
+        let start = Instant::now();
+        let mut rate = AdaptiveBitrate::new(12_000_000, start);
+        rate.set_frame_rate_ceiling(60);
+        rate.sent(0, start);
+        rate.acknowledged(0, 0, start + Duration::from_millis(100));
+        assert_eq!(rate.max_frames_in_flight(), 8, "first healthy ACK sizes it");
+        // A stalled frame shrinks the window one step per reduction interval.
+        rate.sent(1, start + Duration::from_millis(200));
+        rate.check_stall(start + Duration::from_millis(800));
+        assert_eq!(rate.max_frames_in_flight(), 7);
+        rate.check_stall(start + Duration::from_millis(900));
+        assert_eq!(rate.max_frames_in_flight(), 7, "reduction has a cooldown");
+        rate.check_stall(start + Duration::from_millis(1300));
+        assert_eq!(rate.max_frames_in_flight(), 6);
+        // After congestion, a healthy ACK alone does not regrow it at once.
+        rate.sent(2, start + Duration::from_millis(1400));
+        rate.acknowledged(2, 0, start + Duration::from_millis(1500));
+        assert_eq!(rate.max_frames_in_flight(), 6);
+        for (id, ms) in (3..).zip((1600..=5000).step_by(100)) {
+            rate.sent(id, start + Duration::from_millis(ms));
+            rate.acknowledged(id, 0, start + Duration::from_millis(ms + 100));
+        }
+        assert_eq!(rate.max_frames_in_flight(), 8, "stable health regrows it");
         rate.reset_frames();
         assert_eq!(rate.max_frames_in_flight(), 2);
     }
