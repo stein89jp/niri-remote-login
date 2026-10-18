@@ -595,5 +595,6 @@ class AudioRdpInteropTests(unittest.TestCase):
             self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
             self.assertIn("FreeRDP client DSP version:", result.stdout)
             self.assertIn("accepts exact AAC_MS and PCM formats; MS ADPCM is filtered", result.stdout)
+            self.assertIn("FreeRDP accepts 48 kHz mono and stereo PCM", result.stdout)
             self.assertIn("FreeRDP raw AAC decode: reconnect=0", result.stdout)
             self.assertIn("FreeRDP raw AAC decode: reconnect=1", result.stdout)

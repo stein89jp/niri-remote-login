@@ -510,8 +510,8 @@ sudo journalctl -u niri-rdp-frontend | grep "connection summary"
 Each line shows the client address, duration, `result=ok` or `error`, the video
 codec and mode actually used (`video_codec=bitmap` means no H.264 frames were
 sent), frame and IDR counts, average video kbps, the audio codec, waves,
-discarded blocks, credit waits and codec recoveries, clipboard transfers each
-way, timeouts and oversize drops, and the [microphone](#remote-microphone)
+discarded blocks, credit waits, codec recoveries and drift skips, clipboard
+transfers each way, timeouts and oversize drops, and the [microphone](#remote-microphone)
 format, opens, packets, bytes, drops and errors. It contains no usernames, error text, clipboard
 content or credentials; [performance controls](performance.md#configuration)
 describe every field. For example, `audio_codec=pcm` confirms the accepted PCM
@@ -585,10 +585,12 @@ frame rate or ceiling for limited networks; increasing the ceiling can improve
 AVC420 quality when the connection has enough bandwidth. Bitmap fallback does
 not use this bitrate controller.
 
-Audio prefers stereo 48 kHz PCM at about 1.54 Mbps before framing. This restores
-the format that was intelligible on Windows 10 mstsc after continuous static
-was reported with AAC. Clients that do not accept PCM can use stereo AAC-LC at
-96 kbit/s, followed by MS ADPCM. Digital silence is suppressed
+Audio prefers mono 48 kHz PCM at about 768 kbit/s before framing, then stereo
+48 kHz PCM at about 1.54 Mbps, the format that was intelligible on Windows 10
+mstsc after continuous static was reported with AAC. Clients that do not accept
+PCM can use stereo AAC-LC at 96 kbit/s, followed by MS ADPCM. During continuous
+PCM sound, the frontend drops one 20 ms block about every 30 s, preferring a
+quiet moment, so the Windows playback queue cannot keep growing. Digital silence is suppressed
 after a short codec tail. Blocks are paced by their exact sample duration and keep
 recent capture samples when the source or network stalls. Recent, validated
 playback feedback can briefly discard capture to let a client buffer drain.

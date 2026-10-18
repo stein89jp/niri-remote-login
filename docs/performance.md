@@ -1,8 +1,11 @@
 # Performance controls and reproducible validation
 
-The remote desktop keeps one display and bounded latest-frame delivery. The
-accepted audio baseline remains 48 kHz stereo S16LE PCM in 20 ms blocks, with
-both RDPSND timestamps zero. Audio and video measurements use internal monotonic
+The remote desktop keeps one display and bounded latest-frame delivery. Since
+2026-10-18 the audio baseline prefers 48 kHz mono S16LE PCM in 20 ms blocks,
+falling back to the previously accepted stereo PCM, with both RDPSND timestamps
+zero and a periodic 20 ms drift catch-up during continuous PCM sound
+([session audio](../bridge/README.md#session-audio)); Windows listening
+validation of that change is pending. Audio and video measurements use internal monotonic
 time; graphics acknowledgements do not establish physical presentation or an
 audio/video clock.
 
@@ -76,13 +79,14 @@ ends with one always-on `RDP connection summary` journal line, independent of
 `NIRI_RDP_DIAGNOSTICS`:
 
 ```text
-RDP connection summary peer=192.0.2.10:50123 duration_s=60.0 result=ok video_codec=h264 video_mode=avc420 frames=3600 idr_frames=4 video_avg_kbps=1000 audio_codec=pcm audio_waves=3000 audio_discarded_blocks=5 audio_credit_waits=6 audio_codec_recoveries=7 clipboard_to_client=8 clipboard_from_client=9 clipboard_timeouts=10 clipboard_oversize_drops=11 mic=pcm_48000_mono mic_opens=2 mic_packets=1306 mic_bytes=2507520 mic_dropped=0 mic_errors=0 client_frame_ack_limit=2 window_max=8 window_avg=7.8
+RDP connection summary peer=192.0.2.10:50123 duration_s=60.0 result=ok video_codec=h264 video_mode=avc420 frames=3600 idr_frames=4 video_avg_kbps=1000 audio_codec=pcm audio_waves=3000 audio_discarded_blocks=5 audio_credit_waits=6 audio_codec_recoveries=7 audio_drift_skips=0 clipboard_to_client=8 clipboard_from_client=9 clipboard_timeouts=10 clipboard_oversize_drops=11 mic=pcm_48000_mono mic_opens=2 mic_packets=1306 mic_bytes=2507520 mic_dropped=0 mic_errors=0 client_frame_ack_limit=2 window_max=8 window_avg=7.8
 ```
 
 It records the peer address, duration, `result=ok` or `error`, video codec and
 mode, H.264 frames, IDR frames, average H.264 payload kbps, audio codec, waves,
-discarded capture blocks, credit waits and codec recoveries, clipboard transfers
-each way, clipboard timeouts and oversize drops. The microphone fields give the
+discarded capture blocks, credit waits, codec recoveries and drift skips (audible
+20 ms PCM blocks dropped by the periodic drift catch-up, about two per minute of
+continuous sound), clipboard transfers each way, clipboard timeouts and oversize drops. The microphone fields give the
 recording format (`mic=none` when Windows never recorded), successful opens,
 packets and bytes received, audio frames dropped by the bounded queues, and
 failed or unanswered opens, invalid packets and helper connection errors.

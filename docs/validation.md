@@ -12,6 +12,67 @@ entries below. Their results are automated, namespace, lab and package checks;
 the user confirmed the installed-host Windows 10 mstsc checks for this release
 in [acceptance](acceptance.md) on 2026-10-17.
 
+## Growing audio delay, mono PCM and drift skip, 2026-10-18
+
+- Finding: in Windows 10 mstsc over the internet, the user reported audio delay
+  that started near zero and grew steadily during a session. The server-side
+  queues are bounded: four waves in flight, a three-block capture FIFO and a
+  60 ms expiry, with one 20 ms block sent per CLOCK_MONOTONIC tick. mstsc
+  apparently confirms waves on arrival, so the 300 ms render guard almost never
+  fires and buffering inside mstsc is invisible to the server. Below 300 ms there
+  was no drift correction. The client queue grows from clock drift between the
+  Linux clock and the Windows audio device, and from a "jitter ratchet": each
+  network stall (28 credit waits in one 50-minute session) adds permanently to
+  the queue. Only suppressed digital silence let it drain. Stereo PCM, at about
+  1.54 Mbit/s, also used more bandwidth than the video (about 0.9 Mbit/s) on
+  that link.
+- User-approved change: on 2026-10-18 the user explicitly requested two changes
+  to the [protected audio baseline](../CLAUDE.md#preserve-the-working-audio-combination).
+  Everything else in that baseline is unchanged.
+  - **Mono PCM preference.** The offer order is 48 kHz mono PCM (`nChannels` 1,
+    `nAvgBytesPerSec` 96000, `nBlockAlign` 2, `wBitsPerSample` 16), then 48 kHz
+    stereo PCM, then AAC-LC and MS ADPCM. Capture stays stereo, so the stereo and
+    compressed fallbacks are unchanged. When mono is negotiated, the bridge
+    downmixes each frame to (L+R)/2 in i32, rounding halves away from zero; a
+    20 ms block is 1920 wire bytes (about 768 kbit/s).
+  - **Blind drift catch-up for PCM.** After 30 s of continuous sending since
+    the previous skip, or since resuming from silence suppression, one audible
+    20 ms block is dropped. The first block whose mean absolute level is at most
+    328 (about -40 dBFS), or at most a quarter of the recent average, is chosen.
+    If none arrives within 5 s, the next audible block is dropped. Digital
+    silence is never dropped. The next sent block starts with a 5 ms linear
+    crossfade from the dropped block's first frames. The send schedule is
+    unchanged: a queued successor takes the dropped block's tick, otherwise the
+    next block leaves on its normal tick. The skip does not count as capture
+    loss, a credit wait or pressure, and it does not reset codec state. It is
+    disabled for AAC and ADPCM, whose fallback behavior stays byte-identical.
+  - **Logging.** The connection summary adds `audio_drift_skips`. With
+    `NIRI_RDP_DIAGNOSTICS=1`, each skip logs `RDP audio drift skip`. Wave
+    Confirms log the block number, echoed timestamp and first-to-second confirm
+    gap: individually for a stream's first 32 confirmations and first 32 nonzero
+    timestamps, then in `RDP audio confirms` summaries every 5 s. These logs show
+    whether mstsc ever reports real playback time.
+- Automated evidence: `make check` passed: `cargo fmt --check` and Clippy
+  `-D warnings`, 143 Python tests (3 opt-ins skipped), 18 native broker groups,
+  274 bridge library tests (1 ignored) and the integration targets.
+  New Rust regressions cover the offer order and format fields; mono preference
+  with exact (L+R)/2 wire bytes and the client's format index on version 6 and
+  version 8 waves; downmix rounding at `i16::MIN`/`i16::MAX`; skip arming at
+  30 s, quiet preference, a forced skip after 5 s, restart after silence resume,
+  and never dropping digital silence; crossfade continuity; an unchanged send
+  schedule with and without a queued successor in the real worker; the summary
+  counter; and confirm diagnostics. The stereo PCM preference/wire-byte
+  regression now checks stereo as the fallback when mono is not offered. The AAC
+  credit-wait continuity regressions pass unchanged. The prepared FreeRDP
+  fixture also accepts the mono PCM format.
+- Pending: the user's actual Windows 10 mstsc validation. It should cover
+  clarity of mono PCM, inaudible skips, delay staying near its starting value
+  over 30+ minutes of continuous internet playback, and lip-sync. The skip is
+  blind: when mstsc's queue is already at its minimum, a dropped block could
+  briefly underrun it. The change needs the clean
+  [uninstall](uninstall.md)/[install](install.md) cycle before it can be tested.
+  It adds no configuration, so neither document's procedure changes.
+
 ## Choppy NVENC video over the internet and the graphics frame window, 2026-10-17
 
 - Finding: on the installed 1.5.5 host, Windows 10 mstsc over the internet

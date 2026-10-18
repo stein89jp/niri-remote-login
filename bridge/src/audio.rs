@@ -31,6 +31,24 @@ const MAX_CAPTURE_BLOCKS: usize = 3; // At most 64 ms of capture batching/jitter
 const PLAYBACK_BUDGET: Duration = Duration::from_millis(300);
 const CAPTURE_BUDGET: Duration = Duration::from_millis(60);
 const SILENCE_TAIL_BLOCKS: usize = 5; // 100 ms flushes bounded AAC lookahead.
+// Blind clock-drift catch-up for PCM (user-approved 2026-10-18). mstsc confirms
+// waves on arrival, so its playback queue is invisible here; device clock drift
+// and network-stall bursts grow it until silence suppression lets it drain.
+// After this much continuous sending, drop one audible 20 ms block.
+const DRIFT_SKIP_INTERVAL: Duration = Duration::from_secs(30);
+// While armed, wait at most this long for a quiet block, then drop the next one.
+const DRIFT_SKIP_MAX_WAIT: Duration = Duration::from_secs(5);
+// A block is quiet when its mean absolute sample is at most about -40 dBFS...
+const DRIFT_SKIP_QUIET_LEVEL: u32 = 328;
+// ...or at most a quarter (-12 dB) of the recent audible average.
+const DRIFT_SKIP_QUIET_FRACTION: f32 = 0.25;
+// Weight of each audible block in that average: about a 640 ms time constant.
+const DRIFT_SKIP_AVERAGE_WEIGHT: f32 = 1.0 / 32.0;
+// The block after a skip fades in from the dropped block's first 5 ms.
+const DRIFT_SKIP_FADE_FRAMES: usize = 48000 * 5 / 1000;
+// Diagnostics: individual Wave Confirm lines per stream, then 5 s summaries.
+const CONFIRM_DETAIL_LINES: u32 = 32;
+const CONFIRM_REPORT_INTERVAL: Duration = Duration::from_secs(5);
 const CAPTURE_MAGIC: &[u8; 4] = b"NRA1";
 const CAPTURE_HEADER_BYTES: usize = 32;
 
@@ -449,14 +467,18 @@ impl Adpcm {
 }
 
 enum Codec {
-    Pcm,
+    /// Uncompressed 48 kHz S16LE; `mono` downmixes the stereo capture.
+    Pcm {
+        mono: bool,
+    },
     Aac(Aac),
     Adpcm(Adpcm),
 }
 impl Codec {
     fn encode(&mut self, pcm: Vec<u8>) -> anyhow::Result<Option<Vec<u8>>> {
         match self {
-            Self::Pcm => Ok(Some(pcm)),
+            Self::Pcm { mono: false } => Ok(Some(pcm)),
+            Self::Pcm { mono: true } => Ok(Some(downmix_to_mono(&pcm))),
             Self::Aac(encoder) => encoder.encode(&pcm),
             Self::Adpcm(encoder) => encoder.encode(&pcm).map(Some),
         }
@@ -469,15 +491,263 @@ impl Codec {
     }
 }
 
-fn pcm_format() -> AudioFormat {
+/// 48 kHz S16LE PCM with `channels` interleaved channels.
+fn pcm_format_with(channels: u16) -> AudioFormat {
+    let block_align = channels * 2;
     AudioFormat {
         format: WaveFormat::PCM,
-        n_channels: 2,
+        n_channels: channels,
         n_samples_per_sec: 48000,
-        n_avg_bytes_per_sec: 192000,
-        n_block_align: 4,
+        n_avg_bytes_per_sec: 48000 * u32::from(block_align),
+        n_block_align: block_align,
         bits_per_sample: 16,
         data: None,
+    }
+}
+
+/// Preferred since 2026-10-18: half the stereo bandwidth (768 kbit/s).
+fn pcm_mono_format() -> AudioFormat {
+    pcm_format_with(1)
+}
+
+/// The 2026-10-12 accepted stereo format, now the first fallback.
+fn pcm_format() -> AudioFormat {
+    pcm_format_with(2)
+}
+
+fn sample_at(pcm: &[u8], index: usize) -> i32 {
+    i32::from(i16::from_le_bytes([pcm[index * 2], pcm[index * 2 + 1]]))
+}
+
+/// Interleaved stereo S16LE to mono as (L+R)/2. The sum is formed in i32, so
+/// it cannot overflow; halves round to nearest, ties away from zero, which is
+/// symmetric about zero and adds no DC offset. The result always fits i16.
+fn downmix_to_mono(stereo: &[u8]) -> Vec<u8> {
+    stereo
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .flat_map(|frame| {
+            let sum = sample_at(frame, 0) + sample_at(frame, 1);
+            (((sum + sum.signum()) / 2) as i16).to_le_bytes()
+        })
+        .collect()
+}
+
+/// Mean absolute sample of an S16LE block: 0 for digital silence.
+fn block_level(pcm: &[u8]) -> u32 {
+    let samples = pcm.len() / 2;
+    if samples == 0 {
+        return 0;
+    }
+    let sum: u64 = (0..samples)
+        .map(|index| u64::from(sample_at(pcm, index).unsigned_abs()))
+        .sum();
+    (sum / samples as u64) as u32
+}
+
+/// Begin `next` with the leading stereo frames of a dropped block, then blend
+/// linearly into `next`'s own samples. Frame 0 equals the dropped block's first
+/// frame, which continued the previously sent block, so the splice is smooth;
+/// the last faded frame is within one fade step of `next` itself.
+fn crossfade_into(next: &mut [u8], dropped_head: &[u8]) {
+    let frames = (dropped_head.len() / 4).min(next.len() / 4);
+    if frames == 0 {
+        return;
+    }
+    let length = frames as i32;
+    for frame in 0..frames {
+        for channel in 0..2 {
+            let index = frame * 2 + channel;
+            let from = sample_at(dropped_head, index);
+            let to = sample_at(next, index);
+            let step = (to - from) * frame as i32;
+            // Round to nearest; the result lies between `from` and `to`.
+            let blended = from + (step + step.signum() * (length / 2)) / length;
+            next[index * 2..index * 2 + 2].copy_from_slice(&(blended as i16).to_le_bytes());
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkipReason {
+    Quiet,
+    Forced,
+}
+impl SkipReason {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Quiet => "quiet",
+            Self::Forced => "forced",
+        }
+    }
+}
+
+/// Blind catch-up for client playback-queue growth that the server cannot
+/// observe. During continuous audible PCM, drop one 20 ms block roughly every
+/// [`DRIFT_SKIP_INTERVAL`], preferring a quiet one. Silence suppression already
+/// lets the client queue drain, so a resume restarts the interval. A skip is
+/// neither capture loss nor a credit or pressure event: codec state, counters
+/// and the send schedule are untouched; only one block of content is removed.
+#[derive(Debug, Default)]
+struct DriftSkip {
+    /// Start of the current continuous run: first send, resume or last skip.
+    run_start: Option<Instant>,
+    /// Recent mean level of audible sent blocks.
+    average: Option<f32>,
+}
+impl DriftSkip {
+    /// Whether to drop this block instead of sending it. Digital silence is
+    /// never dropped: it belongs to the silence tail and suppression path.
+    fn consider(&mut self, now: Instant, block: &[u8]) -> Option<SkipReason> {
+        let armed_at = self.run_start? + DRIFT_SKIP_INTERVAL;
+        if now < armed_at || block.iter().all(|byte| *byte == 0) {
+            return None;
+        }
+        let level = block_level(block);
+        let quiet = level <= DRIFT_SKIP_QUIET_LEVEL
+            || self
+                .average
+                .is_some_and(|average| level as f32 <= average * DRIFT_SKIP_QUIET_FRACTION);
+        let reason = if quiet {
+            SkipReason::Quiet
+        } else if now >= armed_at + DRIFT_SKIP_MAX_WAIT {
+            SkipReason::Forced
+        } else {
+            return None;
+        };
+        self.run_start = Some(now);
+        Some(reason)
+    }
+    /// A block was sent to the client.
+    fn sent(&mut self, now: Instant, block: &[u8]) {
+        self.run_start.get_or_insert(now);
+        if block.iter().any(|byte| *byte != 0) {
+            let level = block_level(block) as f32;
+            self.average = Some(self.average.map_or(level, |average| {
+                average + (level - average) * DRIFT_SKIP_AVERAGE_WEIGHT
+            }));
+        }
+    }
+    /// Silence suppression stopped sending; the client queue drains.
+    fn suppressed(&mut self) {
+        self.run_start = None;
+    }
+    fn average(&self) -> u32 {
+        self.average.unwrap_or(0.0) as u32
+    }
+}
+
+/// Opt-in Wave Confirm details: does mstsc ever echo real playback time, and
+/// how far apart are its first and second confirmations?
+#[derive(Debug, Default)]
+struct ConfirmDiagnostics {
+    detail_lines: u32,
+    nonzero_lines: u32,
+    first: u64,
+    second: u64,
+    repeat: u64,
+    unmatched: u64,
+    nonzero: u64,
+    last_nonzero: Option<(u8, u16)>,
+    gaps_us: Vec<u64>,
+    last_second: Option<(u8, u16, Duration)>,
+    last_report: Option<Instant>,
+}
+impl ConfirmDiagnostics {
+    fn record(
+        &mut self,
+        number: u8,
+        timestamp: u16,
+        now: Instant,
+        matched: Option<(Duration, Option<Duration>, bool)>,
+    ) {
+        let kind = match matched {
+            None => {
+                self.unmatched += 1;
+                "unmatched"
+            }
+            Some((_, None, _)) => {
+                self.first += 1;
+                "first"
+            }
+            Some((_, Some(gap), false)) => {
+                self.second += 1;
+                if self.gaps_us.len() < 1024 {
+                    self.gaps_us.push(gap.as_micros() as u64);
+                }
+                self.last_second = Some((number, timestamp, gap));
+                "second"
+            }
+            Some((_, Some(_), true)) => {
+                self.repeat += 1;
+                "repeat"
+            }
+        };
+        if timestamp != 0 {
+            self.nonzero += 1;
+            self.last_nonzero = Some((number, timestamp));
+        }
+        let detail = self.detail_lines < CONFIRM_DETAIL_LINES
+            || (timestamp != 0 && self.nonzero_lines < CONFIRM_DETAIL_LINES);
+        if detail {
+            if self.detail_lines < CONFIRM_DETAIL_LINES {
+                self.detail_lines += 1;
+            } else {
+                self.nonzero_lines += 1;
+            }
+            let (elapsed, gap) =
+                matched.map_or((None, None), |(elapsed, gap, _)| (Some(elapsed), gap));
+            eprintln!(
+                "RDP audio confirm: block={number} timestamp={timestamp} kind={kind} sent_ms={} second_gap_ms={}",
+                elapsed.map_or("none".into(), |at| format!(
+                    "{:.1}",
+                    at.as_secs_f64() * 1000.0
+                )),
+                gap.map_or("none".into(), |gap| format!(
+                    "{:.1}",
+                    gap.as_secs_f64() * 1000.0
+                )),
+            );
+        }
+        let began = *self.last_report.get_or_insert(now);
+        if now.saturating_duration_since(began) >= CONFIRM_REPORT_INTERVAL {
+            self.report(now.saturating_duration_since(began));
+            self.last_report = Some(now);
+        }
+    }
+    fn report(&mut self, interval: Duration) {
+        self.gaps_us.sort_unstable();
+        let gap = |index: usize| {
+            self.gaps_us
+                .get(index)
+                .map_or("none".into(), |us| format!("{:.1}", *us as f64 / 1000.0))
+        };
+        let count = self.gaps_us.len();
+        eprintln!(
+            "RDP audio confirms: interval_ms={} first={} second={} repeat={} unmatched={} nonzero_timestamps={} last_nonzero={} second_gap_ms_min={} second_gap_ms_p50={} second_gap_ms_max={} last_second={}",
+            interval.as_millis(),
+            self.first,
+            self.second,
+            self.repeat,
+            self.unmatched,
+            self.nonzero,
+            self.last_nonzero
+                .map_or("none".into(), |(block, ts)| format!("{block}/{ts}")),
+            gap(0),
+            gap(count.saturating_sub(1) / 2),
+            gap(count.saturating_sub(1)),
+            self.last_second
+                .map_or("none".into(), |(block, ts, gap)| format!(
+                    "{block}/{ts}/{:.1}ms",
+                    gap.as_secs_f64() * 1000.0
+                )),
+        );
+        *self = Self {
+            detail_lines: self.detail_lines,
+            nonzero_lines: self.nonzero_lines,
+            ..Self::default()
+        };
     }
 }
 
@@ -507,6 +777,8 @@ struct FlowControl {
     playback_epoch: u64,
     receipt_baseline: Option<Duration>,
     last_render_delay: Duration,
+    /// Present only with `NIRI_RDP_DIAGNOSTICS=1`; observes, never decides.
+    diagnostics: Option<ConfirmDiagnostics>,
 }
 impl FlowControl {
     const HISTORY: usize = 2048;
@@ -644,6 +916,18 @@ impl FlowControl {
                     })
                 })
         };
+        if let Some(diagnostics) = &mut self.diagnostics {
+            let matched = position.map(|position| {
+                let wave = &self.recent[position];
+                (
+                    now.saturating_duration_since(wave.sent_at),
+                    wave.first_confirm_at
+                        .map(|first| now.saturating_duration_since(first)),
+                    wave.playback_confirmed,
+                )
+            });
+            diagnostics.record(number, timestamp, now, matched);
+        }
         let Some(position) = position else {
             return;
         };
@@ -824,8 +1108,9 @@ impl SoundServerFactory for Factory {
             .ok();
         // mstsc advertises compressed formats that have rendered as static in
         // actual Windows playback. Prefer the PCM path verified by listening;
-        // keep compressed codecs for clients that do not accept PCM.
-        let mut formats = vec![pcm_format()];
+        // keep compressed codecs for clients that do not accept PCM. Mono PCM
+        // (user-approved 2026-10-18) halves the 1.54 Mbit/s stereo bandwidth.
+        let mut formats = vec![pcm_mono_format(), pcm_format()];
         if aac.is_some() {
             formats.push(aac_format());
         }
@@ -839,7 +1124,11 @@ impl SoundServerFactory for Factory {
             aac,
             encoder,
             stopped: Arc::new(AtomicBool::new(false)),
-            pending: Arc::new(Mutex::new(FlowControl::default())),
+            pending: Arc::new(Mutex::new(FlowControl {
+                diagnostics: crate::performance::diagnostics_enabled()
+                    .then(ConfirmDiagnostics::default),
+                ..FlowControl::default()
+            })),
             feedback: self
                 .audio
                 .video
@@ -887,7 +1176,9 @@ impl RdpsndServerHandler for Backend {
                     as Box<dyn RdpsndError>
             })?)
         } else {
-            Codec::Pcm
+            Codec::Pcm {
+                mono: format.format().n_channels == 1,
+            }
         };
         self.aac.take();
         self.encoder.take();
@@ -898,13 +1189,18 @@ impl RdpsndServerHandler for Backend {
         };
         let block_duration = Duration::from_secs_f64(block_bytes as f64 / 192000.0);
         eprintln!(
-            "RDP audio {}: {} Hz stereo, {} kbps, {:.2} ms capture blocks",
+            "RDP audio {}: {} Hz {}, {} kbps, {:.2} ms capture blocks",
             match &encoder {
                 Codec::Aac(_) => "AAC-LC",
                 Codec::Adpcm(_) => "MS ADPCM",
-                Codec::Pcm => "PCM",
+                Codec::Pcm { .. } => "PCM",
             },
             format.format().n_samples_per_sec,
+            if format.format().n_channels == 1 {
+                "mono"
+            } else {
+                "stereo"
+            },
             format.format().n_avg_bytes_per_sec * 8 / 1000,
             block_duration.as_secs_f64() * 1000.0,
         );
@@ -912,8 +1208,10 @@ impl RdpsndServerHandler for Backend {
         crate::performance::connection().set_audio_codec(match &encoder {
             Codec::Aac(_) => crate::performance::AudioCodec::Aac,
             Codec::Adpcm(_) => crate::performance::AudioCodec::Adpcm,
-            Codec::Pcm => crate::performance::AudioCodec::Pcm,
+            Codec::Pcm { .. } => crate::performance::AudioCodec::Pcm,
         });
+        // AAC and ADPCM keep their unchanged fallback behavior: no drift skip.
+        let drift_skip_enabled = matches!(encoder, Codec::Pcm { .. });
         let audio = self.audio.clone();
         let sender = self.sender.clone();
         let stopped = self.stopped.clone();
@@ -956,6 +1254,9 @@ impl RdpsndServerHandler for Backend {
                     let mut quiet_capture_blocks = 0usize;
                     let mut feedback_suspended = false;
                     let mut reset_codec = false;
+                    let mut drift = DriftSkip::default();
+                    // Leading frames of a drift-skipped block, faded into the next.
+                    let mut fade_from: Option<Vec<u8>> = None;
                     'capture: while !stopped.load(Ordering::Acquire) {
                         // Keep a small FIFO for normal PipeWire quantum batching
                         // and scheduling jitter. Drop only capture exceeding the
@@ -1050,7 +1351,7 @@ impl RdpsndServerHandler for Backend {
                                 reset_codec = true;
                             }
                         } else if now >= next_send
-                            && let Some((data, captured_at)) = captured.pop_front()
+                            && let Some((mut data, captured_at)) = captured.pop_front()
                         {
                             if let Some(at) = credit_wait_start.take() {
                                 telemetry.sample("credit_wait", now.saturating_duration_since(at));
@@ -1063,6 +1364,33 @@ impl RdpsndServerHandler for Backend {
                                     break;
                                 }
                                 reset_codec = false;
+                                // Lost samples already break continuity.
+                                fade_from = None;
+                            }
+                            if drift_skip_enabled && let Some(reason) = drift.consider(now, &data) {
+                                // Drop this block's content but keep the send
+                                // schedule: a queued successor takes this tick;
+                                // otherwise the next block leaves on arrival.
+                                telemetry.count("drift_skips", 1);
+                                if telemetry.enabled() {
+                                    eprintln!(
+                                        "RDP audio drift skip: reason={} level={} average={} next_block={number} successor={}",
+                                        reason.name(),
+                                        block_level(&data),
+                                        drift.average(),
+                                        if captured.is_empty() { "arriving" } else { "queued" },
+                                    );
+                                }
+                                data.truncate(DRIFT_SKIP_FADE_FRAMES * 4);
+                                fade_from = Some(data);
+                                silent_blocks = 0;
+                                match captured.pop_front() {
+                                    Some((next, _)) => data = next,
+                                    None => continue,
+                                }
+                            }
+                            if let Some(head) = fade_from.take() {
+                                crossfade_into(&mut data, &head);
                             }
                             silent_blocks = if data.iter().all(|sample| *sample == 0) {
                                 silent_blocks.saturating_add(1)
@@ -1077,8 +1405,10 @@ impl RdpsndServerHandler for Backend {
                             // Finish the codec tail, then avoid feeding a silent
                             // Windows playback queue for the entire idle session.
                             if silent_blocks > SILENCE_TAIL_BLOCKS {
+                                drift.suppressed();
                                 continue;
                             }
+                            drift.sent(now, &data);
                             let encode_started = Instant::now();
                             let data = match encoder.encode(data) {
                                 Ok(Some(data)) => data,
@@ -1805,7 +2135,8 @@ mod tests {
     }
 
     #[test]
-    fn pcm_preferred_over_aac_and_adpcm_preserves_signed_stereo_on_both_wave_versions() {
+    fn stereo_pcm_fallback_preferred_over_aac_and_adpcm_preserves_signed_stereo_on_both_wave_versions()
+     {
         for version in [Version::V6, Version::V8] {
             let rig = Rig::new();
             let adpcm = Adpcm::new().unwrap().format.clone();
@@ -1831,7 +2162,7 @@ mod tests {
             let (data, timestamp) = rig.take_wave(&mut receiver);
             assert_eq!(
                 data, expected,
-                "PCM must be selected when the client also accepts AAC and ADPCM"
+                "stereo PCM must be selected when the client accepts AAC and ADPCM but not mono PCM"
             );
             let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
             let bytes = messages[0].encode_unframed_pdu().unwrap();
@@ -2759,10 +3090,537 @@ mod tests {
     #[test]
     fn incompatible_audio_formats_produce_no_sound() {
         let audio = Audio::default();
-        let mut unsupported = pcm();
-        unsupported.n_channels = 1;
+        let mut unsupported = pcm_mono_format();
+        unsupported.n_samples_per_sec = 44100;
         let (server, receiver) = negotiate(&audio, vec![unsupported]);
         assert!(!server.is_ready());
         assert!(receiver.is_empty());
+    }
+
+    fn stereo_block(left: i16, right: i16) -> Vec<u8> {
+        let [l0, l1] = left.to_le_bytes();
+        let [r0, r1] = right.to_le_bytes();
+        [l0, l1, r0, r1].repeat(BLOCK_BYTES / 4)
+    }
+
+    fn frame(pcm: &[u8], index: usize) -> (i32, i32) {
+        (sample_at(pcm, index * 2), sample_at(pcm, index * 2 + 1))
+    }
+
+    #[test]
+    fn mono_pcm_offered_first_then_stereo_pcm_then_compressed_fallbacks_with_exact_fields() {
+        let audio = Audio::default();
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut factory = audio.factory();
+        factory.set_sender(sender);
+        let backend = factory.build_backend();
+        let formats = backend.get_formats();
+        let summary: Vec<_> = formats
+            .iter()
+            .map(|format| {
+                (
+                    format.format,
+                    format.n_channels,
+                    format.n_samples_per_sec,
+                    format.n_avg_bytes_per_sec,
+                    format.n_block_align,
+                    format.bits_per_sample,
+                )
+            })
+            .collect();
+        assert_eq!(
+            summary,
+            [
+                (WaveFormat::PCM, 1, 48000, 96000, 2, 16),
+                (WaveFormat::PCM, 2, 48000, 192000, 4, 16),
+                (WaveFormat::AAC_MS, 2, 44100, 12000, 4, 16),
+                (
+                    WaveFormat::ADPCM,
+                    2,
+                    48000,
+                    (48000 * ADPCM_BLOCK_BYTES / ADPCM_SAMPLES) as u32,
+                    ADPCM_BLOCK_BYTES as u16,
+                    4
+                ),
+            ]
+        );
+        assert_eq!(formats[0].data, None);
+        assert_eq!(formats[1].data, None);
+        // One 20 ms mono block: 960 frames of 2 bytes, half the stereo wire size.
+        let mono = &formats[0];
+        assert_eq!(
+            mono.n_avg_bytes_per_sec / 50 * u32::from(mono.n_block_align) / 2,
+            1920
+        );
+        assert_eq!(downmix_to_mono(&vec![0x35; BLOCK_BYTES]).len(), 1920);
+    }
+
+    #[test]
+    fn mono_pcm_preferred_over_stereo_aac_and_adpcm_downmixes_on_both_wave_versions() {
+        for version in [Version::V6, Version::V8] {
+            let rig = Rig::new();
+            let adpcm = Adpcm::new().unwrap().format.clone();
+            let mut unsupported = pcm_mono_format();
+            unsupported.n_samples_per_sec = 44100;
+            let (mut server, mut receiver) = negotiate_version(
+                &rig.audio,
+                vec![adpcm, pcm(), unsupported, pcm_mono_format(), aac_format()],
+                version,
+            );
+            assert!(server.is_ready());
+            let mut source = rig.attach_pcm();
+            let stereo: Vec<u8> = (0..BLOCK_BYTES / 4)
+                .flat_map(|frame| {
+                    let left = ((-30000 + frame as i32 * 31) as i16).to_le_bytes();
+                    let right = ((20001 - frame as i32 * 37) as i16).to_le_bytes();
+                    [left[0], left[1], right[0], right[1]]
+                })
+                .collect();
+            let expected: Vec<u8> = (0..BLOCK_BYTES / 4)
+                .flat_map(|frame| {
+                    let sum = -30000 + frame as i32 * 31 + 20001 - frame as i32 * 37;
+                    let rounded = (f64::from(sum) / 2.0).round() as i16;
+                    rounded.to_le_bytes()
+                })
+                .collect();
+            assert_eq!(expected.len(), 1920);
+            source.write_all(&stereo).unwrap();
+            let (data, timestamp) = rig.take_wave(&mut receiver);
+            assert_eq!(
+                data, expected,
+                "mono PCM must be selected and carry (L+R)/2 when the client also accepts stereo PCM, AAC and ADPCM"
+            );
+            let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
+            let bytes = messages[0].encode_unframed_pdu().unwrap();
+            match decode(&bytes).unwrap() {
+                ServerAudioOutputPdu::Wave2(wave) => {
+                    assert_eq!(messages.len(), 1);
+                    assert_eq!(wave.timestamp, 0);
+                    assert_eq!(wave.audio_timestamp, 0);
+                    assert_eq!(wave.format_no, 3, "format number indexes the client's list");
+                    assert_eq!(wave.data.as_ref(), expected);
+                }
+                ServerAudioOutputPdu::Wave(info) => {
+                    assert_eq!(messages.len(), 2);
+                    assert_eq!(info.format_no, 3);
+                    assert_eq!(info.timestamp, 0);
+                    assert_eq!(usize::from(info.audio_length), 1920);
+                    let payload = messages[1].encode_unframed_pdu().unwrap();
+                    assert_eq!(payload.len(), 1920);
+                    let mut reconstructed = info.data_prefix.to_vec();
+                    reconstructed.extend_from_slice(&payload[4..]);
+                    assert_eq!(reconstructed, expected);
+                }
+                _ => panic!("expected an audio wave"),
+            }
+            drop(server);
+            assert_eq!(source.read(&mut [0]).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn downmix_rounds_half_away_from_zero_without_overflow_at_extremes() {
+        let cases = [
+            ((i16::MAX, i16::MAX), i16::MAX),
+            ((i16::MIN, i16::MIN), i16::MIN),
+            ((i16::MAX, i16::MIN), -1),
+            ((i16::MIN, i16::MAX), -1),
+            ((i16::MAX, 0), 16384),
+            ((i16::MIN, 0), -16384),
+            ((i16::MAX, i16::MAX - 1), i16::MAX),
+            ((i16::MIN, i16::MIN + 1), i16::MIN),
+            ((0, 0), 0),
+            ((1, 0), 1),
+            ((-1, 0), -1),
+            ((2, 1), 2),
+            ((-2, -1), -2),
+            ((3, 1), 2),
+            ((-3, -1), -2),
+            ((1000, -1000), 0),
+        ];
+        for ((left, right), expected) in cases {
+            let mut stereo = left.to_le_bytes().to_vec();
+            stereo.extend_from_slice(&right.to_le_bytes());
+            assert_eq!(
+                downmix_to_mono(&stereo),
+                expected.to_le_bytes(),
+                "({left} + {right}) / 2"
+            );
+        }
+        // Symmetric rounding: a sign-mirrored signal has a mirrored downmix
+        // and no DC offset.
+        let mut sum = 0i64;
+        for left in (-32767i32..=32767).step_by(97) {
+            for right in [-32767, -12345, -1, 0, 1, 777, 32767] {
+                let pair = |l: i32, r: i32| {
+                    let mut stereo = (l as i16).to_le_bytes().to_vec();
+                    stereo.extend_from_slice(&(r as i16).to_le_bytes());
+                    i64::from(i16::from_le_bytes(
+                        downmix_to_mono(&stereo).try_into().unwrap(),
+                    ))
+                };
+                let positive = pair(left, right);
+                assert_eq!(positive, -pair(-left, -right));
+                sum += positive + pair(-left, -right);
+            }
+        }
+        assert_eq!(sum, 0);
+    }
+
+    /// Feed real-time 20 ms blocks to a skip policy the way the worker does,
+    /// returning the elapsed time and reason of every skip.
+    fn drive_drift(
+        drift: &mut DriftSkip,
+        start: Instant,
+        from: Duration,
+        until: Duration,
+        mut block_at: impl FnMut(Duration) -> Vec<u8>,
+    ) -> Vec<(Duration, SkipReason)> {
+        let mut skips = Vec::new();
+        let mut elapsed = from;
+        while elapsed < until {
+            let now = start + elapsed;
+            let block = block_at(elapsed);
+            match drift.consider(now, &block) {
+                Some(reason) => skips.push((elapsed, reason)),
+                None => drift.sent(now, &block),
+            }
+            elapsed += Duration::from_millis(20);
+        }
+        skips
+    }
+
+    #[test]
+    fn drift_skip_arms_after_thirty_seconds_and_prefers_a_quiet_block() {
+        let start = Instant::now();
+        let mut drift = DriftSkip::default();
+        let loud = stereo_block(12000, -12000);
+        let quiet = stereo_block(200, -200);
+        // Quiet passages before arming are sent normally.
+        let skips = drive_drift(
+            &mut drift,
+            start,
+            Duration::ZERO,
+            Duration::from_secs(30),
+            |at| {
+                if at.as_millis() % 1000 == 0 {
+                    quiet.clone()
+                } else {
+                    loud.clone()
+                }
+            },
+        );
+        assert!(skips.is_empty(), "nothing is dropped before 30 s");
+        // Armed: loud blocks still pass until the first quiet one.
+        let skips = drive_drift(
+            &mut drift,
+            start,
+            Duration::from_secs(30),
+            Duration::from_secs(34),
+            |at| {
+                if at == Duration::from_millis(32_500) {
+                    quiet.clone()
+                } else {
+                    loud.clone()
+                }
+            },
+        );
+        assert_eq!(skips, [(Duration::from_millis(32_500), SkipReason::Quiet)]);
+        // A block well below the recent average is quiet even above -40 dBFS.
+        let relative = stereo_block(2000, -2000);
+        assert!(block_level(&relative) > DRIFT_SKIP_QUIET_LEVEL);
+        let skips = drive_drift(
+            &mut drift,
+            start,
+            Duration::from_secs(34),
+            Duration::from_secs(64),
+            |at| {
+                if at == Duration::from_millis(63_000) {
+                    relative.clone()
+                } else {
+                    loud.clone()
+                }
+            },
+        );
+        assert_eq!(
+            skips,
+            [(Duration::from_millis(63_000), SkipReason::Quiet)],
+            "the next skip arms 30 s after the previous one"
+        );
+    }
+
+    #[test]
+    fn drift_skip_is_forced_after_the_maximum_quiet_wait() {
+        let start = Instant::now();
+        let mut drift = DriftSkip::default();
+        let loud = stereo_block(12000, -12000);
+        let skips = drive_drift(
+            &mut drift,
+            start,
+            Duration::ZERO,
+            Duration::from_secs(80),
+            |_| loud.clone(),
+        );
+        assert_eq!(
+            skips,
+            [
+                (Duration::from_secs(35), SkipReason::Forced),
+                (Duration::from_secs(70), SkipReason::Forced),
+            ],
+            "without a quiet block, skip 5 s after arming and rearm from the skip"
+        );
+    }
+
+    #[test]
+    fn drift_skip_restarts_after_silence_resume_and_never_drops_silence() {
+        let start = Instant::now();
+        let mut drift = DriftSkip::default();
+        assert_eq!(
+            drift.consider(start + Duration::from_secs(100), &stereo_block(1, 1)),
+            None,
+            "nothing is armed before the first send"
+        );
+        let loud = stereo_block(12000, -12000);
+        let quiet = stereo_block(200, -200);
+        let silence = vec![0; BLOCK_BYTES];
+        assert!(
+            drive_drift(
+                &mut drift,
+                start,
+                Duration::ZERO,
+                Duration::from_secs(25),
+                |_| { loud.clone() }
+            )
+            .is_empty()
+        );
+        // Suppression drains the client queue; the interval restarts on resume.
+        drift.suppressed();
+        let resume = Duration::from_secs(26);
+        let skips = drive_drift(
+            &mut drift,
+            start,
+            resume,
+            resume + DRIFT_SKIP_INTERVAL,
+            |_| quiet.clone(),
+        );
+        assert!(
+            skips.is_empty(),
+            "the run restarted at the resume: {skips:?}"
+        );
+        // Armed again, but digital silence (the codec tail) is never dropped,
+        // even though it is the quietest possible block.
+        let armed = start + resume + DRIFT_SKIP_INTERVAL;
+        for offset in [0, 3000, 10_000] {
+            assert_eq!(
+                drift.consider(armed + Duration::from_millis(offset), &silence),
+                None
+            );
+        }
+        assert_eq!(drift.consider(armed, &quiet), Some(SkipReason::Quiet));
+    }
+
+    #[test]
+    fn drift_skip_crossfade_splices_without_a_discontinuity() {
+        // A continuous 441 Hz stereo tone across three blocks; 20 ms is 8.82
+        // cycles, so removing the middle block leaves a large phase jump.
+        let tone = |index: usize, channel: usize| {
+            let phase = 2.0 * std::f64::consts::PI * 441.0 * index as f64 / 48000.0;
+            (20000.0 * (phase + channel as f64).sin()).round() as i16
+        };
+        let frames = BLOCK_BYTES / 4;
+        let block = |number: usize| -> Vec<u8> {
+            (0..frames)
+                .flat_map(|frame| {
+                    let index = number * frames + frame;
+                    let [l0, l1] = tone(index, 0).to_le_bytes();
+                    let [r0, r1] = tone(index, 1).to_le_bytes();
+                    [l0, l1, r0, r1]
+                })
+                .collect()
+        };
+        let (previous, dropped, next) = (block(0), block(1), block(2));
+        let natural_step =
+            (20000.0 * 2.0 * std::f64::consts::PI * 441.0 / 48000.0).ceil() as i32 + 1;
+        let jump = |a: (i32, i32), b: (i32, i32)| (a.0 - b.0).abs().max((a.1 - b.1).abs());
+        let last = frame(&previous, frames - 1);
+        assert!(
+            jump(last, frame(&next, 0)) > natural_step * 5,
+            "without a crossfade the splice clicks"
+        );
+        let mut faded = next.clone();
+        crossfade_into(&mut faded, &dropped[..DRIFT_SKIP_FADE_FRAMES * 4]);
+        assert_eq!(frame(&faded, 0), frame(&dropped, 0));
+        assert!(jump(last, frame(&faded, 0)) <= natural_step);
+        // The fade adds at most (40000 / fade length) to the natural step.
+        let fade_step = 40000 / DRIFT_SKIP_FADE_FRAMES as i32 + 1;
+        for index in 1..frames {
+            assert!(
+                jump(frame(&faded, index - 1), frame(&faded, index)) <= natural_step + fade_step,
+                "discontinuity at frame {index}"
+            );
+        }
+        assert_eq!(
+            faded[DRIFT_SKIP_FADE_FRAMES * 4..],
+            next[DRIFT_SKIP_FADE_FRAMES * 4..],
+            "only the first 5 ms changes"
+        );
+        // Extreme opposite samples stay in range with no wrap: a monotonic
+        // ramp from the dropped extreme to the opposite one.
+        let mut extreme = stereo_block(i16::MIN, i16::MAX);
+        crossfade_into(
+            &mut extreme,
+            &stereo_block(i16::MAX, i16::MIN)[..DRIFT_SKIP_FADE_FRAMES * 4],
+        );
+        assert_eq!(frame(&extreme, 0), (32767, -32768));
+        let extreme_step = 65535 / DRIFT_SKIP_FADE_FRAMES as i32 + 1;
+        for index in 1..frames {
+            let (previous, current) = (frame(&extreme, index - 1), frame(&extreme, index));
+            assert!(current.0 <= previous.0 && current.1 >= previous.1);
+            assert!(jump(previous, current) <= extreme_step);
+        }
+        assert_eq!(frame(&extreme, frames - 1), (-32768, 32767));
+    }
+
+    /// Real-time capture through the worker: each step writes `blocks`, lets
+    /// the worker send what is due, confirms every wave and advances 20 ms.
+    struct LiveStream {
+        rig: Rig,
+        server: RdpsndServer,
+        receiver: Events,
+        source: UnixStream,
+    }
+    impl LiveStream {
+        fn new(format: AudioFormat) -> Self {
+            let rig = Rig::new();
+            let (server, receiver) = negotiate(&rig.audio, vec![format]);
+            let source = rig.attach_pcm();
+            Self {
+                rig,
+                server,
+                receiver,
+                source,
+            }
+        }
+        fn elapsed(&self) -> Duration {
+            *self.rig.clock.elapsed.lock().unwrap()
+        }
+        fn step(&mut self, blocks: &[u8]) -> Vec<(Duration, Vec<u8>)> {
+            self.source.write_all(blocks).unwrap();
+            self.rig.settle();
+            let mut waves = Vec::new();
+            while let Ok(ServerEvent::Rdpsnd(RdpsndServerMessage::Wave(data, timestamp))) =
+                self.receiver.try_recv()
+            {
+                let wave = wave2(&mut self.server, data.clone(), timestamp);
+                confirm(&mut self.server, wave.block_no, 0);
+                waves.push((self.elapsed(), data));
+            }
+            *self.rig.clock.elapsed.lock().unwrap() += Duration::from_millis(20);
+            waves
+        }
+    }
+
+    #[test]
+    fn drift_skip_drops_one_quiet_pcm_block_without_moving_the_send_schedule() {
+        use crate::performance::{Counter, connection};
+        let before = connection().get(Counter::AudioDriftSkips);
+        let mut stream = LiveStream::new(pcm_mono_format());
+        let loud = stereo_block(12000, -11000);
+        let quiet = stereo_block(150, -90);
+        let ms = Duration::from_millis;
+        for step in 0..1500u64 {
+            let waves = stream.step(&loud);
+            assert_eq!(waves.len(), 1, "one wave per tick before arming");
+            assert_eq!(waves[0].0, ms(step * 20));
+        }
+        // Armed at 30 s: the quiet block is dropped. Its successor has not
+        // been captured yet, so it leaves on its own normal tick, faded in
+        // from the dropped block's leading frames.
+        assert!(stream.step(&quiet).is_empty(), "the quiet block is dropped");
+        let mut faded = loud.clone();
+        crossfade_into(&mut faded, &quiet[..DRIFT_SKIP_FADE_FRAMES * 4]);
+        assert_eq!(stream.step(&loud), [(ms(30_020), downmix_to_mono(&faded))]);
+        assert_eq!(stream.step(&loud), [(ms(30_040), downmix_to_mono(&loud))]);
+        assert!(connection().get(Counter::AudioDriftSkips) > before);
+        // Rearmed 30 s after that skip. With backlog, the queued successor
+        // takes the dropped block's own tick: the schedule does not move.
+        while stream.elapsed() < ms(60_000) {
+            let waves = stream.step(&loud);
+            assert_eq!(waves.len(), 1);
+            assert_eq!(
+                waves[0].1,
+                downmix_to_mono(&loud),
+                "no other block is dropped"
+            );
+        }
+        let second = stereo_block(9000, 9000);
+        let burst = [quiet.clone(), second.clone(), loud.clone()].concat();
+        let mut faded = second.clone();
+        crossfade_into(&mut faded, &quiet[..DRIFT_SKIP_FADE_FRAMES * 4]);
+        assert_eq!(stream.step(&burst), [(ms(60_000), downmix_to_mono(&faded))]);
+        assert_eq!(stream.step(&loud), [(ms(60_020), downmix_to_mono(&loud))]);
+        assert_eq!(stream.step(&loud), [(ms(60_040), downmix_to_mono(&loud))]);
+        assert!(connection().get(Counter::AudioDriftSkips) >= before + 2);
+    }
+
+    #[test]
+    fn silence_suppression_restarts_the_drift_interval_and_audio_is_never_skipped_early() {
+        let mut stream = LiveStream::new(pcm());
+        let loud = stereo_block(12000, -11000);
+        let quiet = stereo_block(150, -90);
+        let silence = vec![0; BLOCK_BYTES];
+        let mut sent = Vec::new();
+        // 25 s of sound with a quiet block every second, then suppressed
+        // silence, then 25 s more: 50 s in all but never 30 s continuous.
+        for step in 0..2510u64 {
+            let block = match step {
+                1250..1260 => &silence,
+                _ if step % 50 == 0 => &quiet,
+                _ => &loud,
+            };
+            sent.extend(stream.step(block).into_iter().map(|(_, data)| data));
+        }
+        let quiet_blocks = sent.iter().filter(|data| **data == quiet).count();
+        assert_eq!(quiet_blocks, 50, "every quiet block is delivered");
+        assert_eq!(sent.len(), 2500 + SILENCE_TAIL_BLOCKS);
+        assert!(
+            sent.iter()
+                .all(|data| *data == loud || *data == quiet || *data == silence)
+        );
+    }
+
+    #[test]
+    fn confirm_diagnostics_record_receipt_second_gap_and_echoed_timestamps() {
+        let start = Instant::now();
+        let mut flow = FlowControl {
+            diagnostics: Some(ConfirmDiagnostics::default()),
+            ..FlowControl::default()
+        };
+        flow.sent(0, 0, start);
+        flow.confirm(0, 0, start + Duration::from_millis(3));
+        flow.confirm(0, 0, start + Duration::from_millis(30));
+        flow.confirm(0, 0, start + Duration::from_millis(31));
+        flow.confirm(9, 0, start + Duration::from_millis(32));
+        flow.sent(1, 0, start + Duration::from_millis(40));
+        flow.confirm(1, 77, start + Duration::from_millis(43));
+        let diagnostics = flow.diagnostics.as_ref().unwrap();
+        assert_eq!(
+            (
+                diagnostics.first,
+                diagnostics.second,
+                diagnostics.repeat,
+                diagnostics.unmatched,
+                diagnostics.nonzero
+            ),
+            (2, 1, 1, 1, 1)
+        );
+        assert_eq!(diagnostics.gaps_us, [27_000]);
+        assert_eq!(diagnostics.last_nonzero, Some((1, 77)));
+        assert_eq!(flow.pending, 0, "diagnostics never change credit");
+        // A five-second summary resets the counts but keeps the line budget.
+        flow.confirm(1, 0, start + Duration::from_secs(6));
+        let diagnostics = flow.diagnostics.as_ref().unwrap();
+        assert_eq!((diagnostics.first, diagnostics.second), (0, 0));
+        assert_eq!(diagnostics.detail_lines, 6);
     }
 }

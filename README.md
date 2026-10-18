@@ -93,8 +93,11 @@ per-connection summary line. NVENC sends fewer keyframes, steps its bitrate
 through fixed levels and uses GPU capture by default; capture copies less and
 repeated cursor shapes are cached. Earlier releases added client-local cursor
 motion, damage-aware capture, explicit remote DPI scaling and optional AVC444;
-see [performance controls](docs/performance.md). The accepted 48 kHz stereo PCM
-audio configuration is unchanged. Upgrading from 1.5 needs a fresh remote
+see [performance controls](docs/performance.md). Since 2026-10-18, playback
+prefers 48 kHz mono PCM, with the previously accepted stereo PCM as the first
+fallback, and drops one 20 ms block about every 30 s of continuous sound so the
+delay cannot keep growing; Windows listening validation is pending (see
+[session audio](bridge/README.md#session-audio)). Upgrading from 1.5 needs a fresh remote
 desktop and may need a `.pacnew` merge; see [upgrade](docs/upgrade.md#rebuild-the-installed-combined-package).
 
 The clipboard carries Unicode text, HTML and images in both directions. Files are

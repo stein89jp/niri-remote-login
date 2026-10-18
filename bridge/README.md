@@ -256,11 +256,16 @@ only a broker-authorized versioned PCM capture descriptor, without access to the
 This follows GNOME Remote Login's session-playback model: capture an audio sink
 and send it through RDP ([GNOME implementation](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dvc-audio-playback.c)).
 
-Capture is stereo 48 kHz, signed 16-bit little-endian PCM. The frontend prefers
-this uncompressed format, using 20 ms blocks and about 1.54 Mbit/s before framing.
-Windows 10 mstsc playback was intelligible with PCM, but both compressed offers
-have produced static in actual listening checks. Clients that do not accept PCM
-can use GNOME Remote Login's AAC-LC format: `AAC_MS`, stereo 44.1 kHz at 96 kbit/s,
+Capture is stereo 48 kHz, signed 16-bit little-endian PCM. Since 2026-10-18
+the frontend prefers **48 kHz mono PCM**: it downmixes each stereo frame to
+(L+R)/2, rounding halves away from zero without overflow, and sends 1920 bytes
+per 20 ms block, about 768 kbit/s before framing. The offer order is mono PCM,
+then the previous 48 kHz stereo PCM (about 1.54 Mbit/s), then AAC-LC and MS
+ADPCM; stereo PCM is passed through unchanged. Mono is advertised as
+`WAVE_FORMAT_PCM`, 1 channel, 48000 Hz, 96000 bytes/s, block align 2,
+16 bits per sample. Windows 10 mstsc playback was intelligible with PCM, but
+both compressed offers have produced static in actual listening checks. Clients
+that do not accept PCM can use GNOME Remote Login's AAC-LC format: `AAC_MS`, stereo 44.1 kHz at 96 kbit/s,
 1024 sample frames per raw packet, with no ADTS header or WAVE extra data.
 FFmpeg resamples capture with bounded buffers; encoder lookahead remains below
 two AAC frames. MS ADPCM is the last fallback. No
@@ -286,6 +291,26 @@ permanently mute sound or create an ever-growing delay. Later receipt progress
 also retires missing earlier confirmations. Actual audio congestion reduces
 the live H.264 target even when graphics acknowledgements are healthy or
 suspended; recovery waits for three seconds without audio pressure.
+mstsc confirms waves on arrival, so audio queued inside mstsc is invisible to
+the server. Device clock drift and bursts after network stalls can make that
+queue, and the audio delay, grow during continuous sound; only suppressed
+silence used to let it drain. For PCM, the bridge therefore drops one audible
+20 ms block after 30 s of continuous sending, counted from the previous drop or
+from the latest resume after silence suppression. While this catch-up is armed
+it drops the first quiet block: mean absolute level at most about -40 dBFS, or
+at most a quarter of the recent average level. If no quiet block arrives within
+5 s, it drops the next audible block. Digital silence is never dropped. The
+following block starts with a 5 ms linear crossfade from the dropped block's
+first frames, so the splice does not click. The send schedule is unchanged: a
+queued successor takes the dropped block's tick; otherwise the next block leaves
+on its normal tick when captured. A drop is not counted as capture loss, a
+credit wait or audio pressure, and it does not reset codec state. AAC and MS
+ADPCM fallbacks never drop blocks; their behavior is unchanged. The connection
+summary counts drops in `audio_drift_skips`. With `NIRI_RDP_DIAGNOSTICS=1`, each
+drop logs `RDP audio drift skip`. Wave Confirms log `RDP audio confirm` lines
+for a stream's first 32 confirmations and first 32 nonzero echoed timestamps,
+with block number, echoed timestamp and first-to-second confirmation gap.
+`RDP audio confirms` summaries follow every 5 s.
 The bridge paces blocks by their exact sample duration and retains a three-block
 capture FIFO to absorb ordinary PipeWire batching. Excess backlog drops the
 oldest complete blocks while preserving partial-sample alignment. Capture also
@@ -310,8 +335,11 @@ Disposable compositor mode has no audio backend.
 `python3 -m unittest tests.test_audio -v` runs real private PipeWire playback,
 captures a tone and repeats after reconnect, and verifies AAC and ADPCM
 encode/decode with guarded source buffers. Rust tests negotiate the audio
-formats, verify codec preference and exact signed stereo samples in both
-WaveInfo/Wave and Wave2 PDUs, verify the client's format index, and check
+formats, verify the offer order and mono/stereo format fields, mono preference
+with exact (L+R)/2 samples, stereo fallback with exact signed stereo samples in
+both WaveInfo/Wave and Wave2 PDUs, and the client's format index. They check
+downmix extremes, drift-skip arming, quiet preference, forced drops, restart
+after silence, crossfade continuity and an unchanged send schedule. They also check
 backpressure, long playback feedback, timestamp/block wrapping, healthy sample
 continuity and disconnect cleanup. Installed-service and Windows mstsc sound
 playback remain actual-machine acceptance checks.
@@ -331,7 +359,7 @@ its own `rdp-microphone` thread per helper connection, its own bounded queue,
 its own socket (`audio-in-0`, the optional third descriptor of the
 [broker reply](../broker/README.md#wire-contract-v2)), its own NRM1 framing,
 helper (`session-microphone`) and restart budget, and its own `mic_*` summary
-counters. `audio.rs` and the accepted RDPSND PCM baseline are unchanged.
+counters. The microphone path does not change `audio.rs` or RDPSND playback.
 
 The server offers 16-bit PCM at 48 kHz mono, 48 kHz stereo, 44.1 kHz mono and
 44.1 kHz stereo, in that order, each as WAVE_FORMAT_EXTENSIBLE and plain PCM,

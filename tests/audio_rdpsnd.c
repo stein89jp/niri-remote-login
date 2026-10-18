@@ -42,6 +42,17 @@ static const AUDIO_FORMAT pcm_format = {
     .data = NULL,
 };
 
+static const AUDIO_FORMAT pcm_mono_format = {
+    .wFormatTag = WAVE_FORMAT_PCM,
+    .nChannels = 1,
+    .nSamplesPerSec = 48000,
+    .nAvgBytesPerSec = 96000,
+    .nBlockAlign = 2,
+    .wBitsPerSample = 16,
+    .cbSize = 0,
+    .data = NULL,
+};
+
 static int16_t read_sample(const BYTE *data) {
     return (int16_t)((uint16_t)data[0] | (uint16_t)data[1] << 8);
 }
@@ -79,7 +90,8 @@ static void test_formats(void) {
     assert(read.nAvgBytesPerSec == 12000 && read.nBlockAlign == 4);
     assert(read.wBitsPerSample == 16 && read.cbSize == 0 && read.data == NULL);
     assert(freerdp_dsp_supports_format(&read, FALSE) && "GNOME AAC_MS offer must be accepted");
-    assert(freerdp_dsp_supports_format(&pcm_format, FALSE) && "PCM fallback must be accepted");
+    assert(freerdp_dsp_supports_format(&pcm_mono_format, FALSE) && "preferred mono PCM must be accepted");
+    assert(freerdp_dsp_supports_format(&pcm_format, FALSE) && "stereo PCM fallback must be accepted");
     audio_format_free(&read);
     Stream_Free(wire, TRUE);
 
@@ -92,6 +104,7 @@ static void test_formats(void) {
     adpcm.wBitsPerSample = 4;
     assert(!freerdp_dsp_supports_format(&adpcm, FALSE));
     puts("PASS: FreeRDP accepts exact AAC_MS and PCM formats; MS ADPCM is filtered");
+    puts("PASS: FreeRDP accepts 48 kHz mono and stereo PCM");
 }
 
 static void test_aac_client_decode(void) {
