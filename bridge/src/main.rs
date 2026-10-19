@@ -171,7 +171,8 @@ async fn main() -> anyhow::Result<()> {
     let output = std::env::var("NIRI_RDP_OUTPUT").unwrap_or_else(|_| "HEADLESS-1".into());
     let video = Video::from_env()?;
     let clipboard = niri_rdp_bridge::clipboard::Clipboard::default();
-    let mut audio = niri_rdp_bridge::audio::Audio::default();
+    let mut audio = niri_rdp_bridge::audio::Audio::default()
+        .with_tuning(niri_rdp_bridge::audio::AudioTuning::from_env());
     if let Some(video) = &video {
         audio = audio.with_video(video.clone());
     }

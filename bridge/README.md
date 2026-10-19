@@ -294,20 +294,45 @@ suspended; recovery waits for three seconds without audio pressure.
 mstsc confirms waves on arrival, so audio queued inside mstsc is invisible to
 the server. Device clock drift and bursts after network stalls can make that
 queue, and the audio delay, grow during continuous sound; only suppressed
-silence used to let it drain. For PCM, the bridge therefore drops one audible
-20 ms block after 30 s of continuous sending, counted from the previous drop or
-from the latest resume after silence suppression. While this catch-up is armed
-it drops the first quiet block: mean absolute level at most about -40 dBFS, or
-at most a quarter of the recent average level. If no quiet block arrives within
-5 s, it drops the next audible block. Digital silence is never dropped. The
+silence used to let it drain. For PCM, the bridge therefore drops an audible
+20 ms block when the drop is earned (since 2026-10-20; a blind drop every 30 s
+kept sync but drained the client's jitter cushion and sounded crackly). The
+bridge simulates a client that starts empty, receives each wave when its first
+Wave Confirm arrives and plays it 100 ppm slower than real time, as a slow
+client clock would. Its queue just before each arrival, at the minimum over the
+last one to two seconds and capped at 1 s, estimates the surplus in mstsc's
+queue: stalls followed by bursts of late waves raise it (four transport
+credits bound one burst to about 80 ms less the round trip), sending gaps lower
+it, and capture discarded as stale or under pressure was never sent, so it earns
+nothing. Because mstsc may rebuild a larger queue after running dry, which
+receipts cannot show, the model's running dry for at least 100 ms within a sound
+run (a likely underrun) adds 20 ms of starvation credit, at most once per 30 s,
+which is never faster than the former blind 667 ppm. A drop that the observed
+queue cannot absorb uses that credit. A drop needs a surplus of at least a 60 ms jitter reserve plus 20 ms,
+and at least 10 s since the previous drop or since sound started or resumed;
+silence suppression empties the estimate and the credit, and receipts of waves
+sent before it are ignored. Steady audio earns only the drift allowance: 20 ms
+per 200 s at the default 100 ppm, so its first drop comes after about 800 s of
+continuous sound. Two frontend settings, read once at startup and defaulting to
+this baseline, tune it: `NIRI_RDP_AUDIO_DRIFT_PPM` (0–2000, default 100) sets
+the allowance, and `NIRI_RDP_AUDIO_CHANNELS=stereo` removes mono from the PCM
+offer so stereo PCM is preferred (default `mono`); invalid values warn and keep
+the default. The `RDP audio PCM` start line reports `channels`, `drift_ppm` and
+whether the drift skip is on. While armed, the catch-up drops the first quiet block: mean
+absolute level at most about -40 dBFS, or at most a quarter of the recent
+average level. If no quiet block arrives within 5 s, it drops the next audible
+block. Digital silence is never dropped. The
 following block starts with a 5 ms linear crossfade from the dropped block's
 first frames, so the splice does not click. The send schedule is unchanged: a
 queued successor takes the dropped block's tick; otherwise the next block leaves
 on its normal tick when captured. A drop is not counted as capture loss, a
 credit wait or audio pressure, and it does not reset codec state. AAC and MS
 ADPCM fallbacks never drop blocks; their behavior is unchanged. The connection
-summary counts drops in `audio_drift_skips`. With `NIRI_RDP_DIAGNOSTICS=1`, each
-drop logs `RDP audio drift skip`. Wave Confirms log `RDP audio confirm` lines
+summary counts drops in `audio_drift_skips`, and model starvations and their
+total length in `audio_model_starvations` and `audio_model_starved_ms`. With
+`NIRI_RDP_DIAGNOSTICS=1`, each drop logs `RDP audio drift skip`, including the
+surplus it relied on as `earned_ms`, which the 5 s `RDP audio confirms`
+summaries also report. Wave Confirms log `RDP audio confirm` lines
 for a stream's first 32 confirmations and first 32 nonzero echoed timestamps,
 with block number, echoed timestamp and first-to-second confirmation gap.
 `RDP audio confirms` summaries follow every 5 s.
@@ -338,8 +363,13 @@ encode/decode with guarded source buffers. Rust tests negotiate the audio
 formats, verify the offer order and mono/stereo format fields, mono preference
 with exact (L+R)/2 samples, stereo fallback with exact signed stereo samples in
 both WaveInfo/Wave and Wave2 PDUs, and the client's format index. They check
-downmix extremes, drift-skip arming, quiet preference, forced drops, restart
-after silence, crossfade continuity and an unchanged send schedule. They also check
+downmix extremes, the earned surplus (drift allowance only for steady audio,
+burst credit above the reserve, starvation credit at most once per 30 s and
+never across silence suppression or for AAC/ADPCM, no credit for discarded
+capture, return-path batching, the cap and the reset at silence suppression),
+the audio settings' parsing, stereo preference with `NIRI_RDP_AUDIO_CHANNELS`, drift-skip arming and spacing, quiet preference,
+forced drops, restart after silence, crossfade continuity and an unchanged send
+schedule. They also check
 backpressure, long playback feedback, timestamp/block wrapping, healthy sample
 continuity and disconnect cleanup. Installed-service and Windows mstsc sound
 playback remain actual-machine acceptance checks.

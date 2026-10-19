@@ -557,8 +557,12 @@ pub enum Counter {
     AudioDiscardedBlocks,
     AudioCreditWaits,
     AudioCodecRecoveries,
-    /// Audible 20 ms PCM blocks dropped by the periodic clock-drift catch-up.
+    /// Audible 20 ms PCM blocks dropped by the earned clock-drift catch-up.
     AudioDriftSkips,
+    /// PCM arrival-model runs dry of at least 100 ms: likely client underruns.
+    AudioModelStarvations,
+    /// Total length of those runs dry, in milliseconds.
+    AudioModelStarvedMs,
     ClipboardToClient,
     ClipboardFromClient,
     ClipboardTimeouts,
@@ -575,7 +579,7 @@ pub enum Counter {
     MicErrors,
 }
 impl Counter {
-    const COUNT: usize = 17;
+    const COUNT: usize = 19;
     /// Diagnostics counters that also feed the summary, so the opt-in
     /// telemetry and the always-on line share one increment site.
     fn from_telemetry(name: &str) -> Option<Self> {
@@ -741,6 +745,7 @@ impl ConnectionSummary {
              video_codec={codec} video_mode={mode} frames={frames} idr_frames={} \
              video_avg_kbps={kbps} audio_codec={} audio_waves={} audio_discarded_blocks={} \
              audio_credit_waits={} audio_codec_recoveries={} audio_drift_skips={} \
+             audio_model_starvations={} audio_model_starved_ms={} \
              clipboard_to_client={} clipboard_from_client={} clipboard_timeouts={} clipboard_oversize_drops={} \
              mic={} mic_opens={} mic_packets={} mic_bytes={} mic_dropped={} mic_errors={} \
              client_frame_ack_limit={} window_max={} window_avg={:.1}",
@@ -753,6 +758,8 @@ impl ConnectionSummary {
             self.get(Counter::AudioCreditWaits),
             self.get(Counter::AudioCodecRecoveries),
             self.get(Counter::AudioDriftSkips),
+            self.get(Counter::AudioModelStarvations),
+            self.get(Counter::AudioModelStarvedMs),
             self.get(Counter::ClipboardToClient),
             self.get(Counter::ClipboardFromClient),
             self.get(Counter::ClipboardTimeouts),
@@ -883,6 +890,8 @@ mod tests {
             (Counter::AudioCreditWaits, 6),
             (Counter::AudioCodecRecoveries, 7),
             (Counter::AudioDriftSkips, 17),
+            (Counter::AudioModelStarvations, 18),
+            (Counter::AudioModelStarvedMs, 1900),
             (Counter::ClipboardToClient, 8),
             (Counter::ClipboardFromClient, 9),
             (Counter::ClipboardTimeouts, 10),
@@ -909,7 +918,8 @@ mod tests {
             "RDP connection summary peer=192.0.2.10:50123 duration_s=60.0 result=ok \
              video_codec=h264 video_mode=avc420 frames=3600 idr_frames=4 video_avg_kbps=1000 \
              audio_codec=pcm audio_waves=3000 audio_discarded_blocks=5 audio_credit_waits=6 \
-             audio_codec_recoveries=7 audio_drift_skips=17 clipboard_to_client=8 \
+             audio_codec_recoveries=7 audio_drift_skips=17 audio_model_starvations=18 \
+             audio_model_starved_ms=1900 clipboard_to_client=8 \
              clipboard_from_client=9 clipboard_timeouts=10 clipboard_oversize_drops=11 mic=pcm_48000_mono mic_opens=15 \
              mic_packets=12 mic_bytes=13 mic_dropped=14 mic_errors=16 \
              client_frame_ack_limit=2 window_max=8 window_avg=5.5"
@@ -925,9 +935,10 @@ mod tests {
         let line = next.line(peer, Duration::ZERO, false, true);
         assert!(line.contains(" video_codec=bitmap video_mode=none frames=0 "));
         assert!(line.contains(" video_avg_kbps=0 audio_codec=none "));
-        assert!(
-            line.contains(" audio_codec_recoveries=0 audio_drift_skips=0 clipboard_to_client=0 ")
-        );
+        assert!(line.contains(
+            " audio_codec_recoveries=0 audio_drift_skips=0 audio_model_starvations=0 \
+                 audio_model_starved_ms=0 clipboard_to_client=0 "
+        ));
         assert!(line.ends_with(
             " mic=none mic_opens=0 mic_packets=0 mic_bytes=0 mic_dropped=0 mic_errors=0 \
              client_frame_ack_limit=none window_max=0 window_avg=0.0"

@@ -31,11 +31,31 @@ const MAX_CAPTURE_BLOCKS: usize = 3; // At most 64 ms of capture batching/jitter
 const PLAYBACK_BUDGET: Duration = Duration::from_millis(300);
 const CAPTURE_BUDGET: Duration = Duration::from_millis(60);
 const SILENCE_TAIL_BLOCKS: usize = 5; // 100 ms flushes bounded AAC lookahead.
-// Blind clock-drift catch-up for PCM (user-approved 2026-10-18). mstsc confirms
-// waves on arrival, so its playback queue is invisible here; device clock drift
-// and network-stall bursts grow it until silence suppression lets it drain.
-// After this much continuous sending, drop one audible 20 ms block.
-const DRIFT_SKIP_INTERVAL: Duration = Duration::from_secs(30);
+// Earned clock-drift catch-up for PCM (mono PCM and a skip user-approved
+// 2026-10-18; the blind 30 s skip replaced by this on the user's request
+// 2026-10-20). mstsc confirms waves on arrival, so its playback queue is
+// invisible here. A 20 ms block is dropped only when the estimated surplus in
+// that queue (see `ArrivalModel`) exceeds a jitter reserve by one block.
+const BLOCK_DURATION: Duration = Duration::from_millis(20);
+// Never drop the last 60 ms of estimated surplus: it absorbs network jitter.
+const DRIFT_SKIP_RESERVE: Duration = Duration::from_millis(60);
+// The surplus estimate saturates here, bounding catch-up after a long stall.
+const DRIFT_SKIP_EARNED_CAP: Duration = Duration::from_secs(1);
+// Default unobservable client-clock drift allowance: 20 ms per 200 s of
+// sound. `NIRI_RDP_AUDIO_DRIFT_PPM` overrides it within 0..=MAX_DRIFT_PPM.
+const DRIFT_ALLOWANCE_PPM: u32 = 100;
+const MAX_DRIFT_PPM: u32 = 2000;
+// The model running dry this long is a likely client underrun. mstsc may then
+// rebuild a larger queue that receipts cannot show (the pre-2026-10-18 growth
+// that followed credit waits), so each such starvation earns one block...
+const STARVATION_MIN: Duration = Duration::from_millis(100);
+const STARVATION_CREDIT: Duration = BLOCK_DURATION;
+// ...at most once per 30 s: never faster than the former blind 667 ppm.
+const STARVATION_CREDIT_SPACING: Duration = Duration::from_secs(30);
+// The estimate is the lowest surplus over the last one to two such windows.
+const ARRIVAL_LOW_WATER_WINDOW: Duration = Duration::from_secs(1);
+// Minimum time between skips, and from the start or resume of a sound run.
+const DRIFT_SKIP_MIN_SPACING: Duration = Duration::from_secs(10);
 // While armed, wait at most this long for a quiet block, then drop the next one.
 const DRIFT_SKIP_MAX_WAIT: Duration = Duration::from_secs(5);
 // A block is quiet when its mean absolute sample is at most about -40 dBFS...
@@ -583,27 +603,222 @@ impl SkipReason {
     }
 }
 
-/// Blind catch-up for client playback-queue growth that the server cannot
-/// observe. During continuous audible PCM, drop one 20 ms block roughly every
-/// [`DRIFT_SKIP_INTERVAL`], preferring a quiet one. Silence suppression already
-/// lets the client queue drain, so a resume restarts the interval. A skip is
-/// neither capture loss nor a credit or pressure event: codec state, counters
-/// and the send schedule are untouched; only one block of content is removed.
+/// Server-side estimate of the surplus in the client's playback queue: audio
+/// it holds beyond what just-in-time delivery would need. It simulates a client
+/// that starts with an empty queue, plays each block in 20 ms plus the drift
+/// allowance (a client clock that slow), pauses when empty and receives each
+/// wave when its first Wave Confirm arrives. mstsc appears to confirm on
+/// arrival, so this replays the jitter ratchet: after a stall, waves sent late
+/// arrive together, and the client keeps the excess queued. (A client
+/// confirming at playback would give smooth receipts: only the allowance.)
+///
+/// Only waves actually sent can be confirmed. Capture discarded as stale or
+/// under pressure is never credited, and a sending gap (credit wait, worker
+/// stall, late capture, a skip without a queued successor) drains the estimate
+/// as it would the real queue. Sub-block schedule catch-up only refills what a
+/// preceding gap drained. The queue estimate is the lowest queue seen just
+/// before an arrival over the last one to two [`ARRIVAL_LOW_WATER_WINDOW`]s, so
+/// clumped confirmations do not count as surplus. Four transport credits bound
+/// one stall's burst to 80 ms less the round trip. Growth that receipts cannot
+/// show is covered by the drift allowance and by a starvation credit: one block
+/// when the model runs dry for [`STARVATION_MIN`], at most once per
+/// [`STARVATION_CREDIT_SPACING`], held until a skip uses it or silence.
+#[derive(Debug)]
+struct ArrivalModel {
+    /// PCM only: compressed fallbacks never skip, so they never feed it.
+    enabled: bool,
+    drift_ppm: u32,
+    /// Waves sent before the latest silence suppression are not counted.
+    since: Option<Instant>,
+    /// When the simulated client would run out of received audio.
+    play_end: Option<Instant>,
+    window_start: Option<Instant>,
+    window_low: Duration,
+    previous_low: Option<Duration>,
+    /// Starvation credit not yet used by a skip.
+    hidden: Duration,
+    last_starvation_credit: Option<Instant>,
+}
+impl Default for ArrivalModel {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            drift_ppm: DRIFT_ALLOWANCE_PPM,
+            since: None,
+            play_end: None,
+            window_start: None,
+            window_low: Duration::ZERO,
+            previous_low: None,
+            hidden: Duration::ZERO,
+            last_starvation_credit: None,
+        }
+    }
+}
+impl ArrivalModel {
+    /// Whether a wave sent at `sent_at` belongs to the current sound run.
+    fn counts(&self, sent_at: Instant) -> bool {
+        self.enabled && self.since.is_none_or(|since| sent_at >= since)
+    }
+    /// `blocks` waves were first confirmed at `now`. Returns how long the
+    /// model had run dry when that was at least [`STARVATION_MIN`].
+    fn received(&mut self, now: Instant, blocks: u32) -> Option<Duration> {
+        if blocks == 0 {
+            return None;
+        }
+        let starved = self
+            .play_end
+            .map(|end| now.saturating_duration_since(end))
+            .filter(|starved| *starved >= STARVATION_MIN);
+        if starved.is_some()
+            && self
+                .last_starvation_credit
+                .is_none_or(|at| now >= at + STARVATION_CREDIT_SPACING)
+        {
+            self.hidden = (self.hidden + STARVATION_CREDIT).min(DRIFT_SKIP_EARNED_CAP);
+            self.last_starvation_credit = Some(now);
+        }
+        let queued = self
+            .play_end
+            .map_or(Duration::ZERO, |end| end.saturating_duration_since(now))
+            .min(DRIFT_SKIP_EARNED_CAP);
+        match self.window_start {
+            Some(start) if now < start + ARRIVAL_LOW_WATER_WINDOW => {
+                self.window_low = self.window_low.min(queued);
+            }
+            started => {
+                if started.is_some() {
+                    self.previous_low = Some(self.window_low);
+                }
+                self.window_start = Some(now);
+                self.window_low = queued;
+            }
+        }
+        let per_block = BLOCK_DURATION + BLOCK_DURATION * self.drift_ppm / 1_000_000;
+        self.play_end = Some(now + queued + per_block * blocks);
+        starved
+    }
+    /// Observed queue surplus: zero until one full window has been seen.
+    fn queue_low(&self) -> Duration {
+        self.previous_low
+            .map_or(Duration::ZERO, |previous| previous.min(self.window_low))
+    }
+    /// Estimated surplus: observed queue plus unused starvation credit.
+    fn earned(&self) -> Duration {
+        (self.queue_low() + self.hidden).min(DRIFT_SKIP_EARNED_CAP)
+    }
+    /// A block was dropped. Without a queued successor its gap shows in later
+    /// receipts, but only as far as the observed queue reaches; the rest is
+    /// charged to the starvation credit.
+    fn skipped(&mut self) {
+        let unobserved = BLOCK_DURATION.saturating_sub(self.queue_low());
+        self.hidden = self.hidden.saturating_sub(unobserved);
+    }
+    /// Silence suppression stopped sending: the client queue drains to empty.
+    fn reset(&mut self, now: Instant) {
+        *self = Self {
+            enabled: self.enabled,
+            drift_ppm: self.drift_ppm,
+            since: Some(now),
+            last_starvation_credit: self.last_starvation_credit,
+            ..Self::default()
+        };
+    }
+}
+
+/// Playback tuning, read once at frontend startup from the environment that
+/// `/etc/niri-rdp/frontend.conf` supplies. The defaults are the accepted
+/// baseline; invalid values warn and keep the default.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct AudioTuning {
+    /// `NIRI_RDP_AUDIO_DRIFT_PPM`: drift allowance, 0..=2000, default 100.
+    pub drift_ppm: u32,
+    /// `NIRI_RDP_AUDIO_CHANNELS`: `mono` (default) offers mono PCM first;
+    /// `stereo` removes it, so stereo PCM is preferred.
+    pub mono: bool,
+}
+impl Default for AudioTuning {
+    fn default() -> Self {
+        Self {
+            drift_ppm: DRIFT_ALLOWANCE_PPM,
+            mono: true,
+        }
+    }
+}
+impl AudioTuning {
+    pub fn from_env() -> Self {
+        let read = |name| match std::env::var(name) {
+            Ok(value) => Some(value),
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => Some("<not unicode>".into()),
+        };
+        let (tuning, warnings) = Self::parse(
+            read("NIRI_RDP_AUDIO_DRIFT_PPM").as_deref(),
+            read("NIRI_RDP_AUDIO_CHANNELS").as_deref(),
+        );
+        for warning in warnings {
+            eprintln!("{warning}");
+        }
+        tuning
+    }
+    fn parse(drift_ppm: Option<&str>, channels: Option<&str>) -> (Self, Vec<String>) {
+        let mut tuning = Self::default();
+        let mut warnings = Vec::new();
+        if let Some(value) = drift_ppm {
+            match value.trim().parse::<u64>() {
+                Ok(ppm) if ppm <= u64::from(MAX_DRIFT_PPM) => tuning.drift_ppm = ppm as u32,
+                Ok(_) => {
+                    warnings.push(format!(
+                        "RDP audio: NIRI_RDP_AUDIO_DRIFT_PPM={value} above {MAX_DRIFT_PPM}; using {MAX_DRIFT_PPM}"
+                    ));
+                    tuning.drift_ppm = MAX_DRIFT_PPM;
+                }
+                Err(_) => warnings.push(format!(
+                    "RDP audio: NIRI_RDP_AUDIO_DRIFT_PPM={value} is not 0-{MAX_DRIFT_PPM}; using {DRIFT_ALLOWANCE_PPM}"
+                )),
+            }
+        }
+        match channels.map(str::trim) {
+            None | Some("mono") => {}
+            Some("stereo") => tuning.mono = false,
+            Some(value) => warnings.push(format!(
+                "RDP audio: NIRI_RDP_AUDIO_CHANNELS={value} is not mono or stereo; using mono"
+            )),
+        }
+        (tuning, warnings)
+    }
+}
+
+/// Earned catch-up for client playback-queue growth. During continuous
+/// audible PCM, drop one 20 ms block when the [`ArrivalModel`] surplus is at
+/// least [`DRIFT_SKIP_RESERVE`] plus one block, at most once per
+/// [`DRIFT_SKIP_MIN_SPACING`], preferring a quiet block. Without a queued
+/// successor, the skip leaves a 20 ms sending gap, and the estimate falls by
+/// 20 ms once later waves are confirmed; the spacing exceeds any plausible
+/// round trip. With one, the skip removes 20 ms of server-side capture backlog
+/// instead and the client queue is unchanged. A skip is neither
+/// capture loss nor a credit or pressure event: codec state, counters and the
+/// send schedule are untouched; only one block of content is removed.
 #[derive(Debug, Default)]
 struct DriftSkip {
-    /// Start of the current continuous run: first send, resume or last skip.
+    /// Start of the current spacing interval: first send, resume or last skip.
     run_start: Option<Instant>,
+    /// When the surplus first allowed a skip in this interval.
+    armed_at: Option<Instant>,
     /// Recent mean level of audible sent blocks.
     average: Option<f32>,
 }
 impl DriftSkip {
     /// Whether to drop this block instead of sending it. Digital silence is
     /// never dropped: it belongs to the silence tail and suppression path.
-    fn consider(&mut self, now: Instant, block: &[u8]) -> Option<SkipReason> {
-        let armed_at = self.run_start? + DRIFT_SKIP_INTERVAL;
-        if now < armed_at || block.iter().all(|byte| *byte == 0) {
+    fn consider(&mut self, now: Instant, block: &[u8], earned: Duration) -> Option<SkipReason> {
+        if now < self.run_start? + DRIFT_SKIP_MIN_SPACING || block.iter().all(|byte| *byte == 0) {
             return None;
         }
+        if earned < DRIFT_SKIP_RESERVE + BLOCK_DURATION {
+            self.armed_at = None;
+            return None;
+        }
+        let armed_at = *self.armed_at.get_or_insert(now);
         let level = block_level(block);
         let quiet = level <= DRIFT_SKIP_QUIET_LEVEL
             || self
@@ -617,6 +832,7 @@ impl DriftSkip {
             return None;
         };
         self.run_start = Some(now);
+        self.armed_at = None;
         Some(reason)
     }
     /// A block was sent to the client.
@@ -632,6 +848,7 @@ impl DriftSkip {
     /// Silence suppression stopped sending; the client queue drains.
     fn suppressed(&mut self) {
         self.run_start = None;
+        self.armed_at = None;
     }
     fn average(&self) -> u32 {
         self.average.unwrap_or(0.0) as u32
@@ -653,6 +870,8 @@ struct ConfirmDiagnostics {
     gaps_us: Vec<u64>,
     last_second: Option<(u8, u16, Duration)>,
     last_report: Option<Instant>,
+    /// Latest drift-skip surplus estimate, reported with each summary.
+    earned: Duration,
 }
 impl ConfirmDiagnostics {
     fn record(
@@ -725,7 +944,7 @@ impl ConfirmDiagnostics {
         };
         let count = self.gaps_us.len();
         eprintln!(
-            "RDP audio confirms: interval_ms={} first={} second={} repeat={} unmatched={} nonzero_timestamps={} last_nonzero={} second_gap_ms_min={} second_gap_ms_p50={} second_gap_ms_max={} last_second={}",
+            "RDP audio confirms: interval_ms={} first={} second={} repeat={} unmatched={} nonzero_timestamps={} last_nonzero={} second_gap_ms_min={} second_gap_ms_p50={} second_gap_ms_max={} last_second={} earned_ms={:.1}",
             interval.as_millis(),
             self.first,
             self.second,
@@ -742,6 +961,7 @@ impl ConfirmDiagnostics {
                     "{block}/{ts}/{:.1}ms",
                     gap.as_secs_f64() * 1000.0
                 )),
+            self.earned.as_secs_f64() * 1000.0,
         );
         *self = Self {
             detail_lines: self.detail_lines,
@@ -777,6 +997,8 @@ struct FlowControl {
     playback_epoch: u64,
     receipt_baseline: Option<Duration>,
     last_render_delay: Duration,
+    /// Receipt-time model of the client queue for the PCM drift skip.
+    arrivals: ArrivalModel,
     /// Present only with `NIRI_RDP_DIAGNOSTICS=1`; observes, never decides.
     diagnostics: Option<ConfirmDiagnostics>,
 }
@@ -926,6 +1148,7 @@ impl FlowControl {
                     wave.playback_confirmed,
                 )
             });
+            diagnostics.earned = self.arrivals.earned();
             diagnostics.record(number, timestamp, now, matched);
         }
         let Some(position) = position else {
@@ -966,11 +1189,18 @@ impl FlowControl {
             );
             // Receipt of a later FIFO wave also proves earlier transport
             // events reached the client, even if one receipt ACK went missing.
+            let mut received = 0;
             for old in self.recent.iter_mut().take(position + 1) {
                 if !old.acknowledged {
                     old.acknowledged = true;
                     self.pending -= 1;
+                    received += u32::from(self.arrivals.counts(old.sent_at));
                 }
+            }
+            if let Some(starved) = self.arrivals.received(now, received) {
+                use crate::performance::{Counter, connection};
+                connection().add(Counter::AudioModelStarvations, 1);
+                connection().add(Counter::AudioModelStarvedMs, starved.as_millis() as u64);
             }
         }
         // Even an immediate equal second packet finishes this generation.
@@ -1032,6 +1262,10 @@ pub struct Audio {
     wake: Arc<Wake>,
     video: Option<crate::video::Video>,
     clock: AudioClock,
+    tuning: AudioTuning,
+    /// Drift skips taken by this audio's workers, for exact test assertions.
+    #[cfg(test)]
+    skips: Arc<std::sync::atomic::AtomicU64>,
 }
 impl std::fmt::Debug for Audio {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -1041,6 +1275,10 @@ impl std::fmt::Debug for Audio {
 impl Audio {
     pub fn with_video(mut self, video: crate::video::Video) -> Self {
         self.video = Some(video);
+        self
+    }
+    pub fn with_tuning(mut self, tuning: AudioTuning) -> Self {
+        self.tuning = tuning;
         self
     }
     pub fn attach(&self, socket: Option<UnixStream>) {
@@ -1110,7 +1348,12 @@ impl SoundServerFactory for Factory {
         // actual Windows playback. Prefer the PCM path verified by listening;
         // keep compressed codecs for clients that do not accept PCM. Mono PCM
         // (user-approved 2026-10-18) halves the 1.54 Mbit/s stereo bandwidth.
-        let mut formats = vec![pcm_mono_format(), pcm_format()];
+        // `NIRI_RDP_AUDIO_CHANNELS=stereo` removes mono for listening A/B tests.
+        let mut formats = if self.audio.tuning.mono {
+            vec![pcm_mono_format(), pcm_format()]
+        } else {
+            vec![pcm_format()]
+        };
         if aac.is_some() {
             formats.push(aac_format());
         }
@@ -1188,8 +1431,16 @@ impl RdpsndServerHandler for Backend {
             BLOCK_BYTES
         };
         let block_duration = Duration::from_secs_f64(block_bytes as f64 / 192000.0);
+        // AAC and ADPCM keep their unchanged fallback behavior: no drift skip.
+        let drift_skip_enabled = matches!(encoder, Codec::Pcm { .. });
+        let tuning = self.audio.tuning;
+        {
+            let mut flow = self.pending.lock().unwrap();
+            flow.arrivals.enabled = drift_skip_enabled;
+            flow.arrivals.drift_ppm = tuning.drift_ppm;
+        }
         eprintln!(
-            "RDP audio {}: {} Hz {}, {} kbps, {:.2} ms capture blocks",
+            "RDP audio {}: {} Hz {}, {} kbps, {:.2} ms capture blocks; channels={} drift_ppm={} drift_skip={}",
             match &encoder {
                 Codec::Aac(_) => "AAC-LC",
                 Codec::Adpcm(_) => "MS ADPCM",
@@ -1203,6 +1454,9 @@ impl RdpsndServerHandler for Backend {
             },
             format.format().n_avg_bytes_per_sec * 8 / 1000,
             block_duration.as_secs_f64() * 1000.0,
+            if tuning.mono { "mono" } else { "stereo" },
+            tuning.drift_ppm,
+            if drift_skip_enabled { "on" } else { "off" },
         );
         // Read-only record for the disconnect summary; selects nothing.
         crate::performance::connection().set_audio_codec(match &encoder {
@@ -1210,8 +1464,6 @@ impl RdpsndServerHandler for Backend {
             Codec::Adpcm(_) => crate::performance::AudioCodec::Adpcm,
             Codec::Pcm { .. } => crate::performance::AudioCodec::Pcm,
         });
-        // AAC and ADPCM keep their unchanged fallback behavior: no drift skip.
-        let drift_skip_enabled = matches!(encoder, Codec::Pcm { .. });
         let audio = self.audio.clone();
         let sender = self.sender.clone();
         let stopped = self.stopped.clone();
@@ -1364,20 +1616,28 @@ impl RdpsndServerHandler for Backend {
                                     break;
                                 }
                                 reset_codec = false;
-                                // Lost samples already break continuity.
+                                // Lost samples already break continuity. The
+                                // arrival model stays: discarded capture was
+                                // never sent, and any sending gap it caused
+                                // already shows in later confirmations.
                                 fade_from = None;
                             }
-                            if drift_skip_enabled && let Some(reason) = drift.consider(now, &data) {
+                            let earned = queue.arrivals.earned();
+                            if drift_skip_enabled && let Some(reason) = drift.consider(now, &data, earned) {
                                 // Drop this block's content but keep the send
                                 // schedule: a queued successor takes this tick;
                                 // otherwise the next block leaves on arrival.
                                 telemetry.count("drift_skips", 1);
+                                queue.arrivals.skipped();
+                                #[cfg(test)]
+                                audio.skips.fetch_add(1, Ordering::Relaxed);
                                 if telemetry.enabled() {
                                     eprintln!(
-                                        "RDP audio drift skip: reason={} level={} average={} next_block={number} successor={}",
+                                        "RDP audio drift skip: reason={} level={} average={} earned_ms={:.1} next_block={number} successor={}",
                                         reason.name(),
                                         block_level(&data),
                                         drift.average(),
+                                        earned.as_secs_f64() * 1000.0,
                                         if captured.is_empty() { "arriving" } else { "queued" },
                                     );
                                 }
@@ -1406,6 +1666,7 @@ impl RdpsndServerHandler for Backend {
                             // Windows playback queue for the entire idle session.
                             if silent_blocks > SILENCE_TAIL_BLOCKS {
                                 drift.suppressed();
+                                queue.arrivals.reset(now);
                                 continue;
                             }
                             drift.sent(now, &data);
@@ -3267,13 +3528,17 @@ mod tests {
         assert_eq!(sum, 0);
     }
 
-    /// Feed real-time 20 ms blocks to a skip policy the way the worker does,
-    /// returning the elapsed time and reason of every skip.
-    fn drive_drift(
+    const SKIP_THRESHOLD: Duration =
+        Duration::from_millis(DRIFT_SKIP_RESERVE.as_millis() as u64 + 20);
+
+    /// Feed real-time 20 ms blocks to the skip policy with a given surplus
+    /// estimate, returning the elapsed time and reason of every skip.
+    fn drive_policy(
         drift: &mut DriftSkip,
         start: Instant,
         from: Duration,
         until: Duration,
+        mut earned_at: impl FnMut(Duration) -> Duration,
         mut block_at: impl FnMut(Duration) -> Vec<u8>,
     ) -> Vec<(Duration, SkipReason)> {
         let mut skips = Vec::new();
@@ -3281,61 +3546,118 @@ mod tests {
         while elapsed < until {
             let now = start + elapsed;
             let block = block_at(elapsed);
-            match drift.consider(now, &block) {
+            match drift.consider(now, &block, earned_at(elapsed)) {
                 Some(reason) => skips.push((elapsed, reason)),
                 None => drift.sent(now, &block),
             }
-            elapsed += Duration::from_millis(20);
+            elapsed += BLOCK_DURATION;
         }
         skips
     }
 
+    /// The worker's skip loop against the arrival model: every sent block is
+    /// confirmed on arrival; a dropped block leaves a 20 ms sending gap.
+    /// Returns each skip's elapsed time, reason and the surplus it relied on.
+    fn drive_model(
+        drift: &mut DriftSkip,
+        arrivals: &mut ArrivalModel,
+        start: Instant,
+        from: Duration,
+        until: Duration,
+        mut block_at: impl FnMut(Duration) -> Vec<u8>,
+    ) -> Vec<(Duration, SkipReason, Duration)> {
+        let mut skips = Vec::new();
+        let mut elapsed = from;
+        while elapsed < until {
+            let now = start + elapsed;
+            let block = block_at(elapsed);
+            let earned = arrivals.earned();
+            match drift.consider(now, &block, earned) {
+                Some(reason) => {
+                    arrivals.skipped();
+                    skips.push((elapsed, reason, earned));
+                }
+                None => {
+                    drift.sent(now, &block);
+                    arrivals.received(now, 1);
+                }
+            }
+            elapsed += BLOCK_DURATION;
+        }
+        skips
+    }
+
+    fn within(value: Duration, low_ms: f64, high_ms: f64) -> bool {
+        let ms = value.as_secs_f64() * 1000.0;
+        (low_ms..=high_ms).contains(&ms)
+    }
+
     #[test]
-    fn drift_skip_arms_after_thirty_seconds_and_prefers_a_quiet_block() {
+    fn drift_skip_needs_surplus_above_the_reserve_and_prefers_a_quiet_block() {
         let start = Instant::now();
         let mut drift = DriftSkip::default();
         let loud = stereo_block(12000, -12000);
         let quiet = stereo_block(200, -200);
-        // Quiet passages before arming are sent normally.
-        let skips = drive_drift(
+        let quiet_each_second = |at: Duration| {
+            if at.as_millis().is_multiple_of(1000) {
+                quiet.clone()
+            } else {
+                loud.clone()
+            }
+        };
+        // One microsecond short of reserve plus one block: never armed.
+        let short = SKIP_THRESHOLD - Duration::from_micros(1);
+        let skips = drive_policy(
             &mut drift,
             start,
             Duration::ZERO,
-            Duration::from_secs(30),
-            |at| {
-                if at.as_millis() % 1000 == 0 {
-                    quiet.clone()
-                } else {
-                    loud.clone()
-                }
-            },
+            Duration::from_secs(60),
+            |_| short,
+            quiet_each_second,
         );
-        assert!(skips.is_empty(), "nothing is dropped before 30 s");
-        // Armed: loud blocks still pass until the first quiet one.
-        let skips = drive_drift(
+        assert!(skips.is_empty(), "no surplus beyond the reserve: {skips:?}");
+        // Enough surplus, but not within the minimum spacing of a fresh run.
+        let mut drift = DriftSkip::default();
+        let skips = drive_policy(
             &mut drift,
             start,
-            Duration::from_secs(30),
-            Duration::from_secs(34),
+            Duration::ZERO,
+            DRIFT_SKIP_MIN_SPACING,
+            |_| SKIP_THRESHOLD,
+            quiet_each_second,
+        );
+        assert!(
+            skips.is_empty(),
+            "nothing is dropped within 10 s of the run start"
+        );
+        // Armed: loud blocks still pass until the first quiet one.
+        let skips = drive_policy(
+            &mut drift,
+            start,
+            DRIFT_SKIP_MIN_SPACING,
+            Duration::from_secs(14),
+            |_| SKIP_THRESHOLD,
             |at| {
-                if at == Duration::from_millis(32_500) {
+                if at == Duration::from_millis(12_500) {
                     quiet.clone()
                 } else {
                     loud.clone()
                 }
             },
         );
-        assert_eq!(skips, [(Duration::from_millis(32_500), SkipReason::Quiet)]);
-        // A block well below the recent average is quiet even above -40 dBFS.
+        assert_eq!(skips, [(Duration::from_millis(12_500), SkipReason::Quiet)]);
+        // A block well below the recent average is quiet even above -40 dBFS;
+        // the next skip waits the minimum spacing after the previous one.
         let relative = stereo_block(2000, -2000);
         assert!(block_level(&relative) > DRIFT_SKIP_QUIET_LEVEL);
-        let skips = drive_drift(
+        let skips = drive_policy(
             &mut drift,
             start,
-            Duration::from_secs(34),
-            Duration::from_secs(64),
+            Duration::from_secs(14),
+            Duration::from_secs(30),
+            |_| Duration::from_millis(500),
             |at| {
-                if at == Duration::from_millis(63_000) {
+                if at == Duration::from_millis(22_000) || at == Duration::from_millis(23_000) {
                     relative.clone()
                 } else {
                     loud.clone()
@@ -3344,8 +3666,8 @@ mod tests {
         );
         assert_eq!(
             skips,
-            [(Duration::from_millis(63_000), SkipReason::Quiet)],
-            "the next skip arms 30 s after the previous one"
+            [(Duration::from_millis(23_000), SkipReason::Quiet)],
+            "the next skip arms 10 s after the previous one"
         );
     }
 
@@ -3354,29 +3676,53 @@ mod tests {
         let start = Instant::now();
         let mut drift = DriftSkip::default();
         let loud = stereo_block(12000, -12000);
-        let skips = drive_drift(
+        let skips = drive_policy(
             &mut drift,
             start,
             Duration::ZERO,
-            Duration::from_secs(80),
+            Duration::from_secs(40),
+            |_| Duration::from_millis(200),
             |_| loud.clone(),
         );
         assert_eq!(
             skips,
             [
-                (Duration::from_secs(35), SkipReason::Forced),
-                (Duration::from_secs(70), SkipReason::Forced),
+                (Duration::from_secs(15), SkipReason::Forced),
+                (Duration::from_secs(30), SkipReason::Forced),
             ],
             "without a quiet block, skip 5 s after arming and rearm from the skip"
         );
+        // A surplus that falls below the threshold while armed disarms; the
+        // 5 s quiet wait restarts when it returns.
+        let mut drift = DriftSkip::default();
+        let skips = drive_policy(
+            &mut drift,
+            start,
+            Duration::ZERO,
+            Duration::from_secs(30),
+            |at| {
+                if (Duration::from_secs(12)..Duration::from_secs(13)).contains(&at) {
+                    SKIP_THRESHOLD - BLOCK_DURATION
+                } else {
+                    SKIP_THRESHOLD
+                }
+            },
+            |_| loud.clone(),
+        );
+        assert_eq!(skips, [(Duration::from_secs(18), SkipReason::Forced)]);
     }
 
     #[test]
     fn drift_skip_restarts_after_silence_resume_and_never_drops_silence() {
         let start = Instant::now();
         let mut drift = DriftSkip::default();
+        let plenty = Duration::from_millis(500);
         assert_eq!(
-            drift.consider(start + Duration::from_secs(100), &stereo_block(1, 1)),
+            drift.consider(
+                start + Duration::from_secs(100),
+                &stereo_block(1, 1),
+                plenty
+            ),
             None,
             "nothing is armed before the first send"
         );
@@ -3384,23 +3730,25 @@ mod tests {
         let quiet = stereo_block(200, -200);
         let silence = vec![0; BLOCK_BYTES];
         assert!(
-            drive_drift(
+            drive_policy(
                 &mut drift,
                 start,
                 Duration::ZERO,
-                Duration::from_secs(25),
-                |_| { loud.clone() }
+                Duration::from_secs(9),
+                |_| plenty,
+                |_| loud.clone()
             )
             .is_empty()
         );
-        // Suppression drains the client queue; the interval restarts on resume.
+        // Suppression drains the client queue; the spacing restarts on resume.
         drift.suppressed();
         let resume = Duration::from_secs(26);
-        let skips = drive_drift(
+        let skips = drive_policy(
             &mut drift,
             start,
             resume,
-            resume + DRIFT_SKIP_INTERVAL,
+            resume + DRIFT_SKIP_MIN_SPACING,
+            |_| plenty,
             |_| quiet.clone(),
         );
         assert!(
@@ -3409,14 +3757,359 @@ mod tests {
         );
         // Armed again, but digital silence (the codec tail) is never dropped,
         // even though it is the quietest possible block.
-        let armed = start + resume + DRIFT_SKIP_INTERVAL;
+        let armed = start + resume + DRIFT_SKIP_MIN_SPACING;
         for offset in [0, 3000, 10_000] {
             assert_eq!(
-                drift.consider(armed + Duration::from_millis(offset), &silence),
+                drift.consider(armed + Duration::from_millis(offset), &silence, plenty),
                 None
             );
         }
-        assert_eq!(drift.consider(armed, &quiet), Some(SkipReason::Quiet));
+        assert_eq!(
+            drift.consider(armed, &quiet, plenty),
+            Some(SkipReason::Quiet)
+        );
+    }
+
+    #[test]
+    fn steady_on_schedule_audio_earns_only_the_drift_allowance() {
+        let start = Instant::now();
+        let mut drift = DriftSkip::default();
+        let mut arrivals = ArrivalModel::default();
+        let loud = stereo_block(12000, -12000);
+        let quiet = stereo_block(200, -200);
+        // Five minutes of continuous sound with frequent quiet candidates:
+        // 100 ppm earns 30 ms, inside the reserve, so nothing is dropped.
+        let skips = drive_model(
+            &mut drift,
+            &mut arrivals,
+            start,
+            Duration::ZERO,
+            Duration::from_secs(300),
+            |at| {
+                if at.as_millis().is_multiple_of(500) {
+                    quiet.clone()
+                } else {
+                    loud.clone()
+                }
+            },
+        );
+        assert!(skips.is_empty(), "{skips:?}");
+        assert!(
+            within(arrivals.earned(), 29.0, 30.0),
+            "{:?}",
+            arrivals.earned()
+        );
+        // The allowance alone first reaches reserve plus one block after
+        // 800 s (40,000 blocks), then every further 200 s.
+        let skips = drive_model(
+            &mut drift,
+            &mut arrivals,
+            start,
+            Duration::from_secs(300),
+            Duration::from_secs(1100),
+            |_| loud.clone(),
+        );
+        let times: Vec<_> = skips.iter().map(|skip| skip.0.as_secs_f64()).collect();
+        assert_eq!(skips.len(), 2, "{times:?}");
+        assert!((800.0..808.0).contains(&times[0]), "{times:?}");
+        assert!((1000.0..1008.0).contains(&times[1]), "{times:?}");
+        assert!(skips.iter().all(|skip| skip.1 == SkipReason::Forced));
+        assert!(skips.iter().all(|skip| skip.2 >= SKIP_THRESHOLD));
+        // Each skip's 20 ms gap shows in the next arrival's queue.
+        assert!(arrivals.earned() < SKIP_THRESHOLD);
+        assert!(arrivals.earned() >= DRIFT_SKIP_RESERVE);
+    }
+
+    #[test]
+    fn catch_up_burst_earns_skips_only_above_the_reserve() {
+        let start = Instant::now();
+        let mut drift = DriftSkip::default();
+        let mut arrivals = ArrivalModel::default();
+        let loud = stereo_block(12000, -12000);
+        let quiet = stereo_block(200, -200);
+        let every_half_second = |at: Duration| {
+            if at.as_millis().is_multiple_of(500) {
+                quiet.clone()
+            } else {
+                loud.clone()
+            }
+        };
+        let ms = Duration::from_millis;
+        assert!(
+            drive_model(
+                &mut drift,
+                &mut arrivals,
+                start,
+                ms(0),
+                ms(30_000),
+                every_half_second
+            )
+            .is_empty()
+        );
+        // A short stall (the model runs dry 60 ms, below the starvation
+        // threshold), then the four waves in flight (the credit window) arrive
+        // together and sending resumes on schedule: the queue gains 60 ms,
+        // which stays inside the reserve.
+        assert_eq!(arrivals.received(start + ms(30_060), 4), None);
+        assert!(
+            drive_model(
+                &mut drift,
+                &mut arrivals,
+                start,
+                ms(30_080),
+                ms(60_000),
+                every_half_second
+            )
+            .is_empty()
+        );
+        // 60 ms from the burst plus 100 ppm of the 30 s since.
+        assert!(
+            within(arrivals.earned(), 62.0, 64.0),
+            "{:?}",
+            arrivals.earned()
+        );
+        assert_eq!(arrivals.hidden, Duration::ZERO, "no starvation credit");
+        // A larger catch-up: twelve blocks arrive together, one tick late.
+        // Their 220 ms surplus is repaid in 20 ms skips, at least 10 s apart,
+        // only while the estimate is at least reserve plus one block.
+        assert_eq!(arrivals.received(start + ms(60_060), 12), None);
+        let skips = drive_model(
+            &mut drift,
+            &mut arrivals,
+            start,
+            ms(60_080),
+            ms(180_000),
+            every_half_second,
+        );
+        assert_eq!(skips.len(), 8, "{skips:?}");
+        assert!(skips.iter().all(|skip| skip.1 == SkipReason::Quiet));
+        assert!(skips.iter().all(|skip| skip.2 >= SKIP_THRESHOLD));
+        assert!(
+            skips
+                .windows(2)
+                .all(|pair| pair[1].0 - pair[0].0 >= DRIFT_SKIP_MIN_SPACING)
+        );
+        assert!(arrivals.earned() >= DRIFT_SKIP_RESERVE);
+        assert!(arrivals.earned() < SKIP_THRESHOLD);
+    }
+
+    #[test]
+    fn arrival_estimate_is_capped_and_resets_on_silence_suppression() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let mut arrivals = ArrivalModel::default();
+        arrivals.received(start, 1);
+        assert_eq!(arrivals.earned(), Duration::ZERO, "no full window yet");
+        // A long stall's huge burst cannot exceed the cap, however long the
+        // sequence of later arrivals.
+        arrivals.received(start + ms(10), 5000);
+        let mut at = ms(30);
+        while at < ms(5000) {
+            arrivals.received(start + at, 1);
+            assert!(arrivals.earned() <= DRIFT_SKIP_EARNED_CAP);
+            at += BLOCK_DURATION;
+        }
+        assert!(arrivals.earned() + ms(30) >= DRIFT_SKIP_EARNED_CAP);
+        // Suppression empties the estimate at once; late confirmations of
+        // the silence tail cannot restore it.
+        arrivals.reset(start + ms(5000));
+        assert_eq!(arrivals.earned(), Duration::ZERO);
+        for offset in 0..5 {
+            arrivals.received(start + ms(5000 + offset * 20), 1);
+        }
+        assert_eq!(arrivals.earned(), Duration::ZERO);
+    }
+
+    #[test]
+    fn first_confirmations_feed_the_arrival_model_once_per_wave() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let mut flow = FlowControl::default();
+        let mut number = 0u8;
+        let mut at = Duration::ZERO;
+        // Steady waves, each confirmed on arrival and again 5 ms later.
+        while at < ms(3000) {
+            flow.sent(number, 0, start + at);
+            flow.confirm(number, 0, start + at);
+            flow.confirm(number, 0, start + at + ms(5));
+            number = number.wrapping_add(1);
+            at += BLOCK_DURATION;
+        }
+        assert!(
+            flow.arrivals.earned() < ms(1),
+            "{:?}",
+            flow.arrivals.earned()
+        );
+        // A stall: four waves leave on schedule but only the last receipt
+        // arrives, 300 ms later. FIFO proves all four reached the client.
+        for _ in 0..4 {
+            flow.sent(number, 0, start + at);
+            number = number.wrapping_add(1);
+            at += BLOCK_DURATION;
+        }
+        let release = start + at + ms(220);
+        flow.confirm(number.wrapping_sub(1), 0, release);
+        assert_eq!(flow.pending, 0);
+        let mut at = ms(20);
+        while at < ms(3000) {
+            flow.sent(number, 0, release + at);
+            flow.confirm(number, 0, release + at);
+            number = number.wrapping_add(1);
+            at += BLOCK_DURATION;
+        }
+        assert!(
+            within(flow.arrivals.queue_low(), 60.0, 61.0),
+            "{:?}",
+            flow.arrivals.queue_low()
+        );
+        // The model ran dry for about 300 ms: one starvation credit.
+        assert_eq!(flow.arrivals.hidden, STARVATION_CREDIT);
+        assert_eq!(
+            flow.arrivals.earned(),
+            flow.arrivals.queue_low() + STARVATION_CREDIT
+        );
+    }
+
+    #[test]
+    fn starvation_credits_one_block_at_most_once_per_thirty_seconds() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        let mut arrivals = ArrivalModel::default();
+        let mut events = Vec::new();
+        let mut at = Duration::ZERO;
+        // Every 5 s the receipts stop for 200 ms (the model runs dry about
+        // 200 ms); every 5 s offset by 2.5 s they stop for 80 ms only.
+        while at < ms(100_000) {
+            let gap = match at.as_millis() % 5000 {
+                0 if !at.is_zero() => Some(ms(200)),
+                2500 => Some(ms(80)),
+                _ => None,
+            };
+            let at_arrival = at + gap.unwrap_or_default();
+            if let Some(starved) = arrivals.received(start + at_arrival, 1) {
+                events.push((at_arrival, starved));
+            }
+            at = at_arrival + BLOCK_DURATION;
+        }
+        // 19 starvations of about 200 ms; the 80 ms gaps are not starvation.
+        assert_eq!(events.len(), 19, "{events:?}");
+        assert!(
+            events
+                .iter()
+                .all(|(_, starved)| within(*starved, 195.0, 200.1)),
+            "{events:?}"
+        );
+        // Credited at the first, then 30 s later each time: four in 100 s.
+        let credited: Vec<_> = events.iter().map(|(at, _)| at.as_millis()).collect();
+        assert_eq!(credited[0], 5200);
+        assert_eq!(arrivals.hidden, STARVATION_CREDIT * 4);
+        // A skip the observed queue cannot show is charged to the credit.
+        // (The observed queue holds only 62 us of drift allowance.)
+        arrivals.skipped();
+        assert!(within(arrivals.hidden, 60.0, 60.1), "{:?}", arrivals.hidden);
+        // Suppression drops the credit but keeps its 30 s spacing.
+        let credited = arrivals.last_starvation_credit;
+        arrivals.reset(start + at);
+        assert_eq!(arrivals.hidden, Duration::ZERO);
+        assert_eq!(arrivals.last_starvation_credit, credited);
+    }
+
+    #[test]
+    fn starvation_is_not_credited_across_silence_suppression_or_for_compressed_audio() {
+        let start = Instant::now();
+        let ms = Duration::from_millis;
+        for enabled in [true, false] {
+            let mut flow = FlowControl::default();
+            flow.arrivals.enabled = enabled;
+            let mut number = 0u8;
+            let mut at = Duration::ZERO;
+            let send = |flow: &mut FlowControl, number: &mut u8, at: Duration| {
+                flow.sent(*number, 0, start + at);
+                flow.confirm(*number, 0, start + at);
+                *number = number.wrapping_add(1);
+            };
+            while at < ms(3000) {
+                send(&mut flow, &mut number, at);
+                at += BLOCK_DURATION;
+            }
+            // The silence tail leaves, suppression starts, and the tail's
+            // receipts arrive late, after the reset.
+            let tail = at;
+            for index in 0..4u32 {
+                flow.sent(
+                    number.wrapping_add(index as u8),
+                    0,
+                    start + tail + BLOCK_DURATION * index,
+                );
+            }
+            flow.arrivals.reset(start + tail + ms(100));
+            for index in 0..4u32 {
+                flow.confirm(number.wrapping_add(index as u8), 0, start + tail + ms(150));
+            }
+            number = number.wrapping_add(4);
+            // Sound resumes 5 s later: not a starvation.
+            let mut at = tail + ms(5000);
+            while at < tail + ms(8000) {
+                send(&mut flow, &mut number, at);
+                at += BLOCK_DURATION;
+            }
+            assert_eq!(flow.arrivals.hidden, Duration::ZERO);
+            assert_eq!(flow.arrivals.last_starvation_credit, None);
+            // A real stall inside the run is credited only for PCM.
+            let stalled = at;
+            for index in 0..4u32 {
+                flow.sent(
+                    number.wrapping_add(index as u8),
+                    0,
+                    start + stalled + BLOCK_DURATION * index,
+                );
+            }
+            flow.confirm(number.wrapping_add(3), 0, start + stalled + ms(400));
+            let expected = if enabled {
+                STARVATION_CREDIT
+            } else {
+                Duration::ZERO
+            };
+            assert_eq!(flow.arrivals.hidden, expected, "enabled={enabled}");
+            if !enabled {
+                assert_eq!(flow.arrivals.earned(), Duration::ZERO);
+            }
+        }
+    }
+
+    #[test]
+    fn audio_tuning_parses_defaults_valid_invalid_and_clamped_values() {
+        let baseline = AudioTuning {
+            drift_ppm: 100,
+            mono: true,
+        };
+        assert_eq!(AudioTuning::default(), baseline);
+        assert_eq!(AudioTuning::parse(None, None), (baseline, vec![]));
+        assert_eq!(
+            AudioTuning::parse(Some("250"), Some("stereo")),
+            (
+                AudioTuning {
+                    drift_ppm: 250,
+                    mono: false
+                },
+                vec![]
+            )
+        );
+        assert_eq!(AudioTuning::parse(Some(" 0 "), Some("mono")).0.drift_ppm, 0);
+        assert_eq!(AudioTuning::parse(Some("2000"), None).0.drift_ppm, 2000);
+        let (clamped, warnings) = AudioTuning::parse(Some("5000"), None);
+        assert_eq!(clamped.drift_ppm, MAX_DRIFT_PPM);
+        assert_eq!(warnings.len(), 1);
+        for invalid in ["", "-5", "abc", "1.5", "<not unicode>"] {
+            let (tuning, warnings) = AudioTuning::parse(Some(invalid), None);
+            assert_eq!(tuning, baseline, "{invalid:?}");
+            assert_eq!(warnings.len(), 1, "{invalid:?}");
+        }
+        for invalid in ["Stereo", "5.1", ""] {
+            let (tuning, warnings) = AudioTuning::parse(None, Some(invalid));
+            assert_eq!(tuning, baseline, "{invalid:?}");
+            assert_eq!(warnings.len(), 1, "{invalid:?}");
+        }
     }
 
     #[test]
@@ -3482,29 +4175,43 @@ mod tests {
     }
 
     /// Real-time capture through the worker: each step writes `blocks`, lets
-    /// the worker send what is due, confirms every wave and advances 20 ms.
+    /// the worker send what is due, confirms every wave on arrival unless the
+    /// link is stalled, and advances 20 ms.
     struct LiveStream {
         rig: Rig,
         server: RdpsndServer,
         receiver: Events,
         source: UnixStream,
+        withheld: Vec<u8>,
     }
     impl LiveStream {
         fn new(format: AudioFormat) -> Self {
-            let rig = Rig::new();
-            let (server, receiver) = negotiate(&rig.audio, vec![format]);
+            Self::with(vec![format], AudioTuning::default())
+        }
+        fn with(formats: Vec<AudioFormat>, tuning: AudioTuning) -> Self {
+            let mut rig = Rig::new();
+            rig.audio = rig.audio.clone().with_tuning(tuning);
+            let (server, receiver) = negotiate(&rig.audio, formats);
             let source = rig.attach_pcm();
             Self {
                 rig,
                 server,
                 receiver,
                 source,
+                withheld: Vec::new(),
             }
         }
         fn elapsed(&self) -> Duration {
             *self.rig.clock.elapsed.lock().unwrap()
         }
+        /// Drift skips taken by this stream's worker.
+        fn skips(&self) -> u64 {
+            self.rig.audio.skips.load(Ordering::Relaxed)
+        }
         fn step(&mut self, blocks: &[u8]) -> Vec<(Duration, Vec<u8>)> {
+            self.step_with(blocks, true)
+        }
+        fn step_with(&mut self, blocks: &[u8], confirm_now: bool) -> Vec<(Duration, Vec<u8>)> {
             self.source.write_all(blocks).unwrap();
             self.rig.settle();
             let mut waves = Vec::new();
@@ -3512,11 +4219,28 @@ mod tests {
                 self.receiver.try_recv()
             {
                 let wave = wave2(&mut self.server, data.clone(), timestamp);
-                confirm(&mut self.server, wave.block_no, 0);
+                if confirm_now {
+                    confirm(&mut self.server, wave.block_no, 0);
+                } else {
+                    self.withheld.push(wave.block_no);
+                }
                 waves.push((self.elapsed(), data));
             }
             *self.rig.clock.elapsed.lock().unwrap() += Duration::from_millis(20);
             waves
+        }
+        /// A forward-path stall of `steps` ticks; then the receipts of the
+        /// waves sent during it arrive together. Returns how many were sent.
+        fn stall(&mut self, block: &[u8], steps: usize) -> usize {
+            let sent = (0..steps).map(|_| self.step_with(block, false).len()).sum();
+            self.release();
+            sent
+        }
+        /// Withheld receipts arrive together.
+        fn release(&mut self) {
+            for block_no in std::mem::take(&mut self.withheld) {
+                confirm(&mut self.server, block_no, 0);
+            }
         }
     }
 
@@ -3528,23 +4252,41 @@ mod tests {
         let loud = stereo_block(12000, -11000);
         let quiet = stereo_block(150, -90);
         let ms = Duration::from_millis;
-        for step in 0..1500u64 {
+        for step in 0..100u64 {
             let waves = stream.step(&loud);
-            assert_eq!(waves.len(), 1, "one wave per tick before arming");
+            assert_eq!(waves.len(), 1, "one wave per tick");
             assert_eq!(waves[0].0, ms(step * 20));
         }
-        // Armed at 30 s: the quiet block is dropped. Its successor has not
+        // A 300 ms stall: four waves fill the credit window. Their receipts
+        // arrive together and sending resumes at once, so the simulated
+        // client queue holds 80 ms beyond just-in-time delivery; the model
+        // ran dry for about 220 ms, adding 20 ms of starvation credit. The
+        // surplus of about 100 ms is well above reserve plus one block.
+        assert_eq!(stream.stall(&loud, 15), MAX_PENDING);
+        while stream.elapsed() < ms(12_000) {
+            let waves = stream.step(&loud);
+            assert_eq!(waves.len(), 1);
+            assert_eq!(waves[0].1, downmix_to_mono(&loud), "nothing dropped early");
+        }
+        // Armed at 10 s: the quiet block is dropped. Its successor has not
         // been captured yet, so it leaves on its own normal tick, faded in
         // from the dropped block's leading frames.
         assert!(stream.step(&quiet).is_empty(), "the quiet block is dropped");
         let mut faded = loud.clone();
         crossfade_into(&mut faded, &quiet[..DRIFT_SKIP_FADE_FRAMES * 4]);
-        assert_eq!(stream.step(&loud), [(ms(30_020), downmix_to_mono(&faded))]);
-        assert_eq!(stream.step(&loud), [(ms(30_040), downmix_to_mono(&loud))]);
+        assert_eq!(stream.step(&loud), [(ms(12_020), downmix_to_mono(&faded))]);
+        assert_eq!(stream.step(&loud), [(ms(12_040), downmix_to_mono(&loud))]);
         assert!(connection().get(Counter::AudioDriftSkips) > before);
-        // Rearmed 30 s after that skip. With backlog, the queued successor
-        // takes the dropped block's own tick: the schedule does not move.
-        while stream.elapsed() < ms(60_000) {
+        assert_eq!(stream.skips(), 1);
+        // Nothing else is dropped within the 10 s spacing. Another stall's
+        // burst restores the queue surplus (the starvation credit waits 30 s).
+        // With backlog, the queued successor takes the dropped block's own
+        // tick: the schedule does not move.
+        while stream.elapsed() < ms(14_000) {
+            assert_eq!(stream.step(&quiet).len(), 1, "within the spacing");
+        }
+        assert_eq!(stream.stall(&loud, 15), MAX_PENDING);
+        while stream.elapsed() < ms(22_100) {
             let waves = stream.step(&loud);
             assert_eq!(waves.len(), 1);
             assert_eq!(
@@ -3557,35 +4299,179 @@ mod tests {
         let burst = [quiet.clone(), second.clone(), loud.clone()].concat();
         let mut faded = second.clone();
         crossfade_into(&mut faded, &quiet[..DRIFT_SKIP_FADE_FRAMES * 4]);
-        assert_eq!(stream.step(&burst), [(ms(60_000), downmix_to_mono(&faded))]);
-        assert_eq!(stream.step(&loud), [(ms(60_020), downmix_to_mono(&loud))]);
-        assert_eq!(stream.step(&loud), [(ms(60_040), downmix_to_mono(&loud))]);
+        assert_eq!(stream.step(&burst), [(ms(22_100), downmix_to_mono(&faded))]);
+        assert_eq!(stream.step(&loud), [(ms(22_120), downmix_to_mono(&loud))]);
+        assert_eq!(stream.step(&loud), [(ms(22_140), downmix_to_mono(&loud))]);
         assert!(connection().get(Counter::AudioDriftSkips) >= before + 2);
+        assert_eq!(stream.skips(), 2);
     }
 
     #[test]
-    fn silence_suppression_restarts_the_drift_interval_and_audio_is_never_skipped_early() {
+    fn silence_suppression_resets_the_earned_surplus_and_audio_is_never_skipped_early() {
         let mut stream = LiveStream::new(pcm());
         let loud = stereo_block(12000, -11000);
         let quiet = stereo_block(150, -90);
         let silence = vec![0; BLOCK_BYTES];
+        let ms = Duration::from_millis;
+        for _ in 0..50 {
+            stream.step(&loud);
+        }
+        // A stall's burst earns 80 ms; at 10 s a skip is armed and would be
+        // forced at 15 s, but sound stops first.
+        assert_eq!(stream.stall(&loud, 15), MAX_PENDING);
+        while stream.elapsed() < ms(10_500) {
+            assert_eq!(stream.step(&loud).len(), 1);
+        }
+        // Silence is suppressed after its codec tail, emptying the estimate.
+        // The next 26 s of sound, with a quiet block every second, are
+        // delivered complete.
         let mut sent = Vec::new();
-        // 25 s of sound with a quiet block every second, then suppressed
-        // silence, then 25 s more: 50 s in all but never 30 s continuous.
-        for step in 0..2510u64 {
+        let mut quiet_written = 0;
+        for step in 0..1310u64 {
             let block = match step {
-                1250..1260 => &silence,
-                _ if step % 50 == 0 => &quiet,
+                0..10 => &silence,
+                _ if step % 50 == 0 => {
+                    quiet_written += 1;
+                    &quiet
+                }
                 _ => &loud,
             };
             sent.extend(stream.step(block).into_iter().map(|(_, data)| data));
         }
         let quiet_blocks = sent.iter().filter(|data| **data == quiet).count();
-        assert_eq!(quiet_blocks, 50, "every quiet block is delivered");
-        assert_eq!(sent.len(), 2500 + SILENCE_TAIL_BLOCKS);
+        assert_eq!(
+            quiet_blocks, quiet_written,
+            "every quiet block is delivered"
+        );
+        assert_eq!(sent.len(), 1300 + SILENCE_TAIL_BLOCKS);
         assert!(
             sent.iter()
                 .all(|data| *data == loud || *data == quiet || *data == silence)
+        );
+    }
+
+    #[test]
+    fn discarded_capture_never_earns_a_drift_skip() {
+        let mut stream = LiveStream::new(pcm_mono_format());
+        // Capture outruns the 20 ms send schedule threefold for a minute: the
+        // bounded FIFO discards two of every three blocks. Discarded blocks
+        // are never sent or confirmed, so they earn nothing. A skip would
+        // crossfade the quiet block's head into a queued successor.
+        let blocks = [
+            stereo_block(150, -90),
+            stereo_block(12000, -11000),
+            stereo_block(9000, 9000),
+        ];
+        let expected: Vec<_> = blocks.iter().map(|block| downmix_to_mono(block)).collect();
+        let burst = blocks.concat();
+        let mut waves = 0;
+        while stream.elapsed() < Duration::from_secs(60) {
+            for (_, data) in stream.step(&burst) {
+                assert!(expected.contains(&data), "a block was skipped");
+                waves += 1;
+            }
+        }
+        assert_eq!(waves, 3000, "one wave per tick, none skipped");
+        assert_eq!(stream.skips(), 0);
+    }
+
+    #[test]
+    fn compressed_fallbacks_never_drift_skip_after_stall_bursts_or_starvation() {
+        let adpcm = Adpcm::new().unwrap().format.clone();
+        for format in [aac_format(), adpcm] {
+            let mut stream = LiveStream::new(format.clone());
+            let loud = stereo_block(12000, -11000);
+            let quiet = stereo_block(150, -90);
+            let mut waves = 0;
+            for _ in 0..100 {
+                waves += stream.step(&loud).len();
+            }
+            // Zero-round-trip stalls: bursts plus starvation, twice, then 15 s
+            // with a quiet block every 500 ms.
+            for _ in 0..2 {
+                waves += stream.stall(&loud, 15);
+                for step in 0..250u64 {
+                    let block = if step.is_multiple_of(25) {
+                        &quiet
+                    } else {
+                        &loud
+                    };
+                    waves += stream.step(block).len();
+                }
+            }
+            while stream.elapsed() < Duration::from_secs(20) {
+                waves += stream.step(&quiet).len();
+            }
+            assert!(waves > 500, "{:?} kept sending: {waves}", format.format);
+            assert_eq!(stream.skips(), 0, "{:?}", format.format);
+        }
+    }
+
+    #[test]
+    fn stereo_channels_knob_prefers_stereo_pcm_and_skips_the_same_way() {
+        let tuning = AudioTuning {
+            mono: false,
+            ..AudioTuning::default()
+        };
+        // The client accepts both; the knob removes mono from the offer.
+        let mut stream = LiveStream::with(vec![pcm_mono_format(), pcm()], tuning);
+        let loud = stereo_block(12000, -11000);
+        let quiet = stereo_block(150, -90);
+        let ms = Duration::from_millis;
+        for _ in 0..100 {
+            assert_eq!(stream.step(&loud)[0].1, loud, "exact stereo samples");
+        }
+        assert_eq!(stream.stall(&loud, 15), MAX_PENDING);
+        while stream.elapsed() < ms(12_000) {
+            let at = stream.elapsed();
+            assert_eq!(stream.step(&loud), [(at, loud.clone())]);
+        }
+        assert!(stream.step(&quiet).is_empty(), "the quiet block is dropped");
+        let mut faded = loud.clone();
+        crossfade_into(&mut faded, &quiet[..DRIFT_SKIP_FADE_FRAMES * 4]);
+        assert_eq!(stream.step(&loud), [(ms(12_020), faded)]);
+        assert_eq!(stream.skips(), 1);
+    }
+
+    #[test]
+    fn bunched_and_delayed_confirmations_cannot_repeat_unearned_skips() {
+        let mut stream = LiveStream::new(pcm_mono_format());
+        let loud = stereo_block(12000, -11000);
+        let quiet = stereo_block(150, -90);
+        let block = |step: u64| {
+            if step.is_multiple_of(25) {
+                &quiet
+            } else {
+                &loud
+            }
+        };
+        // A minute of return-path batching: receipts come back four at a
+        // time, the first 60 ms late. The forward stream is unchanged, so
+        // nothing is earned beyond the drift allowance.
+        let mut step = 0u64;
+        while stream.elapsed() < Duration::from_secs(60) {
+            assert_eq!(stream.step_with(block(step), false).len(), 1);
+            if step % 4 == 3 {
+                stream.release();
+            }
+            step += 1;
+        }
+        assert_eq!(stream.skips(), 0, "batched receipts earned nothing");
+        // Two minutes more with a 200 ms receipt stall every 2 s on top. Each
+        // stall starves the model, but starvation credit is limited to one
+        // block per 30 s, and batching keeps the observed queue low.
+        while stream.elapsed() < Duration::from_secs(180) {
+            let stalled = step % 100 >= 90;
+            stream.step_with(block(step), false);
+            if !stalled && step % 4 == 3 {
+                stream.release();
+            }
+            step += 1;
+        }
+        let skips = stream.skips();
+        assert!(
+            skips <= 4,
+            "at most one per 30 s of starvation credit: {skips}"
         );
     }
 

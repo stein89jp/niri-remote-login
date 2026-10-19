@@ -12,6 +12,128 @@ entries below. Their results are automated, namespace, lab and package checks;
 the user confirmed the installed-host Windows 10 mstsc checks for this release
 in [acceptance](acceptance.md) on 2026-10-17.
 
+## Crackling with the blind drift skip and the earned skip, 2026-10-20
+
+- Finding: with the 2026-10-18 build installed, the user reported that A/V sync
+  in Windows 10 mstsc was now perfect, but sound crackled and was robotic. The
+  user asked to fix the audio quality without reverting to the old defaults and
+  while keeping the sync; the mono PCM preference stays. An audit found the mono
+  format wiring, the (L+R)/2 downmix and the skip mechanics correct. No
+  measurement of mstsc's queue exists: `NIRI_RDP_DIAGNOSTICS` was not enabled,
+  and the frontend journal holds no connection summary yet for a session with
+  continuous sound since the install.
+- Hypothesis (unmeasured): the blind skip removed 20 ms every 30 s, about
+  667 ppm, far above plausible device clock drift (about 20–100 ppm). Because
+  mstsc confirms waves on arrival, nothing showed when its queue was already at
+  its minimum. Repeated drops would drain the queue to about zero, so ordinary
+  internet jitter then made it run dry: crackling, robotic playback.
+- Change: the drop must now be earned. `ArrivalModel` in `bridge/src/audio.rs`
+  simulates a client that starts with an empty queue, receives each wave when
+  its first Wave Confirm arrives (receipt of a later wave also counts the
+  earlier ones it proves, as for transport credit), pauses when empty, and
+  plays each 20 ms block 100 ppm slower than real time. The modelled queue just
+  before each arrival, taken at its minimum over the last one to two seconds,
+  plus any unused starvation credit (below), capped at 1 s, is the earned
+  surplus.
+  - Catch-up credit is what the receipts show. When a stall delays waves and
+    they then arrive together, the client keeps the excess queued, and so does
+    the model. Only sent waves are confirmed: capture discarded as stale (60 ms
+    expiry), on FIFO overflow or under pressure is never credited. Sending gaps
+    (credit waits, worker stalls, late capture, a skip without a queued
+    successor) drain the estimate. The scheduler itself never catches up a
+    whole block: a lag of 20 ms or more restarts the schedule, and a smaller lag
+    only refills what the preceding gap drained. Crediting send-schedule lag
+    directly would also have credited ordinary PipeWire quantum batching on
+    every cycle. Four transport credits bound a single stall's burst to about
+    80 ms less the round trip: one stall adds at most that much to the observed
+    queue, and successive stalls do not stack, because each drains the model
+    first. Below a 20 ms round trip a stall can reach reserve plus one block;
+    over the internet (20–60 ms) it earns little, so the observed queue alone
+    cannot explain the pre-2026-10-18 growth.
+  - Starvation credit, added after review on 2026-10-20 to keep the user's
+    sync. That growth followed credit waits (28 in one 50-minute session), so
+    the likely mechanism is mstsc rebuilding a larger queue after running dry,
+    which receipts cannot show. When the model has run dry for at least 100 ms
+    within a sound run, it records a starvation; at most once per 30 s, that
+    earns 20 ms of credit. 100 ms is above ordinary jitter, at the scale of a
+    stall that empties a small client queue; 20 ms per 30 s caps it at the
+    former blind rate of 667 ppm, and it accrues only during network trouble.
+    The credit still needs the reserve, the spacing and the quiet preference.
+    A drop whose gap the observed queue cannot absorb is charged to the credit;
+    silence suppression clears it (keeping the 30 s spacing), and receipts of
+    waves sent before suppression are ignored, so idle time is never mistaken
+    for starvation. Compressed fallbacks never feed the model. The connection
+    summary adds `audio_model_starvations` and `audio_model_starved_ms`.
+  - The drift allowance (100 ppm, 20 ms per 200 s of continuous sound) covers
+    client clock drift, which receipts cannot show. Steady audio first earns a
+    drop after about 800 s and then every further 200 s.
+  - Tuning knobs, read once at frontend startup from `frontend.conf`, with the
+    baseline as default: `NIRI_RDP_AUDIO_DRIFT_PPM` (0–2000, default 100;
+    larger values clamp to 2000, invalid values warn and keep 100) and
+    `NIRI_RDP_AUDIO_CHANNELS` (`mono` default, or `stereo`, which removes mono
+    from the PCM offer so stereo PCM is preferred; fallbacks unchanged). The
+    `RDP audio PCM: ...` line now ends with the effective
+    `channels=… drift_ppm=… drift_skip=on|off`.
+  - A drop needs a surplus of at least the 60 ms reserve plus 20 ms, and 10 s
+    since the previous drop or since sound started or resumed. The 10 s
+    spacing, shorter than the old 30 s, only limits how fast an earned backlog
+    is repaid, for example accumulated drift or starvation credit; four
+    transport credits keep any single stall from earning a large backlog. The
+    skipped block is never confirmed, so
+    the estimate falls 20 ms when later waves arrive; with a queued successor,
+    the drop instead removes 20 ms of server capture backlog and the client
+    queue is unchanged. Silence suppression empties the estimate. A codec
+    recovery after lost capture keeps it, because discarded capture was never
+    sent and any sending gap already shows in later confirmations.
+  - Unchanged: the quiet-block preference (about -40 dBFS, or a quarter of the
+    recent level), the forced drop 5 s after arming, never dropping digital
+    silence, the send schedule, the 5 ms crossfade, PCM only, and no capture
+    loss, credit wait, pressure or codec reset. `audio_drift_skips` is kept;
+    with `NIRI_RDP_DIAGNOSTICS=1`, `RDP audio drift skip` and the 5 s
+    `RDP audio confirms` summaries add `earned_ms`.
+- Automated evidence: `make check` passed: `cargo fmt --check` and Clippy
+  `-D warnings`, 143 Python tests (3 opt-ins skipped), 18 native broker groups,
+  285 bridge library tests (1 ignored, 279 before the review follow-up below)
+  and the integration targets.
+  New or rewritten Rust regressions cover: no drop with a surplus 1 µs short of
+  the threshold; the 10 s spacing from a run start and between drops; quiet
+  preference; forced drops and disarming when the surplus falls; restart after
+  silence; five minutes of steady sound earning only the drift allowance
+  (about 30 ms, no drop), then drops near 800 s and 1,000 s; a four-wave stall
+  burst staying inside the reserve; a 12-block (240 ms) burst repaid by exactly eight drops
+  at least 10 s apart, each relying on reserve plus 20 ms and ending at the
+  reserve; the 1 s cap; the reset at suppression; Wave Confirm counting (once
+  per wave, second confirmations ignored, FIFO receipts counted); and, through
+  the real worker, a minute of threefold capture overflow without a drop, drops
+  only after a stall's burst with an unchanged send schedule with and without a
+  queued successor, and no drop for 26 s after suppressed silence. Mutation
+  checks: a zero reserve fails the steady and burst regressions; counting second
+  confirmations fails the confirm regression. The mono PCM preference/wire-byte,
+  downmix and credit-wait continuity regressions pass unchanged. Review
+  follow-up regressions cover: starvation credit at most once per 30 s (19
+  starvations of 200 ms in 100 s earn four credits; 80 ms gaps earn none) and
+  its charge on a drop; no credit across silence suppression from late tail
+  receipts, and none for compressed audio; knob parsing (default, valid,
+  invalid, clamp); AAC and MS ADPCM never skipping after zero-round-trip stall
+  bursts with starvation; stereo PCM preferred by `NIRI_RDP_AUDIO_CHANNELS=stereo`
+  with exact stereo samples and a working drop; return-path batching (receipts
+  four at a time) earning no drop in a minute, and stalls every 2 s on top
+  giving at most one drop per 30 s (one in two minutes). The main worker drop
+  test now runs at about 100 ms of surplus, off the 80 ms threshold. The
+  connection summary format test covers the new counters.
+- Pending: the user's Windows 10 mstsc listening check of clarity, inaudible
+  drops and sync over 30+ minutes of continuous internet playback. If delay
+  creeps back during long continuous sound without network trouble, the
+  client's clock drift exceeds the allowance: raise `NIRI_RDP_AUDIO_DRIFT_PPM`
+  (for example 300) and restart the frontend. If crackling remains, this
+  hypothesis was wrong; `NIRI_RDP_AUDIO_CHANNELS=stereo` A/B-tests mono against
+  the 2026-10-12 stereo baseline without a rebuild.
+  Enabling `NIRI_RDP_DIAGNOSTICS=1` would log each drop with its surplus and
+  show whether mstsc's second confirmations report playback time. The change
+  needs the clean [uninstall](uninstall.md)/[install](install.md) cycle before
+  it can be tested. The two knobs are optional commented entries in the shipped
+  `frontend.conf`; the install and uninstall procedures are unchanged.
+
 ## Growing audio delay, mono PCM and drift skip, 2026-10-18
 
 - Finding: in Windows 10 mstsc over the internet, the user reported audio delay
@@ -21,9 +143,11 @@ in [acceptance](acceptance.md) on 2026-10-17.
   apparently confirms waves on arrival, so the 300 ms render guard almost never
   fires and buffering inside mstsc is invisible to the server. Below 300 ms there
   was no drift correction. The client queue grows from clock drift between the
-  Linux clock and the Windows audio device, and from a "jitter ratchet": each
-  network stall (28 credit waits in one 50-minute session) adds permanently to
-  the queue. Only suppressed digital silence let it drain. Stereo PCM, at about
+  Linux clock and the Windows audio device, and from a "jitter ratchet" after
+  network stalls (28 credit waits in one 50-minute session). (Corrected
+  2026-10-20: four transport credits bound one stall's burst to about 80 ms,
+  and stalls do not stack in the queue directly; the growth more likely comes
+  from mstsc rebuilding a larger queue after running dry, or from drift.) Only suppressed digital silence let it drain. Stereo PCM, at about
   1.54 Mbit/s, also used more bandwidth than the video (about 0.9 Mbit/s) on
   that link.
 - User-approved change: on 2026-10-18 the user explicitly requested two changes

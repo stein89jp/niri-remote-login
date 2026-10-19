@@ -3,9 +3,12 @@
 The remote desktop keeps one display and bounded latest-frame delivery. Since
 2026-10-18 the audio baseline prefers 48 kHz mono S16LE PCM in 20 ms blocks,
 falling back to the previously accepted stereo PCM, with both RDPSND timestamps
-zero and a periodic 20 ms drift catch-up during continuous PCM sound
-([session audio](../bridge/README.md#session-audio)); Windows listening
-validation of that change is pending. Audio and video measurements use internal monotonic
+zero and an earned 20 ms drift catch-up during continuous PCM sound (since
+2026-10-20 a drop needs an estimated client-queue surplus above a 60 ms jitter
+reserve, replacing a blind drop every 30 s; `NIRI_RDP_AUDIO_CHANNELS` and
+`NIRI_RDP_AUDIO_DRIFT_PPM` default to that baseline;
+[session audio](../bridge/README.md#session-audio)); Windows listening
+validation of these changes is pending. Audio and video measurements use internal monotonic
 time; graphics acknowledgements do not establish physical presentation or an
 audio/video clock.
 
@@ -29,6 +32,8 @@ before desktop capture starts.
 | `NIRI_RDP_SCALE` | `client` or explicit 1.0–5.0; an explicit value takes precedence over client Display Control scale metadata |
 | `NIRI_RDP_ADAPTIVE_GRAPHICS` | `1` opts into coordinated FPS, which lowers the cadence with the bitrate level (not below 10); `0` (default) keeps the configured FPS. Either way the graphics credit window follows the measured ACK delay (2–8 frames, see below) |
 | `NIRI_RDP_MICROPHONE` | `auto` (default) offers mstsc microphone redirection (MS-RDPEAI `AUDIO_INPUT`, 48 kHz mono PCM preferred, about 0.8 Mbit/s upload while a remote application records); `off` offers no channel. Separate from playback; see [remote microphone](install.md#remote-microphone) |
+| `NIRI_RDP_AUDIO_CHANNELS` | `mono` (default) offers 48 kHz mono PCM first, then stereo PCM; `stereo` removes mono from the offer, so stereo PCM (about 1.54 Mbit/s) is preferred. Compressed fallbacks are unchanged. Invalid values warn and use `mono` |
+| `NIRI_RDP_AUDIO_DRIFT_PPM` | 0–2000, default 100; the PCM drift skip's allowance for Windows audio clock drift (20 ms per 200 s of continuous sound at 100). Larger values clamp to 2000; invalid values warn and use 100 |
 | `NIRI_RDP_DIAGNOSTICS` | `1` enables bounded timing/counter reports, including `idr_frames`, `deferred_rate_increase_frames`, `bitrate_level_decreases` and `bitrate_level_increases`; ordinary operation avoids diagnostic aggregation |
 
 H.264 frames are limited by a graphics credit window: frames sent but not yet
@@ -79,14 +84,17 @@ ends with one always-on `RDP connection summary` journal line, independent of
 `NIRI_RDP_DIAGNOSTICS`:
 
 ```text
-RDP connection summary peer=192.0.2.10:50123 duration_s=60.0 result=ok video_codec=h264 video_mode=avc420 frames=3600 idr_frames=4 video_avg_kbps=1000 audio_codec=pcm audio_waves=3000 audio_discarded_blocks=5 audio_credit_waits=6 audio_codec_recoveries=7 audio_drift_skips=0 clipboard_to_client=8 clipboard_from_client=9 clipboard_timeouts=10 clipboard_oversize_drops=11 mic=pcm_48000_mono mic_opens=2 mic_packets=1306 mic_bytes=2507520 mic_dropped=0 mic_errors=0 client_frame_ack_limit=2 window_max=8 window_avg=7.8
+RDP connection summary peer=192.0.2.10:50123 duration_s=60.0 result=ok video_codec=h264 video_mode=avc420 frames=3600 idr_frames=4 video_avg_kbps=1000 audio_codec=pcm audio_waves=3000 audio_discarded_blocks=5 audio_credit_waits=6 audio_codec_recoveries=7 audio_drift_skips=0 audio_model_starvations=0 audio_model_starved_ms=0 clipboard_to_client=8 clipboard_from_client=9 clipboard_timeouts=10 clipboard_oversize_drops=11 mic=pcm_48000_mono mic_opens=2 mic_packets=1306 mic_bytes=2507520 mic_dropped=0 mic_errors=0 client_frame_ack_limit=2 window_max=8 window_avg=7.8
 ```
 
 It records the peer address, duration, `result=ok` or `error`, video codec and
 mode, H.264 frames, IDR frames, average H.264 payload kbps, audio codec, waves,
 discarded capture blocks, credit waits, codec recoveries and drift skips (audible
-20 ms PCM blocks dropped by the periodic drift catch-up, about two per minute of
-continuous sound), clipboard transfers each way, clipboard timeouts and oversize drops. The microphone fields give the
+20 ms PCM blocks dropped by the earned drift catch-up: about one per 200 s of
+continuous sound after the first 800 s, plus any repaid burst surplus or
+starvation credit above the reserve), arrival-model starvations (the PCM model
+of the client queue ran dry for at least 100 ms, a likely client underrun) and
+their total milliseconds, clipboard transfers each way, clipboard timeouts and oversize drops. The microphone fields give the
 recording format (`mic=none` when Windows never recorded), successful opens,
 packets and bytes received, audio frames dropped by the bounded queues, and
 failed or unanswered opens, invalid packets and helper connection errors.
