@@ -39,7 +39,12 @@ Pacman preserves changed configuration as `.pacsave`; inspect it before removal.
 The package configuration files are `/etc/niri-rdp/frontend.conf`,
 `headless.kdl`, `waybar.json`, `renderer.conf`, `broker.conf` (left as
 `/etc/niri-rdp/broker.conf.pacsave` if you changed the grace period) and
-`/etc/pam.d/niri-rdp`. Remove the leftovers when discarding the experiment:
+`/etc/pam.d/niri-rdp`. A `frontend.conf` in which you uncommented settings,
+such as the `NIRI_RDP_AUDIO_CHANNELS`, `NIRI_RDP_AUDIO_RATE` or
+`NIRI_RDP_AUDIO_DRIFT_PPM` playback settings, is left as `frontend.conf.pacsave`;
+a fresh install starts from the shipped defaults (44.1 kHz stereo PCM), so copy
+over only the settings you still want. Remove the leftovers when discarding the
+experiment:
 
 ```sh
 sudo rm -f -- /etc/niri-rdp/*.pacsave /etc/niri-rdp/*.pacnew \

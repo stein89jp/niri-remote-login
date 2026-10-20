@@ -461,8 +461,13 @@ and robotic in Windows 10 mstsc on 2026-10-20, so leave it unset.
 PCM drift skip; raise it, for example to 300, only if the audio delay creeps up
 during long continuous sound. Invalid values log a warning and keep the
 default; values above 2000 use 2000. The frontend reads them at startup, so a
-change needs the same frontend restart, and the `RDP audio PCM` journal line
-shows the values in effect.
+change needs the same frontend restart. The `RDP audio PCM` journal line shows
+the values in effect (for the default,
+`RDP audio PCM: 44100 Hz stereo, 1411 kbps, 20.00 ms blocks; channels=stereo
+rate=44100 drift_ppm=100 drift_skip=on`), and the `RDP audio formats: client
+accepted [...]; chosen ...` line before it lists the formats mstsc accepted.
+`NIRI_RDP_DIAGNOSTICS=1` additionally logs each drift skip and the Wave Confirm
+timings; leave it unset for ordinary use.
 
 Inside the remote desktop the microphone is the PipeWire source
 **Remote microphone (RDP)** (`niri-rdp-microphone`), and it is the default
@@ -758,7 +763,7 @@ sudo systemctl restart niri-rdp-frontend.service
 
 ## Performance and desktop upgrades
 
-The combined 1.5.6 package includes damage-aware capture, input/resize coalescing,
+The combined 1.6.0 package includes damage-aware capture, input/resize coalescing,
 cached login rendering, stale-ACK recovery, separate negotiated cursor updates,
 a private bidirectional clipboard and deliberate DPI scaling. The clipboard
 carries Unicode text (up to 1 MiB), HTML (up to 4 MiB) and images (up to 32 MiB

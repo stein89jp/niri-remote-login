@@ -279,7 +279,10 @@ stereo frame to (L+R)/2, rounding halves away from zero without overflow,
 before resampling, and offers mono PCM at the selected rate first (44.1 kHz:
 1764 bytes per 20 ms wave, 88200 bytes/s; 48 kHz: 1920 bytes, 96000 bytes/s).
 At each audio channel start the journal lists the client-accepted formats
-(`RDP audio formats: client accepted [...]; chosen ...`). Windows 10 mstsc playback was intelligible with PCM, but
+(`RDP audio formats: client accepted [...]; chosen ...`). A 20-minute continuous YouTube playback in actual Windows 10
+mstsc with the 44.1 kHz default was clean and in sync (user-confirmed
+2026-10-20; longer runs, constrained bandwidth and repeated reconnects remain
+acceptance checks). Windows 10 mstsc playback was intelligible with PCM, but
 both compressed offers have produced static in actual listening checks. Clients
 that do not accept PCM can use GNOME Remote Login's AAC-LC format: `AAC_MS`, stereo 44.1 kHz at 96 kbit/s,
 1024 sample frames per raw packet, with no ADTS header or WAVE extra data.

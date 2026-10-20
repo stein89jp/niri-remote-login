@@ -56,6 +56,20 @@ replaces `/usr/bin/niri` automatically.
 
 ## Rebuild the installed combined package
 
+Version `1.6.0-1`, published as `v1.6.0`, fixes Windows mstsc audio on top of
+`1.5.6-1`: 44.1 kHz stereo S16LE PCM is preferred (the 48 kHz capture is
+resampled in the bridge to exactly 882 frames per 20 ms), because mstsc played
+48 kHz PCM at 44.1 kHz. Stereo is the default again and mono is opt-in, and an
+earned drift skip replaces the blind 30 s skip. From 1.5.x, use the clean
+reinstall cycle: remove the installation with [uninstall](uninstall.md), then
+install fresh with [install](install.md). The new settings
+`NIRI_RDP_AUDIO_CHANNELS` (`stereo`), `NIRI_RDP_AUDIO_RATE` (`44100`) and
+`NIRI_RDP_AUDIO_DRIFT_PPM` (`100`) are optional in `frontend.conf` and default
+to those values when absent; an existing configuration, including old manual
+mono-era lines, keeps working, though a leftover `mono` or `48000` setting
+overrides the new default. The connection summary gains the counters
+`audio_model_starvations` and `audio_model_starved_ms`.
+
 Version `1.5.6-1`, published as `v1.5.6`, adds headless frame pacing (patch
 0013) and the delay-based H.264 frame window to `1.5.5-1`. From 1.5.5, stop both
 services, `pacman -U` the new package (or use the clean reinstall cycle), and
@@ -304,7 +318,7 @@ necessarily the build or install date, and several builds may share one commit.
 Releases 1–3 were split packages (`niri-remote-login` plus `niri-rdp-headless`);
 the combined `packaging/arch/niri-rdp` package starts at release 4.
 "Headless" is the `niri-rdp-headless` version built from the same commit.
-GitHub lists `v1.0.2`, `v1.5`, `v1.5.5` and `v1.5.6` as published releases; tags `v1.0.0`
+GitHub lists `v1.0.2`, `v1.5`, `v1.5.5`, `v1.5.6` and `v1.6.0` as published releases; tags `v1.0.0`
 and `v1.0.1` exist without a GitHub release.
 
 | Package | Release | Date | Commit | Headless | Headline change |
@@ -336,10 +350,11 @@ and `v1.0.1` exist without a GitHub release.
 | `1.1.0-2` | — | 2026-10-15 | `a4e7b5e` | `26.04.remote1-8` | mstsc cursor-jumping fix, NVIDIA improvements |
 | `1.5-1` | — | 2026-10-15 | `bae6626` | `26.04.remote1-9` | Published `v1.5`: 1.1.0-2 runtime as a release |
 | `1.5.5-1` | — | 2026-10-15 | `dfa3d13` | `26.04.remote2-1` | Published `v1.5.5`: Niri rebase, hardening, rich clipboard, microphone |
-| `1.5.6-1` | — | 2026-10-17 | this release | `26.04.remote2-1` + 0013 | Published `v1.5.6`: headless frame pacing, delay-based H.264 frame window |
+| `1.5.6-1` | — | 2026-10-17 | `c1cdaba` | `26.04.remote2-1` + 0013 | Published `v1.5.6`: headless frame pacing, delay-based H.264 frame window |
+| `1.6.0-1` | — | 2026-10-20 | this release | `26.04.remote2-1` + 0013 | Published `v1.6.0`: 44.1 kHz stereo PCM for mstsc, earned audio drift skip, audio settings |
 
 `niri-rdp-headless` `26.04.remote1-7` does not appear in any commit. The
-PKGBUILDs and `scripts/prepare-release.py` carry `pkgver=1.5.6`/`pkgrel=1`. Bump the version again before
+PKGBUILDs and `scripts/prepare-release.py` carry `pkgver=1.6.0`/`pkgrel=1`. Bump the version again before
 building or publishing later changes, so packages with different contents never
 share a version.
 

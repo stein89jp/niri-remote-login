@@ -1,5 +1,14 @@
 # Validation record
 
+Release `1.6.0-1` (`v1.6.0`) packages the Windows mstsc audio fix on top of
+`1.5.6-1`: 44.1 kHz stereo S16LE PCM preferred (48 kHz capture resampled to
+exactly 882 frames per 20 ms), stereo default with mono opt-in, the earned drift
+skip, the `NIRI_RDP_AUDIO_CHANNELS`, `NIRI_RDP_AUDIO_RATE` and
+`NIRI_RDP_AUDIO_DRIFT_PPM` settings, client format logging and the
+`audio_model_starvations`/`audio_model_starved_ms` summary counters. On
+2026-10-20 the user confirmed in Windows 10 mstsc that a 20-minute YouTube video
+over the internet stayed perfectly in sync with clean audio.
+
 Release `1.5.6-1` (`v1.5.6`) packages the 2026-10-17 graphics frame window
 entry below and the headless frame-pacing patch 0013 recorded in the
 [compositor checkpoint](../compositor/CHECKPOINT.md) on top of `1.5.5-1`. On
@@ -14,10 +23,19 @@ in [acceptance](acceptance.md) on 2026-10-17.
 
 ## Crackling with the blind drift skip and the earned skip, 2026-10-20
 
+Reading note: the bullets below are in the order the day's findings arrived,
+so the first ones describe intermediate states (mono default, 48 kHz offer,
+unmeasured hypotheses) that later bullets supersede. The final state, user-
+confirmed in the 20-minute result at the end, is: 44.1 kHz stereo PCM first,
+then 48 kHz stereo PCM, AAC and ADPCM; mono only as an opt-in; the earned drift
+skip; defaults `NIRI_RDP_AUDIO_CHANNELS=stereo`, `NIRI_RDP_AUDIO_RATE=44100`
+and `NIRI_RDP_AUDIO_DRIFT_PPM=100`.
+
 - Finding: with the 2026-10-18 build installed, the user reported that A/V sync
   in Windows 10 mstsc was now perfect, but sound crackled and was robotic. The
   user asked to fix the audio quality without reverting to the old defaults and
-  while keeping the sync; the mono PCM preference stays. An audit found the mono
+  while keeping the sync; the mono PCM preference stays (superseded the same
+  day: stereo is the default again, see the A/B result). An audit found the mono
   format wiring, the (L+R)/2 downmix and the skip mechanics correct. No
   measurement of mstsc's queue exists: `NIRI_RDP_DIAGNOSTICS` was not enabled,
   and the frontend journal holds no connection summary yet for a session with
@@ -26,7 +44,10 @@ in [acceptance](acceptance.md) on 2026-10-17.
   667 ppm, far above plausible device clock drift (about 20–100 ppm). Because
   mstsc confirms waves on arrival, nothing showed when its queue was already at
   its minimum. Repeated drops would drain the queue to about zero, so ordinary
-  internet jitter then made it run dry: crackling, robotic playback.
+  internet jitter then made it run dry: crackling, robotic playback. (Not
+  supported by the later A/B result: the crackling and robot sound came from
+  48 kHz mono PCM in mstsc, not from the blind skip. The earned skip stays as
+  the safer design, but it was not what fixed the sound.)
 - Change: the drop must now be earned. `ArrivalModel` in `bridge/src/audio.rs`
   simulates a client that starts with an empty queue, receives each wave when
   its first Wave Confirm arrives (receipt of a later wave also counts the
@@ -70,8 +91,9 @@ in [acceptance](acceptance.md) on 2026-10-17.
   - Tuning knobs, read once at frontend startup from `frontend.conf`, with the
     baseline as default: `NIRI_RDP_AUDIO_DRIFT_PPM` (0–2000, default 100;
     larger values clamp to 2000, invalid values warn and keep 100) and
-    `NIRI_RDP_AUDIO_CHANNELS` (`mono` default, or `stereo`, which removes mono
-    from the PCM offer so stereo PCM is preferred; fallbacks unchanged). The
+    `NIRI_RDP_AUDIO_CHANNELS` (`mono` default at this point in the day, or
+    `stereo`, which removes mono from the PCM offer so stereo PCM is preferred;
+    fallbacks unchanged; the default became `stereo` after the A/B result). The
     `RDP audio PCM: ...` line now ends with the effective
     `channels=… drift_ppm=… drift_skip=on|off`.
   - A drop needs a surplus of at least the 60 ms reserve plus 20 ms, and 10 s
@@ -126,7 +148,8 @@ in [acceptance](acceptance.md) on 2026-10-17.
   creeps back during long continuous sound without network trouble, the
   client's clock drift exceeds the allowance: raise `NIRI_RDP_AUDIO_DRIFT_PPM`
   (for example 300) and restart the frontend. If crackling remains, this
-  hypothesis was wrong. (Superseded by the A/B result below.)
+  hypothesis was wrong. (Superseded by the A/B result and the 20-minute result
+  below.)
   Enabling `NIRI_RDP_DIAGNOSTICS=1` would log each drop with its surplus and
   show whether mstsc's second confirmations report playback time. The change
   needs the clean [uninstall](uninstall.md)/[install](install.md) cycle before
@@ -152,8 +175,9 @@ in [acceptance](acceptance.md) on 2026-10-17.
   and `NIRI_RDP_AUDIO_DRIFT_PPM` default 100 are unchanged. Rust tests now pin
   the stereo-first default offer (2 ch, block align 4, 192000 bytes/s, 16 bit)
   with no mono, the mono opt-in offer and downmix, and run the drift-skip tests
-  on the default stereo path. Still to be watched: long-session stereo lip-sync
-  over the internet with the earned skip. The change needs the clean
+  on the default stereo path. (The long-session lip-sync check that was still
+  open here then showed the 48 kHz rate problem below; the 44.1 kHz build
+  passed it, see the 20-minute result.) The change needs the clean
   [uninstall](uninstall.md)/[install](install.md) cycle before it can be tested.
 - Long-run drift with 48 kHz stereo PCM, 2026-10-20 (user-observed in actual
   Windows 10 mstsc): after about 5 minutes of continuous YouTube playback the
@@ -168,8 +192,10 @@ in [acceptance](acceptance.md) on 2026-10-17.
   latency" had no long-run measurement. No wFormatNo bug was found: IronRDP's
   rdpsnd indexes the client's list per MS-RDPEA and matches
   `nSamplesPerSec` strictly, and no 44.1 kHz PCM was in the offer. Real
-  Windows RDP servers never offer 48 kHz. Strong hypothesis: mstsc
-  mishandles 48 kHz PCM by playing it at 44.1 kHz.
+  Windows RDP servers never offer 48 kHz. Hypothesis at that point: mstsc
+  mishandles 48 kHz PCM by playing it at 44.1 kHz (confirmed by listening in
+  the 20-minute result below; the mechanism inside mstsc is inferred, not
+  examined).
 - Change, user-approved 2026-10-20: the default offer is 44.1 kHz stereo
   S16LE PCM (2 ch, 44100 Hz, 176400 bytes/s, block align 4, 16 bit; about
   1.41 Mbit/s), then 48 kHz stereo PCM, AAC_MS and MS ADPCM. The bridge
@@ -200,13 +226,52 @@ in [acceptance](acceptance.md) on 2026-10-17.
   credit waits (with and without queued capture) and its restart after capture
   loss and silence suppression; the drift skip on the 44.1 kHz path drops a
   48 kHz block before resampling. The FreeRDP fixture also accepts 44.1 kHz
-  mono and stereo PCM. AAC and ADPCM tests are unchanged. Pending: actual
-  Windows 10 mstsc listening and long-run lip-sync (5–30 minutes of continuous
-  sound, offset must stay constant). The change needs the clean
-  [uninstall](uninstall.md)/[install](install.md) cycle before it can be
-  tested.
+  mono and stereo PCM. AAC and ADPCM tests are unchanged. The Windows 10 mstsc
+  listening and long-run lip-sync check was pending here and is recorded in
+  the next bullet. The change needed the clean [uninstall](uninstall.md)/
+  [install](install.md) cycle before it could be tested.
+- 20-minute result, 2026-10-20 (user-verified in actual Windows 10 mstsc over
+  the internet, after a clean reinstall of the 44.1 kHz build): the user played
+  a 20-minute YouTube video start to finish and reported it "perfect": audio
+  stayed in sync with the video and sounded clean the whole time. The same
+  client had fallen about 25 s behind in 5 minutes with 48 kHz stereo PCM and
+  sounded pitched-up and robotic with 48 kHz mono. This passes the
+  long-session clarity and lip-sync check for the 44.1 kHz default, and
+  confirms by outcome that the 48 kHz rate was the cause (changing only the
+  sample rate removed the drift); how mstsc mishandles 48 kHz PCM internally
+  remains inferred. The frontend journal for that connection shows the
+  negotiation: `RDP audio formats: client accepted [1 PCM/2ch/44100Hz/16bit,
+  1 PCM/2ch/48000Hz/16bit, 41222 AAC_MS/2ch/44100Hz/16bit,
+  2 ADPCM/2ch/48000Hz/4bit]; chosen 1 PCM/2ch/44100Hz/16bit` and `RDP audio
+  PCM: 44100 Hz stereo, 1411 kbps, 20.00 ms blocks; channels=stereo
+  rate=44100 drift_ppm=100 drift_skip=on`. Not determined: whether the earned
+  drift skip fired during the 20 minutes. `NIRI_RDP_DIAGNOSTICS` was not
+  enabled, so there are no per-drop lines, and the `RDP connection summary`
+  line with `audio_drift_skips`, credit waits and starvations is only written
+  when the connection ends, which had not happened when this was recorded. Over
+  the 20 minutes, the 5-minute rate drift would have grown to about 100 s of
+  delay at 48 kHz, so a 20 ms drop every 200 s could not have hidden it; the
+  result shows only that the 44.1 kHz path plus the earned skip stays clean,
+  not that the skip itself did anything. The same frontend process also logged
+  16 throttled `RDP audio delay: ... dropping stale capture and reducing video
+  bandwidth` warnings (receipt up to 152 ms, render up to 623 ms) from 10:09 to
+  10:23 JST; they were not analysed, and the user heard nothing wrong.
+  Still open: longer than 20 minutes, constrained bandwidth, repeated reconnect
+  and the earned skip's own audibility (see [acceptance](acceptance.md)).
 
 ## Growing audio delay, mono PCM and drift skip, 2026-10-18
+
+Correction, 2026-10-20: the diagnosis below (client clock drift or a jitter
+ratchet) is no longer the likely cause, and neither the mono preference nor the
+blind skip fixed the delay. The growth matches mstsc playing 48 kHz PCM at
+44.1 kHz (about 8.8% slow: 25 s behind in 5 minutes), which the 44.1 kHz
+default removed (see [the 2026-10-20 record](#crackling-with-the-blind-drift-skip-and-the-earned-skip-2026-10-20)).
+The "perfect sync" the user saw with mono was most likely an artifact: mstsc
+played the 48 kHz mono audio too fast (pitched-up, robotic, choppy, which the
+user heard as "chipmunks"), so it consumed sound faster than it arrived and
+could not fall behind. Mono was rejected as a default and is now opt-in; the
+drift skip was replaced by the earned skip. The text below is the historical
+record of the 2026-10-18 change.
 
 - Finding: in Windows 10 mstsc over the internet, the user reported audio delay
   that started near zero and grew steadily during a session. The server-side

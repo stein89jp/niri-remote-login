@@ -3,7 +3,7 @@
 # Local inputs are copied and checksum-verified by makepkg, never built in place.
 # Export a portable source bundle with makepkg --allsource.
 pkgname=niri-remote-login
-pkgver=1.5.6
+pkgver=1.6.0
 pkgrel=1
 pkgdesc='Niri remote desktop host with a PAM/logind broker and dedicated headless compositor'
 arch=('x86_64')

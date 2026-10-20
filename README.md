@@ -16,10 +16,10 @@ From the directory containing the downloaded package, run:
 
 ```sh
 sudo pacman -Syu
-sudo pacman -U ./niri-remote-login-1.5.6-1-x86_64.pkg.tar.zst
+sudo pacman -U ./niri-remote-login-1.6.0-1-x86_64.pkg.tar.zst
 ```
 
-The example uses version `1.5.6-1`; replace the filename if you downloaded a
+The example uses version `1.6.0-1`; replace the filename if you downloaded a
 different release. Pacman installs the package and its required runtime
 dependencies. Continue with the account authorization and service setup below.
 
@@ -81,7 +81,7 @@ optional host NVIDIA NVENC H.264 encoding is available, with a 60 fps capture
 budget, reusable capture buffers and unchanged-frame suppression. The compositor
 prefers hardware EGL rendering, including NVIDIA, with software fallback.
 
-Version 1.5.6 fixes choppy remote motion. The headless compositor now presents
+Version 1.6.0 fixes Windows mstsc audio that played slowly and drifted behind the video: 44.1 kHz stereo PCM is now preferred. Version 1.5.6 fixed choppy remote motion. The headless compositor now presents
 frames on a fixed refresh clock and keeps sending frame callbacks while the
 pointer moves, and the H.264 frame window grows with the connection delay
 instead of staying at two frames, which had held internet sessions to about
@@ -100,8 +100,10 @@ stereo PCM, resampled from the 48 kHz capture, because Windows 10 mstsc played
 48 kHz PCM about 9% slow (25 s behind video after 5 minutes); 48 kHz stereo PCM
 remains the fallback (`NIRI_RDP_AUDIO_RATE=48000` prefers it again). Mono PCM
 (`NIRI_RDP_AUDIO_CHANNELS=mono`) is opt-in because it sounded pitched-up and
-robotic in Windows 10 mstsc on 2026-10-20. Long-session listening validation
-is pending (see
+robotic in Windows 10 mstsc on 2026-10-20. The user confirmed a 20-minute
+continuous YouTube playback in actual Windows 10 mstsc as clean and in sync on
+2026-10-20; longer runs, constrained bandwidth and repeated reconnects remain
+separate acceptance checks (see
 [session audio](bridge/README.md#session-audio)). Upgrading from 1.5 needs a fresh remote
 desktop and may need a `.pacnew` merge; see [upgrade](docs/upgrade.md#rebuild-the-installed-combined-package).
 

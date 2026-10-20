@@ -111,8 +111,8 @@ The response is 5 bytes: `NRB2` and one status byte. Status 0 carries **one to
 three positional** SCM_RIGHTS descriptors, in this order:
 
 1. a Wayland connection to the desktop (always present);
-2. a raw stereo 48 kHz S16LE PCM playback stream from the private session's
-   sink monitor (`audio-0`);
+2. a raw stereo 48 kHz S16LE PCM capture of the private session's sink monitor
+   (`audio-0`; the frontend resamples it to 44.1 kHz for the RDP client);
 3. the remote microphone socket (`audio-in-0`, NRM1 framing), served by
    `session-microphone`.
 

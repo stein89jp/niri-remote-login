@@ -10,7 +10,7 @@ import tarfile
 import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
-VERSION = "1.5.6"
+VERSION = "1.6.0"
 INCLUDE = ("LICENSE", "README.md", "Makefile", "bridge", "broker", "docs", "checkpoints", "scripts", "packaging", "compositor/README.md", "compositor/CHECKPOINT.md", "compositor/pins.json", "compositor/patches", "lab", "prototype", "tests")
 EXCLUDE = {"target", ".cargo-cache", "cargo-home", "__pycache__", ".git", "build", "private", "sysroot", "downloads", "results", "generated"}
 

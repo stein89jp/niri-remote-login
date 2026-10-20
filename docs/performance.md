@@ -9,8 +9,10 @@ RDPSND timestamps zero and an earned 20 ms drift catch-up during continuous PCM 
 2026-10-20 a drop needs an estimated client-queue surplus above a 60 ms jitter
 reserve, replacing a blind drop every 30 s; `NIRI_RDP_AUDIO_CHANNELS`,
 `NIRI_RDP_AUDIO_RATE` and `NIRI_RDP_AUDIO_DRIFT_PPM` default to that baseline;
-[session audio](../bridge/README.md#session-audio)); Windows listening
-validation of these changes is pending. Audio and video measurements use internal monotonic
+[session audio](../bridge/README.md#session-audio)); a 20-minute
+continuous YouTube playback in actual Windows 10 mstsc was clean and in sync on
+2026-10-20 (longer, constrained-bandwidth and reconnect listening remain
+[acceptance](acceptance.md) work). Audio and video measurements use internal monotonic
 time; graphics acknowledgements do not establish physical presentation or an
 audio/video clock.
 
