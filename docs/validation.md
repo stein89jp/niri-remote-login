@@ -126,13 +126,85 @@ in [acceptance](acceptance.md) on 2026-10-17.
   creeps back during long continuous sound without network trouble, the
   client's clock drift exceeds the allowance: raise `NIRI_RDP_AUDIO_DRIFT_PPM`
   (for example 300) and restart the frontend. If crackling remains, this
-  hypothesis was wrong; `NIRI_RDP_AUDIO_CHANNELS=stereo` A/B-tests mono against
-  the 2026-10-12 stereo baseline without a rebuild.
+  hypothesis was wrong. (Superseded by the A/B result below.)
   Enabling `NIRI_RDP_DIAGNOSTICS=1` would log each drop with its surplus and
   show whether mstsc's second confirmations report playback time. The change
   needs the clean [uninstall](uninstall.md)/[install](install.md) cycle before
   it can be tested. The two knobs are optional commented entries in the shipped
   `frontend.conf`; the install and uninstall procedures are unchanged.
+- mstsc A/B result, 2026-10-20 (user-verified in actual Windows 10 mstsc, same
+  installed build with the earned skip and starvation credit): with 48 kHz mono
+  PCM negotiated, playback sounded like chipmunks, pitched up, robotic and
+  choppy, while sync was perfect. Setting `NIRI_RDP_AUDIO_CHANNELS=stereo` in
+  `/etc/niri-rdp/frontend.conf` and restarting the frontend made it clean; the
+  user said "Switching to stereo fixed it", sync still perfect. Journal lines:
+  mono `RDP audio PCM: 48000 Hz mono, 768 kbps ... channels=mono drift_ppm=300
+  drift_skip=on`; stereo `RDP audio PCM: 48000 Hz stereo, 1536 kbps, 20.00 ms
+  capture blocks; channels=stereo drift_ppm=300 drift_skip=on`. Server-side flow
+  was healthy in both: 50 waves/s, first and second confirmations for every
+  wave, second-confirm gap p50 about 20-21 ms. The earned skip was active and
+  fired occasionally (for example `RDP audio drift skip: reason=quiet ...
+  earned_ms=81.0`). The crackling/robotic report was therefore mstsc mishandling
+  mono 48 kHz PCM, not the skip.
+- Decision: the default is now 48 kHz stereo PCM first, then AAC and ADPCM, with
+  no mono offered; `NIRI_RDP_AUDIO_CHANNELS=mono` is an opt-in, the downmix code
+  and tests are kept, invalid values warn and use stereo. The earned drift skip
+  and `NIRI_RDP_AUDIO_DRIFT_PPM` default 100 are unchanged. Rust tests now pin
+  the stereo-first default offer (2 ch, block align 4, 192000 bytes/s, 16 bit)
+  with no mono, the mono opt-in offer and downmix, and run the drift-skip tests
+  on the default stereo path. Still to be watched: long-session stereo lip-sync
+  over the internet with the earned skip. The change needs the clean
+  [uninstall](uninstall.md)/[install](install.md) cycle before it can be tested.
+- Long-run drift with 48 kHz stereo PCM, 2026-10-20 (user-observed in actual
+  Windows 10 mstsc): after about 5 minutes of continuous YouTube playback the
+  sound was about 25 s behind the video, about 8–9% slow, matching
+  48000/44100 = 1.088. The server sent exactly real time (250 waves of
+  3840 bytes per 5 s), the host capture path was bounded (`sample_age` p50
+  about 3 ms) and video was stable. The 48 kHz mono "chipmunks" fit the same
+  cause: 1920-byte mono blocks played as 44.1 kHz stereo run 1.84x fast. The
+  history agrees: release 16 (48 kHz PCM) fell "ten seconds, then thirty
+  seconds" behind over two minutes; release 18 (AAC_MS at 44.1 kHz)
+  "eliminated the huge sound delay" but crackled; release 19's PCM "minimal
+  latency" had no long-run measurement. No wFormatNo bug was found: IronRDP's
+  rdpsnd indexes the client's list per MS-RDPEA and matches
+  `nSamplesPerSec` strictly, and no 44.1 kHz PCM was in the offer. Real
+  Windows RDP servers never offer 48 kHz. Strong hypothesis: mstsc
+  mishandles 48 kHz PCM by playing it at 44.1 kHz.
+- Change, user-approved 2026-10-20: the default offer is 44.1 kHz stereo
+  S16LE PCM (2 ch, 44100 Hz, 176400 bytes/s, block align 4, 16 bit; about
+  1.41 Mbit/s), then 48 kHz stereo PCM, AAC_MS and MS ADPCM. The bridge
+  resamples each 20 ms 48 kHz capture block (960 frames) with FFmpeg
+  libswresample (64-tap filter) to exactly 882 frames, 3528 bytes per wave:
+  the first block after a reset is led by the filter's 33-frame delay as
+  silence, every further block is exactly full, and nothing queues between
+  blocks, so the wire rate equals the capture rate. The resampler restarts
+  after actual sample loss and at silence suppression, never for an ordinary
+  credit wait. The drift skip, its level checks and the fade act on the 48 kHz
+  stereo block; downmix (mono opt-in) and resampling follow. Capture, pacing
+  (one wave per 20 ms), four pending waves, three capture blocks, 60 ms expiry,
+  silence suppression, zero timestamps and the earned skip are unchanged. New
+  setting `NIRI_RDP_AUDIO_RATE`: `44100` (default) or `48000`, which restores
+  the former 48 kHz-first offer exactly; invalid values warn and use 44100.
+  With `NIRI_RDP_AUDIO_CHANNELS=mono`, mono PCM at the selected rate comes
+  first. The start line now reads `RDP audio PCM: 44100 Hz stereo, 1411 kbps,
+  20.00 ms blocks; channels=stereo rate=44100 drift_ppm=100 drift_skip=on`, and
+  each audio channel start logs `RDP audio formats: client accepted [...];
+  chosen ...` so mstsc's accepted list is visible in the journal.
+- Regressions: exact default, mono opt-in and 48000 offers; rate parsing;
+  3528-byte 44.1 kHz waves with the client's format index on Wave2 and
+  WaveInfo/Wave; 1764-byte mono waves (downmix then resample); exactly 882
+  frames per block with no queue growth, padding or discard over 30000 blocks
+  (ten minutes) in both the Rust and the C (`tests/audio_codec.c`) suites; a
+  997 Hz tone stays within 0.5 Hz after conversion (it would read 8.8% low
+  unconverted) with its level and channel order; resampler continuity across
+  credit waits (with and without queued capture) and its restart after capture
+  loss and silence suppression; the drift skip on the 44.1 kHz path drops a
+  48 kHz block before resampling. The FreeRDP fixture also accepts 44.1 kHz
+  mono and stereo PCM. AAC and ADPCM tests are unchanged. Pending: actual
+  Windows 10 mstsc listening and long-run lip-sync (5–30 minutes of continuous
+  sound, offset must stay constant). The change needs the clean
+  [uninstall](uninstall.md)/[install](install.md) cycle before it can be
+  tested.
 
 ## Growing audio delay, mono PCM and drift skip, 2026-10-18
 

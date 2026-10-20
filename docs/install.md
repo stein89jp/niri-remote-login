@@ -449,14 +449,18 @@ exists with `off` but only records silence. Changing the setting needs
 a frontend restart, which disconnects the current RDP connection, so arrange it
 from a local terminal or SSH.
 
-Two optional playback settings in the same file default to the accepted audio
-baseline when absent. `NIRI_RDP_AUDIO_CHANNELS` is `mono` (default: 48 kHz mono
-PCM preferred, then stereo PCM) or `stereo` (mono is not offered, so 48 kHz
-stereo PCM is preferred, about 1.5 Mbit/s); use it to compare mono with stereo.
+Three optional playback settings in the same file default to the accepted
+audio baseline when absent. `NIRI_RDP_AUDIO_RATE` is `44100` (default: 44.1 kHz
+stereo PCM preferred, about 1.4 Mbit/s, resampled from the 48 kHz capture,
+with 48 kHz stereo PCM as fallback) or `48000` (the former 48 kHz-first offer,
+which Windows 10 mstsc played about 9% slow: 25 s behind video after 5
+minutes), so leave it unset. `NIRI_RDP_AUDIO_CHANNELS` is `stereo` (default,
+mono not offered) or `mono` (opt-in: mono PCM first); mono sounded pitched-up
+and robotic in Windows 10 mstsc on 2026-10-20, so leave it unset.
 `NIRI_RDP_AUDIO_DRIFT_PPM` (0–2000, default 100) is the drift allowance of the
 PCM drift skip; raise it, for example to 300, only if the audio delay creeps up
 during long continuous sound. Invalid values log a warning and keep the
-default; values above 2000 use 2000. The frontend reads both at startup, so a
+default; values above 2000 use 2000. The frontend reads them at startup, so a
 change needs the same frontend restart, and the `RDP audio PCM` journal line
 shows the values in effect.
 
@@ -597,9 +601,11 @@ frame rate or ceiling for limited networks; increasing the ceiling can improve
 AVC420 quality when the connection has enough bandwidth. Bitmap fallback does
 not use this bitrate controller.
 
-Audio prefers mono 48 kHz PCM at about 768 kbit/s before framing, then stereo
-48 kHz PCM at about 1.54 Mbps, the format that was intelligible on Windows 10
-mstsc after continuous static was reported with AAC. Clients that do not accept
+Audio prefers stereo 44.1 kHz PCM at about 1.41 Mbps, resampled from the
+48 kHz capture, then stereo 48 kHz PCM at about 1.54 Mbps (mono PCM is opt-in).
+Uncompressed PCM was intelligible on Windows 10 mstsc after continuous static
+was reported with AAC; 44.1 kHz is preferred because mstsc played 48 kHz PCM
+about 9% slow. Clients that do not accept
 PCM can use stereo AAC-LC at 96 kbit/s, followed by MS ADPCM. During continuous
 PCM sound, the frontend drops a 20 ms block, preferring a quiet moment, only
 when its estimate of the Windows playback queue exceeds a 60 ms jitter reserve

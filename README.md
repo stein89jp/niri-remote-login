@@ -94,9 +94,14 @@ through fixed levels and uses GPU capture by default; capture copies less and
 repeated cursor shapes are cached. Earlier releases added client-local cursor
 motion, damage-aware capture, explicit remote DPI scaling and optional AVC444;
 see [performance controls](docs/performance.md). Since 2026-10-18, playback
-prefers 48 kHz mono PCM, with the previously accepted stereo PCM as the first
-fallback, and drops one 20 ms block about every 30 s of continuous sound so the
-delay cannot keep growing; Windows listening validation is pending (see
+drops one 20 ms block only when an estimated client-queue surplus is earned, so
+the delay cannot keep growing. Since 2026-10-20 playback prefers 44.1 kHz
+stereo PCM, resampled from the 48 kHz capture, because Windows 10 mstsc played
+48 kHz PCM about 9% slow (25 s behind video after 5 minutes); 48 kHz stereo PCM
+remains the fallback (`NIRI_RDP_AUDIO_RATE=48000` prefers it again). Mono PCM
+(`NIRI_RDP_AUDIO_CHANNELS=mono`) is opt-in because it sounded pitched-up and
+robotic in Windows 10 mstsc on 2026-10-20. Long-session listening validation
+is pending (see
 [session audio](bridge/README.md#session-audio)). Upgrading from 1.5 needs a fresh remote
 desktop and may need a `.pacnew` merge; see [upgrade](docs/upgrade.md#rebuild-the-installed-combined-package).
 

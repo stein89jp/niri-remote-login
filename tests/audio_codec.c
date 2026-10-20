@@ -236,8 +236,81 @@ static void test_aac(void) {
     puts("PASS: raw AAC-LC stereo, bounded resampling/delay/bitrate, signal quality and loss/reconnect recovery");
 }
 
+static double rising_crossing_frequency(const int16_t *samples, int frames, int stride,
+                                        double rate) {
+    double first = -1, last = -1;
+    int count = 0;
+    for (int frame = 1; frame < frames; ++frame) {
+        double a = samples[(frame - 1) * stride], b = samples[frame * stride];
+        if (a < 0 && b >= 0) {
+            double at = frame - 1 + a / (a - b);
+            if (first < 0) first = at;
+            last = at;
+            ++count;
+        }
+    }
+    assert(count > 10);
+    return (count - 1) * rate / (last - first);
+}
+
+static void test_pcm44_resampler(void) {
+    enum { BLOCKS = 30000 }; /* ten minutes of 20 ms blocks */
+    char error[256] = {0};
+    const double pi = acos(-1.0);
+    assert(niri_audio_resampler_new(3, error, sizeof(error)) == NULL && error[0]);
+    for (int channels = 1; channels <= 2; ++channels) {
+        struct niri_audio_resampler *r = niri_audio_resampler_new(channels, error, sizeof(error));
+        assert(r && "PCM resampler must initialize");
+        uint8_t pcm[PCM44_INPUT_FRAMES * 4];
+        uint8_t out[PCM44_OUTPUT_FRAMES * 4];
+        int16_t tail[PCM44_OUTPUT_FRAMES * 2 * 50];
+        size_t in_bytes = PCM44_INPUT_FRAMES * (size_t)channels * 2;
+        size_t out_bytes = PCM44_OUTPUT_FRAMES * (size_t)channels * 2;
+        assert(niri_audio_resample(r, pcm, in_bytes - 2, out, sizeof(out), error, sizeof(error)) == -1);
+        assert(niri_audio_resample(r, pcm, in_bytes, out, out_bytes - 1, error, sizeof(error)) == -1);
+        assert(niri_audio_resample(NULL, pcm, in_bytes, out, sizeof(out), error, sizeof(error)) == -1);
+        uint64_t frames = 0;
+        for (int block = 0; block < BLOCKS; ++block) {
+            for (int frame = 0; frame < PCM44_INPUT_FRAMES; ++frame) {
+                double time = ((double)block * PCM44_INPUT_FRAMES + frame) / 48000.0;
+                AV_WL16(pcm + (size_t)frame * channels * 2,
+                        (uint16_t)(int16_t)(10000 * sin(2 * pi * 997 * time)));
+                if (channels == 2)
+                    AV_WL16(pcm + frame * 4 + 2,
+                            (uint16_t)(int16_t)(7000 * sin(2 * pi * 1500 * time)));
+            }
+            int length = niri_audio_resample(r, pcm, in_bytes, out, sizeof(out), error, sizeof(error));
+            assert(length == (int)out_bytes && "every 20 ms block is exactly 882 frames");
+            frames += PCM44_OUTPUT_FRAMES;
+            int queued = -1;
+            uint64_t adjusted = 1;
+            assert(niri_audio_resampler_state(r, &queued, &adjusted) == 0);
+            assert(queued == 0 && adjusted == 0 && "no queue growth, padding or discard");
+            if (block >= BLOCKS - 50)
+                for (size_t sample = 0; sample < out_bytes / 2; ++sample)
+                    tail[(size_t)(block - (BLOCKS - 50)) * out_bytes / 2 + sample] =
+                        (int16_t)AV_RL16(out + sample * 2);
+        }
+        assert(frames == (uint64_t)BLOCKS * 882);
+        /* After ten minutes the tone keeps its frequency at 44.1 kHz. */
+        double left = rising_crossing_frequency(tail, PCM44_OUTPUT_FRAMES * 50, channels, 44100);
+        assert(fabs(left - 997) < 0.5);
+        if (channels == 2) {
+            double right = rising_crossing_frequency(tail + 1, PCM44_OUTPUT_FRAMES * 50, 2, 44100);
+            assert(fabs(right - 1500) < 0.75);
+        }
+        /* A reset primes again: the next block is still exactly full. */
+        assert(niri_audio_resampler_reset(r, error, sizeof(error)) == 0);
+        assert(niri_audio_resample(r, pcm, in_bytes, out, sizeof(out), error, sizeof(error)) == (int)out_bytes);
+        niri_audio_resampler_free(r);
+    }
+    niri_audio_resampler_free(NULL);
+    puts("PASS: 48 kHz to 44.1 kHz PCM, exactly 882 frames per 20 ms block for ten minutes, tone frequency kept");
+}
+
 int main(void) {
     test_adpcm();
     test_aac();
+    test_pcm44_resampler();
     return 0;
 }

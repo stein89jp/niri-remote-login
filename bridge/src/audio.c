@@ -3,6 +3,7 @@
 #include <libavutil/audio_fifo.h>
 #include <libavutil/intreadwrite.h>
 #include <libavutil/log.h>
+#include <libavutil/opt.h>
 #include <libswresample/swresample.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -320,4 +321,168 @@ int niri_audio_aac_encode(struct niri_audio_aac *a, const uint8_t *pcm,
     }
     a->pts += AAC_FRAME_SAMPLES;
     return niri_audio_aac_receive(a, data, error, error_length);
+}
+
+/* Uncompressed 44.1 kHz PCM for Windows mstsc, which played 48 kHz PCM about
+   8.8% slow (user-approved baseline 2026-10-20). Capture stays 48 kHz S16LE;
+   each exact 20 ms block of 960 frames becomes exactly 882 frames
+   (960 * 147 / 160), so the output rate equals the input rate exactly.
+   swr_convert holds back its filter delay (33 frames with a 64-tap filter)
+   on the first block after a reset, then returns exactly 882 frames for
+   every further 960-frame block. That first shortfall is filled with leading
+   zero frames once, so every call emits one full block from the first and
+   the queue is empty between calls. Should a build of libswresample ever
+   return a different count, the queue keeps the remainder (at most one
+   block, so it can never grow) and a shortfall is filled with zeros. */
+#define PCM44_INPUT_FRAMES 960
+#define PCM44_OUTPUT_FRAMES 882
+#define PCM44_SCRATCH_FRAMES 2048
+#define PCM44_FIFO_FRAMES (PCM44_OUTPUT_FRAMES * 4)
+
+struct niri_audio_resampler {
+    SwrContext *resampler;
+    AVAudioFifo *fifo;
+    int channels;
+    int primed;
+    /* Frames of zeros inserted or of output discarded after priming. */
+    uint64_t adjusted_frames;
+    int16_t input[PCM44_INPUT_FRAMES * 2];
+    int16_t output[PCM44_SCRATCH_FRAMES * 2];
+    int16_t zeros[PCM44_OUTPUT_FRAMES * 2]; /* calloc'd, never written */
+};
+
+void niri_audio_resampler_free(struct niri_audio_resampler *r) {
+    if (!r) return;
+    swr_free(&r->resampler);
+    av_audio_fifo_free(r->fifo);
+    free(r);
+}
+
+/* Discard filter history and queued output. The next block primes again. */
+int niri_audio_resampler_reset(struct niri_audio_resampler *r, char *error,
+                               size_t length) {
+    if (!r) {
+        snprintf(error, length, "invalid PCM resampler");
+        return -1;
+    }
+    av_audio_fifo_reset(r->fifo);
+    r->primed = 0;
+    int result = swr_init(r->resampler);
+    if (result < 0) {
+        audio_error(error, length, "reset PCM resampler", result);
+        return -1;
+    }
+    return 0;
+}
+
+struct niri_audio_resampler *niri_audio_resampler_new(int channels, char *error,
+                                                      size_t length) {
+    if (channels != 1 && channels != 2) {
+        snprintf(error, length, "unsupported PCM resampler channel count");
+        return NULL;
+    }
+    struct niri_audio_resampler *r = calloc(1, sizeof(*r));
+    if (!r) {
+        snprintf(error, length, "allocate PCM resampler");
+        return NULL;
+    }
+    r->channels = channels;
+    AVChannelLayout layout;
+    av_channel_layout_default(&layout, channels);
+    int result = swr_alloc_set_opts2(&r->resampler, &layout, AV_SAMPLE_FMT_S16,
+                                     44100, &layout, AV_SAMPLE_FMT_S16, 48000,
+                                     0, NULL);
+    av_channel_layout_uninit(&layout);
+    /* 64 taps keep 19 kHz flat and attenuate 22-24 kHz content that would
+       alias, for 0.75 ms of delay; the default 32 taps pass more aliasing. */
+    if (result >= 0) result = av_opt_set_int(r->resampler, "filter_size", 64, 0);
+    if (result >= 0) result = swr_init(r->resampler);
+    if (result < 0) {
+        audio_error(error, length, "initialize PCM resampler", result);
+        goto fail;
+    }
+    r->fifo = av_audio_fifo_alloc(AV_SAMPLE_FMT_S16, channels, PCM44_FIFO_FRAMES);
+    if (!r->fifo) {
+        snprintf(error, length, "allocate PCM resampler queue");
+        goto fail;
+    }
+    return r;
+fail:
+    niri_audio_resampler_free(r);
+    return NULL;
+}
+
+/* Test observation: frames queued between calls (zero in steady state) and
+   frames ever padded or discarded after priming (zero unless the library
+   returns an unexpected count). */
+int niri_audio_resampler_state(const struct niri_audio_resampler *r, int *queued,
+                               uint64_t *adjusted) {
+    if (!r || !queued || !adjusted) return -1;
+    *queued = av_audio_fifo_size(r->fifo);
+    *adjusted = r->adjusted_frames;
+    return 0;
+}
+
+/* Queue `frames` (at most one block) of silence. */
+static int resampler_write_zeros(struct niri_audio_resampler *r, int frames) {
+    void *planes[] = {r->zeros};
+    if (frames > PCM44_OUTPUT_FRAMES || av_audio_fifo_space(r->fifo) < frames) return -1;
+    return av_audio_fifo_write(r->fifo, planes, frames) == frames ? 0 : -1;
+}
+
+/* Convert one 20 ms 48 kHz S16LE block (960 frames of `channels`) into
+   exactly 882 frames at 44.1 kHz. Returns the output byte count. */
+int niri_audio_resample(struct niri_audio_resampler *r, const uint8_t *pcm,
+                        size_t length, uint8_t *output, size_t capacity,
+                        char *error, size_t error_length) {
+    size_t frame_bytes = r ? (size_t)r->channels * 2 : 0;
+    if (!r || !pcm || !output || length != PCM44_INPUT_FRAMES * frame_bytes ||
+        capacity < PCM44_OUTPUT_FRAMES * frame_bytes) {
+        snprintf(error, error_length, "invalid PCM resampler block");
+        return -1;
+    }
+    size_t samples = PCM44_INPUT_FRAMES * (size_t)r->channels;
+    for (size_t sample = 0; sample < samples; ++sample)
+        r->input[sample] = (int16_t)AV_RL16(pcm + sample * 2);
+    const uint8_t *input[] = {(const uint8_t *)r->input};
+    uint8_t *converted[] = {(uint8_t *)r->output};
+    int produced = swr_convert(r->resampler, converted, PCM44_SCRATCH_FRAMES,
+                               input, PCM44_INPUT_FRAMES);
+    if (produced < 0) {
+        audio_error(error, error_length, "resample PCM block", produced);
+        return -1;
+    }
+    if (!r->primed) {
+        /* Lead with the filter delay as silence so this block is full. */
+        int lead = PCM44_OUTPUT_FRAMES - produced;
+        if (lead > 0 && resampler_write_zeros(r, lead) < 0) goto overflow;
+        r->primed = 1;
+    }
+    void *planes[] = {r->output};
+    if (av_audio_fifo_space(r->fifo) < produced ||
+        av_audio_fifo_write(r->fifo, planes, produced) != produced)
+        goto overflow;
+    int queued = av_audio_fifo_size(r->fifo);
+    if (queued < PCM44_OUTPUT_FRAMES) {
+        r->adjusted_frames += (uint64_t)(PCM44_OUTPUT_FRAMES - queued);
+        if (resampler_write_zeros(r, PCM44_OUTPUT_FRAMES - queued) < 0) goto overflow;
+    }
+    void *destination[] = {r->output};
+    if (av_audio_fifo_read(r->fifo, destination, PCM44_OUTPUT_FRAMES) !=
+        PCM44_OUTPUT_FRAMES) {
+        snprintf(error, error_length, "read PCM resampler queue");
+        return -1;
+    }
+    /* Keep at most one block of remainder: the queue can never grow. */
+    int excess = av_audio_fifo_size(r->fifo) - PCM44_OUTPUT_FRAMES;
+    if (excess > 0) {
+        r->adjusted_frames += (uint64_t)excess;
+        av_audio_fifo_drain(r->fifo, excess);
+    }
+    for (size_t sample = 0; sample < PCM44_OUTPUT_FRAMES * (size_t)r->channels; ++sample)
+        AV_WL16(output + sample * 2, (uint16_t)r->output[sample]);
+    return (int)(PCM44_OUTPUT_FRAMES * frame_bytes);
+overflow:
+    snprintf(error, error_length, "PCM resampler queue capacity exceeded");
+    return -1;
 }

@@ -22,6 +22,8 @@ use std::{
 use tokio::sync::mpsc::UnboundedSender;
 
 pub const BLOCK_BYTES: usize = 48000 * 2 * 2 / 50; // 20 ms, stereo S16LE
+/// One 20 ms block at 44.1 kHz: 960 * 147 / 160 frames, exactly.
+const PCM44_FRAMES: usize = 882;
 const ADPCM_SAMPLES: usize = 1012;
 const ADPCM_BLOCK_BYTES: usize = 1024;
 // IronRDP keeps at most four waves per event batch. Stay below that limit
@@ -31,7 +33,7 @@ const MAX_CAPTURE_BLOCKS: usize = 3; // At most 64 ms of capture batching/jitter
 const PLAYBACK_BUDGET: Duration = Duration::from_millis(300);
 const CAPTURE_BUDGET: Duration = Duration::from_millis(60);
 const SILENCE_TAIL_BLOCKS: usize = 5; // 100 ms flushes bounded AAC lookahead.
-// Earned clock-drift catch-up for PCM (mono PCM and a skip user-approved
+// Earned clock-drift catch-up for PCM (a skip user-approved
 // 2026-10-18; the blind 30 s skip replaced by this on the user's request
 // 2026-10-20). mstsc confirms waves on arrival, so its playback queue is
 // invisible here. A 20 ms block is dropped only when the estimated surplus in
@@ -351,6 +353,19 @@ unsafe extern "C" {
         error: *mut c_char,
         error_length: usize,
     ) -> i32;
+    fn niri_audio_resampler_new(channels: i32, error: *mut c_char, length: usize) -> *mut c_void;
+    fn niri_audio_resampler_free(resampler: *mut c_void);
+    fn niri_audio_resampler_reset(resampler: *mut c_void, error: *mut c_char, length: usize)
+    -> i32;
+    fn niri_audio_resample(
+        resampler: *mut c_void,
+        pcm: *const u8,
+        length: usize,
+        output: *mut u8,
+        capacity: usize,
+        error: *mut c_char,
+        error_length: usize,
+    ) -> i32;
     fn niri_audio_aac_new(error: *mut c_char, length: usize) -> *mut c_void;
     fn niri_audio_aac_free(encoder: *mut c_void);
     fn niri_audio_aac_encode(
@@ -408,6 +423,74 @@ impl Aac {
         Ok(Some(
             unsafe { std::slice::from_raw_parts(data, length as usize) }.to_vec(),
         ))
+    }
+}
+
+/// FFmpeg libswresample conversion of exact 20 ms 48 kHz S16LE blocks to
+/// exactly [`PCM44_FRAMES`] frames at 44.1 kHz (see `audio.c`). Its filter
+/// history makes consecutive blocks one continuous signal, so it is reset only
+/// where continuity already ended: actual sample loss (codec recovery) and
+/// silence suppression. An ordinary credit wait keeps it.
+struct Resampler {
+    ptr: *mut c_void,
+    channels: usize,
+}
+// Like the encoders, a single capture-worker owner after negotiation.
+unsafe impl Send for Resampler {}
+impl Drop for Resampler {
+    fn drop(&mut self) {
+        unsafe { niri_audio_resampler_free(self.ptr) };
+    }
+}
+impl Resampler {
+    fn new(channels: u16) -> anyhow::Result<Self> {
+        let mut error = [0 as c_char; 256];
+        let ptr = unsafe {
+            niri_audio_resampler_new(i32::from(channels), error.as_mut_ptr(), error.len())
+        };
+        anyhow::ensure!(
+            !ptr.is_null(),
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        Ok(Self {
+            ptr,
+            channels: usize::from(channels),
+        })
+    }
+    fn reset(&mut self) -> anyhow::Result<()> {
+        let mut error = [0 as c_char; 256];
+        let result =
+            unsafe { niri_audio_resampler_reset(self.ptr, error.as_mut_ptr(), error.len()) };
+        anyhow::ensure!(
+            result == 0,
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        Ok(())
+    }
+    /// One 48 kHz block of this resampler's channel count in, one 44.1 kHz
+    /// block of the same duration out.
+    fn convert(&mut self, pcm: &[u8]) -> anyhow::Result<Vec<u8>> {
+        let mut output = vec![0; PCM44_FRAMES * self.channels * 2];
+        let mut error = [0 as c_char; 256];
+        let length = unsafe {
+            niri_audio_resample(
+                self.ptr,
+                pcm.as_ptr(),
+                pcm.len(),
+                output.as_mut_ptr(),
+                output.len(),
+                error.as_mut_ptr(),
+                error.len(),
+            )
+        };
+        anyhow::ensure!(
+            usize::try_from(length).ok() == Some(output.len()),
+            "{}",
+            unsafe { CStr::from_ptr(error.as_ptr()) }.to_string_lossy()
+        );
+        Ok(output)
     }
 }
 
@@ -487,9 +570,13 @@ impl Adpcm {
 }
 
 enum Codec {
-    /// Uncompressed 48 kHz S16LE; `mono` downmixes the stereo capture.
+    /// Uncompressed S16LE from the 48 kHz stereo capture. `mono` downmixes;
+    /// `resampler` converts to 44.1 kHz. Order: the worker has already applied
+    /// any drift skip and fade to the 48 kHz stereo block; then downmix, then
+    /// resample. Without a resampler, 48 kHz samples pass through unchanged.
     Pcm {
         mono: bool,
+        resampler: Option<Resampler>,
     },
     Aac(Aac),
     Adpcm(Adpcm),
@@ -497,42 +584,98 @@ enum Codec {
 impl Codec {
     fn encode(&mut self, pcm: Vec<u8>) -> anyhow::Result<Option<Vec<u8>>> {
         match self {
-            Self::Pcm { mono: false } => Ok(Some(pcm)),
-            Self::Pcm { mono: true } => Ok(Some(downmix_to_mono(&pcm))),
+            Self::Pcm { mono, resampler } => {
+                let pcm = if *mono { downmix_to_mono(&pcm) } else { pcm };
+                match resampler {
+                    Some(resampler) => resampler.convert(&pcm).map(Some),
+                    None => Ok(Some(pcm)),
+                }
+            }
             Self::Aac(encoder) => encoder.encode(&pcm),
             Self::Adpcm(encoder) => encoder.encode(&pcm).map(Some),
         }
     }
+    /// After actual sample loss: discard state that spans the gap.
     fn reset(&mut self) -> anyhow::Result<()> {
-        if let Self::Aac(encoder) = self {
-            *encoder = Aac::new()?;
+        match self {
+            Self::Aac(encoder) => *encoder = Aac::new()?,
+            Self::Pcm {
+                resampler: Some(resampler),
+                ..
+            } => resampler.reset()?,
+            _ => {}
+        }
+        Ok(())
+    }
+    /// Silence suppression began: the next sound is a new run after an
+    /// unknown gap, so it starts from a freshly primed resampler. The silence
+    /// tail already flushed the filter history; the only difference from
+    /// continuing is that 0.75 ms of filter lookahead before the resumed
+    /// onset stays silent. AAC keeps its encoder across suppression, as before.
+    fn suppressed(&mut self) -> anyhow::Result<()> {
+        if let Self::Pcm {
+            resampler: Some(resampler),
+            ..
+        } = self
+        {
+            resampler.reset()?;
         }
         Ok(())
     }
 }
 
-/// 48 kHz S16LE PCM with `channels` interleaved channels.
-fn pcm_format_with(channels: u16) -> AudioFormat {
+/// S16LE PCM at `rate` with `channels` interleaved channels.
+fn pcm_format_with(rate: u32, channels: u16) -> AudioFormat {
     let block_align = channels * 2;
     AudioFormat {
         format: WaveFormat::PCM,
         n_channels: channels,
-        n_samples_per_sec: 48000,
-        n_avg_bytes_per_sec: 48000 * u32::from(block_align),
+        n_samples_per_sec: rate,
+        n_avg_bytes_per_sec: rate * u32::from(block_align),
         n_block_align: block_align,
         bits_per_sample: 16,
         data: None,
     }
 }
 
-/// Preferred since 2026-10-18: half the stereo bandwidth (768 kbit/s).
+/// 48 kHz mono: opt-in with `NIRI_RDP_AUDIO_RATE=48000` and mono only.
 fn pcm_mono_format() -> AudioFormat {
-    pcm_format_with(1)
+    pcm_format_with(48000, 1)
 }
 
-/// The 2026-10-12 accepted stereo format, now the first fallback.
+/// The 2026-10-12 stereo format (1.54 Mbit/s): the fallback after 44.1 kHz.
 fn pcm_format() -> AudioFormat {
-    pcm_format_with(2)
+    pcm_format_with(48000, 2)
+}
+
+/// Preferred since 2026-10-20 (user-approved): 44.1 kHz stereo, 1.41 Mbit/s,
+/// resampled from the 48 kHz capture. Windows 10 mstsc played 48 kHz PCM at
+/// about 44.1 kHz: 25 s behind video after 5 min, and mono pitched up.
+fn pcm44_format() -> AudioFormat {
+    pcm_format_with(44100, 2)
+}
+
+/// 44.1 kHz mono (705.6 kbit/s): first only with `NIRI_RDP_AUDIO_CHANNELS=mono`.
+fn pcm44_mono_format() -> AudioFormat {
+    pcm_format_with(44100, 1)
+}
+
+/// The PCM part of the offer, most preferred first. Compressed fallbacks
+/// follow it. With the default 44.1 kHz rate, 48 kHz stereo stays as the
+/// next PCM fallback; `NIRI_RDP_AUDIO_RATE=48000` restores the former offer
+/// exactly. Mono, when opted in, comes first at the selected rate.
+fn pcm_offer(tuning: AudioTuning) -> Vec<AudioFormat> {
+    let mut formats = Vec::new();
+    if tuning.rate == 44100 {
+        if tuning.mono {
+            formats.push(pcm44_mono_format());
+        }
+        formats.push(pcm44_format());
+    } else if tuning.mono {
+        formats.push(pcm_mono_format());
+    }
+    formats.push(pcm_format());
+    formats
 }
 
 fn sample_at(pcm: &[u8], index: usize) -> i32 {
@@ -732,15 +875,21 @@ impl ArrivalModel {
 pub struct AudioTuning {
     /// `NIRI_RDP_AUDIO_DRIFT_PPM`: drift allowance, 0..=2000, default 100.
     pub drift_ppm: u32,
-    /// `NIRI_RDP_AUDIO_CHANNELS`: `mono` (default) offers mono PCM first;
-    /// `stereo` removes it, so stereo PCM is preferred.
+    /// `NIRI_RDP_AUDIO_CHANNELS`: `stereo` (default) offers stereo PCM first
+    /// and no mono; `mono` is an opt-in that offers mono PCM first. Mono
+    /// sounded pitched-up and robotic in Windows 10 mstsc (2026-10-20).
     pub mono: bool,
+    /// `NIRI_RDP_AUDIO_RATE`: `44100` (default) offers 44.1 kHz PCM,
+    /// resampled in the bridge, ahead of 48 kHz stereo PCM; `48000` restores
+    /// the former 48 kHz-first offer, which mstsc played about 8.8% slow.
+    pub rate: u32,
 }
 impl Default for AudioTuning {
     fn default() -> Self {
         Self {
             drift_ppm: DRIFT_ALLOWANCE_PPM,
-            mono: true,
+            mono: false,
+            rate: 44100,
         }
     }
 }
@@ -754,13 +903,18 @@ impl AudioTuning {
         let (tuning, warnings) = Self::parse(
             read("NIRI_RDP_AUDIO_DRIFT_PPM").as_deref(),
             read("NIRI_RDP_AUDIO_CHANNELS").as_deref(),
+            read("NIRI_RDP_AUDIO_RATE").as_deref(),
         );
         for warning in warnings {
             eprintln!("{warning}");
         }
         tuning
     }
-    fn parse(drift_ppm: Option<&str>, channels: Option<&str>) -> (Self, Vec<String>) {
+    fn parse(
+        drift_ppm: Option<&str>,
+        channels: Option<&str>,
+        rate: Option<&str>,
+    ) -> (Self, Vec<String>) {
         let mut tuning = Self::default();
         let mut warnings = Vec::new();
         if let Some(value) = drift_ppm {
@@ -778,10 +932,17 @@ impl AudioTuning {
             }
         }
         match channels.map(str::trim) {
-            None | Some("mono") => {}
-            Some("stereo") => tuning.mono = false,
+            None | Some("stereo") => {}
+            Some("mono") => tuning.mono = true,
             Some(value) => warnings.push(format!(
-                "RDP audio: NIRI_RDP_AUDIO_CHANNELS={value} is not mono or stereo; using mono"
+                "RDP audio: NIRI_RDP_AUDIO_CHANNELS={value} is not mono or stereo; using stereo"
+            )),
+        }
+        match rate.map(str::trim) {
+            None | Some("44100") => {}
+            Some("48000") => tuning.rate = 48000,
+            Some(value) => warnings.push(format!(
+                "RDP audio: NIRI_RDP_AUDIO_RATE={value} is not 44100 or 48000; using 44100"
             )),
         }
         (tuning, warnings)
@@ -1346,14 +1507,11 @@ impl SoundServerFactory for Factory {
             .ok();
         // mstsc advertises compressed formats that have rendered as static in
         // actual Windows playback. Prefer the PCM path verified by listening;
-        // keep compressed codecs for clients that do not accept PCM. Mono PCM
-        // (user-approved 2026-10-18) halves the 1.54 Mbit/s stereo bandwidth.
-        // `NIRI_RDP_AUDIO_CHANNELS=stereo` removes mono for listening A/B tests.
-        let mut formats = if self.audio.tuning.mono {
-            vec![pcm_mono_format(), pcm_format()]
-        } else {
-            vec![pcm_format()]
-        };
+        // keep compressed codecs for clients that do not accept PCM. 44.1 kHz
+        // stereo is the default (user-approved 2026-10-20): mstsc played
+        // 48 kHz PCM about 8.8% slow, and mono 48 kHz pitched up. See
+        // `pcm_offer` for the `NIRI_RDP_AUDIO_CHANNELS`/`_RATE` opt-ins.
+        let mut formats = pcm_offer(self.audio.tuning);
         if aac.is_some() {
             formats.push(aac_format());
         }
@@ -1405,7 +1563,25 @@ impl RdpsndServerHandler for Backend {
         &mut self,
         common: &'a [NegotiatedFormat],
     ) -> Option<&'a NegotiatedFormat> {
-        common.first()
+        // `common` is our offer order, filtered to what the client accepted.
+        // Log it once per channel start so the client's real list is visible.
+        let describe = |format: &AudioFormat| {
+            format!(
+                "{}/{}ch/{}Hz/{}bit",
+                format.format, format.n_channels, format.n_samples_per_sec, format.bits_per_sample
+            )
+        };
+        let chosen = common.first();
+        eprintln!(
+            "RDP audio formats: client accepted [{}]; chosen {}",
+            common
+                .iter()
+                .map(|format| describe(format.format()))
+                .collect::<Vec<_>>()
+                .join(", "),
+            chosen.map_or("none".into(), |format| describe(format.format())),
+        );
+        chosen
     }
     fn start(&mut self, format: &NegotiatedFormat) -> Result<(), Box<dyn RdpsndError>> {
         let mut encoder = if format.format().format == WaveFormat::AAC_MS {
@@ -1419,8 +1595,24 @@ impl RdpsndServerHandler for Backend {
                     as Box<dyn RdpsndError>
             })?)
         } else {
+            // Branch on the negotiated PCM rate and channels: 44.1 kHz is
+            // resampled from the 48 kHz capture; 48 kHz passes through.
+            let negotiated = format.format();
+            let channels = negotiated.n_channels;
+            let resampler = match negotiated.n_samples_per_sec {
+                48000 => None,
+                44100 => Some(Resampler::new(channels).map_err(|error| {
+                    Box::new(std::io::Error::other(error.to_string())) as Box<dyn RdpsndError>
+                })?),
+                rate => {
+                    return Err(Box::new(std::io::Error::other(format!(
+                        "unsupported PCM rate {rate}"
+                    ))));
+                }
+            };
             Codec::Pcm {
-                mono: format.format().n_channels == 1,
+                mono: channels == 1,
+                resampler,
             }
         };
         self.aac.take();
@@ -1430,6 +1622,8 @@ impl RdpsndServerHandler for Backend {
         } else {
             BLOCK_BYTES
         };
+        // Capture-side size: 48 kHz stereo S16LE is 192000 bytes/s. Pacing is
+        // per capture block, whatever the wire size (3528 bytes at 44.1 kHz).
         let block_duration = Duration::from_secs_f64(block_bytes as f64 / 192000.0);
         // AAC and ADPCM keep their unchanged fallback behavior: no drift skip.
         let drift_skip_enabled = matches!(encoder, Codec::Pcm { .. });
@@ -1440,7 +1634,7 @@ impl RdpsndServerHandler for Backend {
             flow.arrivals.drift_ppm = tuning.drift_ppm;
         }
         eprintln!(
-            "RDP audio {}: {} Hz {}, {} kbps, {:.2} ms capture blocks; channels={} drift_ppm={} drift_skip={}",
+            "RDP audio {}: {} Hz {}, {} kbps, {:.2} ms blocks; channels={} rate={} drift_ppm={} drift_skip={}",
             match &encoder {
                 Codec::Aac(_) => "AAC-LC",
                 Codec::Adpcm(_) => "MS ADPCM",
@@ -1455,6 +1649,7 @@ impl RdpsndServerHandler for Backend {
             format.format().n_avg_bytes_per_sec * 8 / 1000,
             block_duration.as_secs_f64() * 1000.0,
             if tuning.mono { "mono" } else { "stereo" },
+            tuning.rate,
             tuning.drift_ppm,
             if drift_skip_enabled { "on" } else { "off" },
         );
@@ -1667,9 +1862,18 @@ impl RdpsndServerHandler for Backend {
                             if silent_blocks > SILENCE_TAIL_BLOCKS {
                                 drift.suppressed();
                                 queue.arrivals.reset(now);
+                                if silent_blocks == SILENCE_TAIL_BLOCKS + 1
+                                    && let Err(error) = encoder.suppressed()
+                                {
+                                    eprintln!("RDP audio recovery stopped: {error}");
+                                    break;
+                                }
                                 continue;
                             }
                             drift.sent(now, &data);
+                            // Drift skip, fade and levels above all act on the
+                            // 48 kHz stereo capture block; only now does the
+                            // codec downmix and/or resample it.
                             let encode_started = Instant::now();
                             let data = match encoder.encode(data) {
                                 Ok(Some(data)) => data,
@@ -2402,7 +2606,7 @@ mod tests {
             let rig = Rig::new();
             let adpcm = Adpcm::new().unwrap().format.clone();
             let mut unsupported = pcm();
-            unsupported.n_samples_per_sec = 44100;
+            unsupported.n_samples_per_sec = 22050;
             let (mut server, mut receiver) = negotiate_version(
                 &rig.audio,
                 vec![adpcm, unsupported, pcm(), aac_format()],
@@ -2458,7 +2662,7 @@ mod tests {
         let rig = Rig::new();
         let format = Adpcm::new().unwrap().format.clone();
         let mut unsupported = pcm();
-        unsupported.n_samples_per_sec = 44100;
+        unsupported.n_samples_per_sec = 22050;
         let (mut server, mut receiver) = negotiate(&rig.audio, vec![unsupported, format.clone()]);
         let mut source = rig.attach_pcm();
         source.write_all(&vec![0x35; ADPCM_SAMPLES * 4]).unwrap();
@@ -2558,7 +2762,7 @@ mod tests {
     fn negotiated_pcm_reaches_wire_with_client_format_index_and_bounded_backpressure() {
         let rig = Rig::new();
         let mut unsupported = pcm();
-        unsupported.n_samples_per_sec = 44100;
+        unsupported.n_samples_per_sec = 22050;
         let (mut server, mut receiver) = negotiate(&rig.audio, vec![unsupported, pcm()]);
         assert!(server.is_ready());
         assert!(
@@ -3352,10 +3556,72 @@ mod tests {
     fn incompatible_audio_formats_produce_no_sound() {
         let audio = Audio::default();
         let mut unsupported = pcm_mono_format();
-        unsupported.n_samples_per_sec = 44100;
+        unsupported.n_samples_per_sec = 22050;
         let (server, receiver) = negotiate(&audio, vec![unsupported]);
         assert!(!server.is_ready());
         assert!(receiver.is_empty());
+    }
+
+    /// The former 48 kHz mono opt-in: `NIRI_RDP_AUDIO_RATE=48000` with mono.
+    const MONO_48K: AudioTuning = AudioTuning {
+        drift_ppm: DRIFT_ALLOWANCE_PPM,
+        mono: true,
+        rate: 48000,
+    };
+
+    unsafe extern "C" {
+        fn niri_audio_resampler_state(
+            resampler: *const c_void,
+            queued: *mut i32,
+            adjusted: *mut u64,
+        ) -> i32;
+    }
+
+    /// (frames queued between calls, frames ever padded or discarded).
+    fn resampler_state(resampler: &Resampler) -> (i32, u64) {
+        let (mut queued, mut adjusted) = (-1, u64::MAX);
+        assert_eq!(
+            unsafe { niri_audio_resampler_state(resampler.ptr, &mut queued, &mut adjusted) },
+            0
+        );
+        (queued, adjusted)
+    }
+
+    /// 20 ms 48 kHz stereo blocks of a continuous tone: `frequency` Hz on the
+    /// left, 0.7x amplitude at 1.5x frequency on the right.
+    fn tone_blocks(frequency: f64, first_block: usize, blocks: usize) -> Vec<Vec<u8>> {
+        let frames = BLOCK_BYTES / 4;
+        (first_block..first_block + blocks)
+            .map(|block| {
+                (0..frames)
+                    .flat_map(|frame| {
+                        let t = (block * frames + frame) as f64 / 48000.0;
+                        let tau = std::f64::consts::TAU;
+                        let left = (12000.0 * (tau * frequency * t).sin()) as i16;
+                        let right = (8400.0 * (tau * frequency * 1.5 * t).sin()) as i16;
+                        let [l0, l1] = left.to_le_bytes();
+                        let [r0, r1] = right.to_le_bytes();
+                        [l0, l1, r0, r1]
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Frequency of channel `channel` of interleaved S16LE `pcm` at `rate`,
+    /// from interpolated rising zero crossings.
+    fn zero_crossing_frequency(pcm: &[u8], channels: usize, channel: usize, rate: f64) -> f64 {
+        let samples: Vec<f64> = (0..pcm.len() / 2 / channels)
+            .map(|frame| f64::from(sample_at(pcm, frame * channels + channel)))
+            .collect();
+        let crossings: Vec<f64> = samples
+            .windows(2)
+            .enumerate()
+            .filter(|(_, pair)| pair[0] < 0.0 && pair[1] >= 0.0)
+            .map(|(index, pair)| index as f64 + pair[0] / (pair[0] - pair[1]))
+            .collect();
+        assert!(crossings.len() > 10, "a tone, not silence");
+        (crossings.len() - 1) as f64 * rate / (crossings[crossings.len() - 1] - crossings[0])
     }
 
     fn stereo_block(left: i16, right: i16) -> Vec<u8> {
@@ -3368,14 +3634,120 @@ mod tests {
         (sample_at(pcm, index * 2), sample_at(pcm, index * 2 + 1))
     }
 
+    fn offer(tuning: AudioTuning) -> Vec<(WaveFormat, u16, u32, u32, u16, u16)> {
+        let audio = Audio::default().with_tuning(tuning);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut factory = audio.factory();
+        factory.set_sender(sender);
+        let backend = factory.build_backend();
+        assert!(
+            backend
+                .get_formats()
+                .iter()
+                .all(|format| { format.format == WaveFormat::ADPCM || format.data.is_none() })
+        );
+        backend
+            .get_formats()
+            .iter()
+            .map(|format| {
+                (
+                    format.format,
+                    format.n_channels,
+                    format.n_samples_per_sec,
+                    format.n_avg_bytes_per_sec,
+                    format.n_block_align,
+                    format.bits_per_sample,
+                )
+            })
+            .collect()
+    }
+
+    const AAC_OFFER: (WaveFormat, u16, u32, u32, u16, u16) =
+        (WaveFormat::AAC_MS, 2, 44100, 12000, 4, 16);
+    const ADPCM_OFFER: (WaveFormat, u16, u32, u32, u16, u16) = (
+        WaveFormat::ADPCM,
+        2,
+        48000,
+        (48000 * ADPCM_BLOCK_BYTES / ADPCM_SAMPLES) as u32,
+        ADPCM_BLOCK_BYTES as u16,
+        4,
+    );
+
     #[test]
-    fn mono_pcm_offered_first_then_stereo_pcm_then_compressed_fallbacks_with_exact_fields() {
-        let audio = Audio::default();
+    fn default_offers_44100_stereo_pcm_then_48000_stereo_pcm_then_compressed_fallbacks() {
+        assert_eq!(
+            offer(AudioTuning::default()),
+            [
+                (WaveFormat::PCM, 2, 44100, 176400, 4, 16),
+                (WaveFormat::PCM, 2, 48000, 192000, 4, 16),
+                AAC_OFFER,
+                ADPCM_OFFER,
+            ],
+            "no mono by default"
+        );
+        // One 20 ms 44.1 kHz stereo wave: 882 frames of 4 bytes.
+        assert_eq!(pcm44_format().n_avg_bytes_per_sec / 50, 3528);
+        assert_eq!(PCM44_FRAMES * 4, 3528);
+        assert_eq!(BLOCK_BYTES / 4 * 147 / 160, PCM44_FRAMES);
+    }
+
+    #[test]
+    fn mono_opt_in_offers_44100_mono_then_44100_stereo_then_the_default_fallbacks() {
+        assert_eq!(
+            offer(AudioTuning {
+                mono: true,
+                ..AudioTuning::default()
+            }),
+            [
+                (WaveFormat::PCM, 1, 44100, 88200, 2, 16),
+                (WaveFormat::PCM, 2, 44100, 176400, 4, 16),
+                (WaveFormat::PCM, 2, 48000, 192000, 4, 16),
+                AAC_OFFER,
+                ADPCM_OFFER,
+            ]
+        );
+    }
+
+    #[test]
+    fn rate_48000_restores_the_former_48000_first_offers() {
+        let rate_48k = AudioTuning {
+            rate: 48000,
+            ..AudioTuning::default()
+        };
+        assert_eq!(
+            offer(rate_48k),
+            [
+                (WaveFormat::PCM, 2, 48000, 192000, 4, 16),
+                AAC_OFFER,
+                ADPCM_OFFER,
+            ]
+        );
+        assert_eq!(
+            offer(MONO_48K),
+            [
+                (WaveFormat::PCM, 1, 48000, 96000, 2, 16),
+                (WaveFormat::PCM, 2, 48000, 192000, 4, 16),
+                AAC_OFFER,
+                ADPCM_OFFER,
+            ]
+        );
+    }
+
+    #[test]
+    fn former_default_offers_stereo_pcm_first_then_compressed_fallbacks_with_exact_fields() {
+        let audio = Audio::default().with_tuning(AudioTuning {
+            rate: 48000,
+            ..AudioTuning::default()
+        });
         let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
         let mut factory = audio.factory();
         factory.set_sender(sender);
         let backend = factory.build_backend();
         let formats = backend.get_formats();
+        assert!(
+            formats.iter().all(|format| format.n_channels == 2),
+            "no mono format is offered by default"
+        );
         let summary: Vec<_> = formats
             .iter()
             .map(|format| {
@@ -3392,7 +3764,6 @@ mod tests {
         assert_eq!(
             summary,
             [
-                (WaveFormat::PCM, 1, 48000, 96000, 2, 16),
                 (WaveFormat::PCM, 2, 48000, 192000, 4, 16),
                 (WaveFormat::AAC_MS, 2, 44100, 12000, 4, 16),
                 (
@@ -3406,23 +3777,38 @@ mod tests {
             ]
         );
         assert_eq!(formats[0].data, None);
-        assert_eq!(formats[1].data, None);
-        // One 20 ms mono block: 960 frames of 2 bytes, half the stereo wire size.
-        let mono = &formats[0];
-        assert_eq!(
-            mono.n_avg_bytes_per_sec / 50 * u32::from(mono.n_block_align) / 2,
-            1920
-        );
+        // One 20 ms stereo block: 960 frames of 4 bytes.
+        assert_eq!(formats[0].n_avg_bytes_per_sec / 50, BLOCK_BYTES as u32,);
+    }
+
+    #[test]
+    fn mono_48000_opt_in_offers_mono_pcm_first_then_stereo_pcm_then_compressed_fallbacks() {
+        let audio = Audio::default().with_tuning(MONO_48K);
+        let (sender, _receiver) = tokio::sync::mpsc::unbounded_channel();
+        let mut factory = audio.factory();
+        factory.set_sender(sender);
+        let backend = factory.build_backend();
+        let formats = backend.get_formats();
+        let summary: Vec<_> = formats
+            .iter()
+            .map(|format| (format.format, format.n_channels, format.n_avg_bytes_per_sec))
+            .collect();
+        assert_eq!(summary[0], (WaveFormat::PCM, 1, 96000));
+        assert_eq!(summary[1], (WaveFormat::PCM, 2, 192000));
+        assert_eq!(summary[2].0, WaveFormat::AAC_MS);
+        assert_eq!(summary[3].0, WaveFormat::ADPCM);
+        assert_eq!(summary.len(), 4);
         assert_eq!(downmix_to_mono(&vec![0x35; BLOCK_BYTES]).len(), 1920);
     }
 
     #[test]
-    fn mono_pcm_preferred_over_stereo_aac_and_adpcm_downmixes_on_both_wave_versions() {
+    fn mono_48000_opt_in_preferred_over_stereo_aac_and_adpcm_downmixes_on_both_wave_versions() {
         for version in [Version::V6, Version::V8] {
-            let rig = Rig::new();
+            let mut rig = Rig::new();
+            rig.audio = rig.audio.clone().with_tuning(MONO_48K);
             let adpcm = Adpcm::new().unwrap().format.clone();
             let mut unsupported = pcm_mono_format();
-            unsupported.n_samples_per_sec = 44100;
+            unsupported.n_samples_per_sec = 22050;
             let (mut server, mut receiver) = negotiate_version(
                 &rig.audio,
                 vec![adpcm, pcm(), unsupported, pcm_mono_format(), aac_format()],
@@ -4081,34 +4467,54 @@ mod tests {
     fn audio_tuning_parses_defaults_valid_invalid_and_clamped_values() {
         let baseline = AudioTuning {
             drift_ppm: 100,
-            mono: true,
+            mono: false,
+            rate: 44100,
         };
         assert_eq!(AudioTuning::default(), baseline);
-        assert_eq!(AudioTuning::parse(None, None), (baseline, vec![]));
+        assert_eq!(AudioTuning::parse(None, None, None), (baseline, vec![]));
         assert_eq!(
-            AudioTuning::parse(Some("250"), Some("stereo")),
+            AudioTuning::parse(Some("250"), Some("mono"), Some("48000")),
             (
                 AudioTuning {
                     drift_ppm: 250,
-                    mono: false
+                    mono: true,
+                    rate: 48000,
                 },
                 vec![]
             )
         );
-        assert_eq!(AudioTuning::parse(Some(" 0 "), Some("mono")).0.drift_ppm, 0);
-        assert_eq!(AudioTuning::parse(Some("2000"), None).0.drift_ppm, 2000);
-        let (clamped, warnings) = AudioTuning::parse(Some("5000"), None);
+        assert_eq!(
+            AudioTuning::parse(None, Some("stereo"), Some(" 44100 ")),
+            (baseline, vec![])
+        );
+        assert_eq!(
+            AudioTuning::parse(Some(" 0 "), Some("mono"), None)
+                .0
+                .drift_ppm,
+            0
+        );
+        assert_eq!(
+            AudioTuning::parse(Some("2000"), None, None).0.drift_ppm,
+            2000
+        );
+        let (clamped, warnings) = AudioTuning::parse(Some("5000"), None, None);
         assert_eq!(clamped.drift_ppm, MAX_DRIFT_PPM);
         assert_eq!(warnings.len(), 1);
         for invalid in ["", "-5", "abc", "1.5", "<not unicode>"] {
-            let (tuning, warnings) = AudioTuning::parse(Some(invalid), None);
+            let (tuning, warnings) = AudioTuning::parse(Some(invalid), None, None);
             assert_eq!(tuning, baseline, "{invalid:?}");
             assert_eq!(warnings.len(), 1, "{invalid:?}");
         }
         for invalid in ["Stereo", "5.1", ""] {
-            let (tuning, warnings) = AudioTuning::parse(None, Some(invalid));
+            let (tuning, warnings) = AudioTuning::parse(None, Some(invalid), None);
             assert_eq!(tuning, baseline, "{invalid:?}");
             assert_eq!(warnings.len(), 1, "{invalid:?}");
+        }
+        for invalid in ["", "44.1", "44k", "22050", "96000", "<not unicode>"] {
+            let (tuning, warnings) = AudioTuning::parse(None, None, Some(invalid));
+            assert_eq!(tuning, baseline, "{invalid:?}");
+            assert_eq!(warnings.len(), 1, "{invalid:?}");
+            assert!(warnings[0].contains("NIRI_RDP_AUDIO_RATE"), "{invalid:?}");
         }
     }
 
@@ -4248,7 +4654,7 @@ mod tests {
     fn drift_skip_drops_one_quiet_pcm_block_without_moving_the_send_schedule() {
         use crate::performance::{Counter, connection};
         let before = connection().get(Counter::AudioDriftSkips);
-        let mut stream = LiveStream::new(pcm_mono_format());
+        let mut stream = LiveStream::new(pcm());
         let loud = stereo_block(12000, -11000);
         let quiet = stereo_block(150, -90);
         let ms = Duration::from_millis;
@@ -4266,7 +4672,7 @@ mod tests {
         while stream.elapsed() < ms(12_000) {
             let waves = stream.step(&loud);
             assert_eq!(waves.len(), 1);
-            assert_eq!(waves[0].1, downmix_to_mono(&loud), "nothing dropped early");
+            assert_eq!(waves[0].1, loud.clone(), "nothing dropped early");
         }
         // Armed at 10 s: the quiet block is dropped. Its successor has not
         // been captured yet, so it leaves on its own normal tick, faded in
@@ -4274,8 +4680,8 @@ mod tests {
         assert!(stream.step(&quiet).is_empty(), "the quiet block is dropped");
         let mut faded = loud.clone();
         crossfade_into(&mut faded, &quiet[..DRIFT_SKIP_FADE_FRAMES * 4]);
-        assert_eq!(stream.step(&loud), [(ms(12_020), downmix_to_mono(&faded))]);
-        assert_eq!(stream.step(&loud), [(ms(12_040), downmix_to_mono(&loud))]);
+        assert_eq!(stream.step(&loud), [(ms(12_020), faded.clone())]);
+        assert_eq!(stream.step(&loud), [(ms(12_040), loud.clone())]);
         assert!(connection().get(Counter::AudioDriftSkips) > before);
         assert_eq!(stream.skips(), 1);
         // Nothing else is dropped within the 10 s spacing. Another stall's
@@ -4289,19 +4695,15 @@ mod tests {
         while stream.elapsed() < ms(22_100) {
             let waves = stream.step(&loud);
             assert_eq!(waves.len(), 1);
-            assert_eq!(
-                waves[0].1,
-                downmix_to_mono(&loud),
-                "no other block is dropped"
-            );
+            assert_eq!(waves[0].1, loud.clone(), "no other block is dropped");
         }
         let second = stereo_block(9000, 9000);
         let burst = [quiet.clone(), second.clone(), loud.clone()].concat();
         let mut faded = second.clone();
         crossfade_into(&mut faded, &quiet[..DRIFT_SKIP_FADE_FRAMES * 4]);
-        assert_eq!(stream.step(&burst), [(ms(22_100), downmix_to_mono(&faded))]);
-        assert_eq!(stream.step(&loud), [(ms(22_120), downmix_to_mono(&loud))]);
-        assert_eq!(stream.step(&loud), [(ms(22_140), downmix_to_mono(&loud))]);
+        assert_eq!(stream.step(&burst), [(ms(22_100), faded.clone())]);
+        assert_eq!(stream.step(&loud), [(ms(22_120), loud.clone())]);
+        assert_eq!(stream.step(&loud), [(ms(22_140), loud.clone())]);
         assert!(connection().get(Counter::AudioDriftSkips) >= before + 2);
         assert_eq!(stream.skips(), 2);
     }
@@ -4352,7 +4754,7 @@ mod tests {
 
     #[test]
     fn discarded_capture_never_earns_a_drift_skip() {
-        let mut stream = LiveStream::new(pcm_mono_format());
+        let mut stream = LiveStream::new(pcm());
         // Capture outruns the 20 ms send schedule threefold for a minute: the
         // bounded FIFO discards two of every three blocks. Discarded blocks
         // are never sent or confirmed, so they earn nothing. A skip would
@@ -4362,7 +4764,7 @@ mod tests {
             stereo_block(12000, -11000),
             stereo_block(9000, 9000),
         ];
-        let expected: Vec<_> = blocks.iter().map(|block| downmix_to_mono(block)).collect();
+        let expected: Vec<_> = blocks.to_vec();
         let burst = blocks.concat();
         let mut waves = 0;
         while stream.elapsed() < Duration::from_secs(60) {
@@ -4408,34 +4810,317 @@ mod tests {
     }
 
     #[test]
-    fn stereo_channels_knob_prefers_stereo_pcm_and_skips_the_same_way() {
-        let tuning = AudioTuning {
-            mono: false,
-            ..AudioTuning::default()
-        };
-        // The client accepts both; the knob removes mono from the offer.
-        let mut stream = LiveStream::with(vec![pcm_mono_format(), pcm()], tuning);
+    fn mono_channels_opt_in_downmixes_and_skips_the_same_way() {
+        // The client accepts both; the opt-in puts mono first in the offer.
+        let mut stream = LiveStream::with(vec![pcm_mono_format(), pcm()], MONO_48K);
         let loud = stereo_block(12000, -11000);
         let quiet = stereo_block(150, -90);
         let ms = Duration::from_millis;
         for _ in 0..100 {
-            assert_eq!(stream.step(&loud)[0].1, loud, "exact stereo samples");
+            assert_eq!(stream.step(&loud)[0].1, downmix_to_mono(&loud));
         }
         assert_eq!(stream.stall(&loud, 15), MAX_PENDING);
         while stream.elapsed() < ms(12_000) {
             let at = stream.elapsed();
-            assert_eq!(stream.step(&loud), [(at, loud.clone())]);
+            assert_eq!(stream.step(&loud), [(at, downmix_to_mono(&loud))]);
         }
         assert!(stream.step(&quiet).is_empty(), "the quiet block is dropped");
         let mut faded = loud.clone();
         crossfade_into(&mut faded, &quiet[..DRIFT_SKIP_FADE_FRAMES * 4]);
-        assert_eq!(stream.step(&loud), [(ms(12_020), faded)]);
+        assert_eq!(stream.step(&loud), [(ms(12_020), downmix_to_mono(&faded))]);
         assert_eq!(stream.skips(), 1);
     }
 
     #[test]
+    fn resampler_emits_exactly_882_frames_per_block_for_ten_minutes_without_queue_growth() {
+        // 1 kHz has a whole number of cycles per 20 ms block, so one block
+        // repeated is a continuous tone. 30000 blocks are ten minutes.
+        let stereo = tone_blocks(1000.0, 0, 1).remove(0);
+        for (channels, block) in [(2, stereo.clone()), (1, downmix_to_mono(&stereo))] {
+            let mut resampler = Resampler::new(channels).unwrap();
+            let mut frames = 0;
+            let mut last = Vec::new();
+            for _ in 0..30_000 {
+                last = resampler.convert(&block).unwrap();
+                assert_eq!(last.len(), PCM44_FRAMES * usize::from(channels) * 2);
+                frames += last.len() / 2 / usize::from(channels);
+                // Nothing is left queued between blocks and nothing was
+                // ever padded or discarded: output rate equals input rate.
+                assert_eq!(resampler_state(&resampler), (0, 0));
+            }
+            assert_eq!(frames, 30_000 * 882);
+            if channels == 2 {
+                let frequency = zero_crossing_frequency(&last, 2, 0, 44100.0);
+                assert!((frequency - 1000.0).abs() < 1.0, "{frequency}");
+            }
+            // Wrong sizes are refused without disturbing the stream.
+            assert!(resampler.convert(&block[2..]).is_err());
+            assert_eq!(resampler.convert(&block).unwrap(), last);
+        }
+    }
+
+    #[test]
+    fn resampler_preserves_tone_frequency_level_and_channel_order() {
+        let blocks = tone_blocks(997.0, 0, 100);
+        let mut resampler = Resampler::new(2).unwrap();
+        let output: Vec<u8> = blocks
+            .iter()
+            .flat_map(|block| resampler.convert(block).unwrap())
+            .collect();
+        assert_eq!(output.len(), 100 * 3528);
+        // Skip the first block (filter priming) and measure the rest.
+        let steady = &output[3528..];
+        let left = zero_crossing_frequency(steady, 2, 0, 44100.0);
+        let right = zero_crossing_frequency(steady, 2, 1, 44100.0);
+        assert!((left - 997.0).abs() < 0.5, "left {left} Hz");
+        assert!((right - 1495.5).abs() < 0.75, "right {right} Hz");
+        // Played back at 44.1 kHz, the 48 kHz samples themselves would read
+        // 8.8% low: the defect this conversion avoids.
+        let unconverted = zero_crossing_frequency(&blocks.concat(), 2, 0, 44100.0);
+        assert!((unconverted - 997.0 * 44100.0 / 48000.0).abs() < 1.0);
+        let rms = |channel: usize| {
+            let frames = steady.len() / 4;
+            ((0..frames)
+                .map(|frame| f64::from(sample_at(steady, frame * 2 + channel)).powi(2))
+                .sum::<f64>()
+                / frames as f64)
+                .sqrt()
+        };
+        let expected = 12000.0 / 2f64.sqrt();
+        assert!((rms(0) / expected - 1.0).abs() < 0.01, "{}", rms(0));
+        assert!((rms(1) / (0.7 * expected) - 1.0).abs() < 0.01, "{}", rms(1));
+        // Mono: downmix at 48 kHz first, then resample.
+        let mut mono = Resampler::new(1).unwrap();
+        let output: Vec<u8> = blocks
+            .iter()
+            .flat_map(|block| mono.convert(&downmix_to_mono(block)).unwrap())
+            .collect();
+        assert_eq!(output.len(), 100 * 1764);
+        assert!(Resampler::new(3).is_err());
+    }
+
+    #[test]
+    fn pcm_44100_preferred_reaches_wire_as_3528_byte_waves_with_client_format_index_on_both_wave_versions()
+     {
+        for version in [Version::V6, Version::V8] {
+            let rig = Rig::new();
+            let adpcm = Adpcm::new().unwrap().format.clone();
+            let mut unsupported = pcm();
+            unsupported.n_samples_per_sec = 22050;
+            let (mut server, mut receiver) = negotiate_version(
+                &rig.audio,
+                vec![adpcm, pcm(), unsupported, pcm44_format(), aac_format()],
+                version,
+            );
+            assert!(server.is_ready());
+            let mut source = rig.attach_pcm();
+            let mut reference = Resampler::new(2).unwrap();
+            for block in tone_blocks(997.0, 0, 3) {
+                let expected = reference.convert(&block).unwrap();
+                assert_eq!(expected.len(), 3528);
+                source.write_all(&block).unwrap();
+                let (data, timestamp) = rig.take_wave(&mut receiver);
+                assert_eq!(timestamp, 0);
+                assert_eq!(
+                    data, expected,
+                    "44.1 kHz stereo PCM must be chosen over 48 kHz PCM, AAC and ADPCM"
+                );
+                let messages: Vec<_> = server.wave(data, timestamp).unwrap().into();
+                let bytes = messages[0].encode_unframed_pdu().unwrap();
+                match decode(&bytes).unwrap() {
+                    ServerAudioOutputPdu::Wave2(wave) => {
+                        assert_eq!(messages.len(), 1);
+                        assert_eq!((wave.timestamp, wave.audio_timestamp), (0, 0));
+                        assert_eq!(wave.format_no, 3, "indexes the client's list");
+                        assert_eq!(wave.data.as_ref(), expected);
+                        confirm(&mut server, wave.block_no, 0);
+                    }
+                    ServerAudioOutputPdu::Wave(info) => {
+                        assert_eq!(messages.len(), 2);
+                        assert_eq!(info.format_no, 3);
+                        assert_eq!(info.timestamp, 0);
+                        assert_eq!(usize::from(info.audio_length), 3528);
+                        let payload = messages[1].encode_unframed_pdu().unwrap();
+                        assert_eq!(payload.len(), 3528);
+                        let mut reconstructed = info.data_prefix.to_vec();
+                        reconstructed.extend_from_slice(&payload[4..]);
+                        assert_eq!(reconstructed, expected);
+                        confirm(&mut server, info.block_no, 0);
+                    }
+                    _ => panic!("expected an audio wave"),
+                }
+            }
+            drop(server);
+            assert_eq!(source.read(&mut [0]).unwrap(), 0);
+        }
+    }
+
+    #[test]
+    fn mono_opt_in_at_44100_downmixes_then_resamples_to_1764_byte_waves() {
+        let mono = AudioTuning {
+            mono: true,
+            ..AudioTuning::default()
+        };
+        let mut stream = LiveStream::with(
+            vec![
+                pcm(),
+                pcm44_format(),
+                pcm_mono_format(),
+                pcm44_mono_format(),
+            ],
+            mono,
+        );
+        let mut reference = Resampler::new(1).unwrap();
+        for block in tone_blocks(997.0, 0, 20) {
+            let waves = stream.step(&block);
+            assert_eq!(waves.len(), 1);
+            assert_eq!(waves[0].1.len(), 1764);
+            assert_eq!(
+                waves[0].1,
+                reference.convert(&downmix_to_mono(&block)).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn pcm_44100_transport_credit_wait_preserves_resampler_continuity() {
+        for queued_capture in [false, true] {
+            let rig = Rig::new();
+            let (mut server, mut receiver) = negotiate(&rig.audio, vec![pcm44_format()]);
+            let mut source = rig.attach_pcm();
+            let mut blocks = tone_blocks(997.0, 0, 12).into_iter();
+            let mut reference = Resampler::new(2).unwrap();
+            let mut tail = 0;
+            // Fill transport credit with paced capture so no sample is lost.
+            for _ in 0..MAX_PENDING {
+                let block = blocks.next().unwrap();
+                source.write_all(&block).unwrap();
+                let (data, _) = rig.take_wave(&mut receiver);
+                assert_eq!(data, reference.convert(&block).unwrap());
+                tail = wave2(&mut server, data, 0).block_no;
+                rig.advance(Duration::from_millis(25));
+            }
+            // An ordinary credit wait, within the receipt budget.
+            rig.advance(Duration::from_millis(30));
+            assert!(receiver.is_empty());
+            let mut expected = VecDeque::new();
+            if queued_capture {
+                let block = blocks.next().unwrap();
+                expected.push_back(reference.convert(&block).unwrap());
+                source.write_all(&block).unwrap();
+                rig.advance(Duration::from_millis(15));
+                assert!(receiver.is_empty());
+            }
+            confirm(&mut server, tail, 0);
+            for _ in 0..3 {
+                let block = blocks.next().unwrap();
+                expected.push_back(reference.convert(&block).unwrap());
+                source.write_all(&block).unwrap();
+                rig.advance(Duration::from_millis(25));
+            }
+            for expected in expected {
+                let (data, _) = rig.take_wave(&mut receiver);
+                assert!(
+                    data == expected,
+                    "a credit wait must not reset or re-prime the resampler"
+                );
+            }
+            drop(server);
+        }
+    }
+
+    #[test]
+    fn pcm_44100_resampler_restarts_after_capture_loss_and_silence_suppression() {
+        let mut stream = LiveStream::new(pcm44_format());
+        let blocks = tone_blocks(997.0, 0, 40);
+        let mut reference = Resampler::new(2).unwrap();
+        for block in &blocks[..10] {
+            assert_eq!(stream.step(block)[0].1, reference.convert(block).unwrap());
+        }
+        // Capture overflow: the oldest of four queued blocks is lost, so the
+        // remaining three start a freshly primed resampler.
+        let mut reference = Resampler::new(2).unwrap();
+        let waves = stream.step(&blocks[10..14].concat());
+        assert_eq!(waves.len(), 1);
+        assert_eq!(waves[0].1, reference.convert(&blocks[11]).unwrap());
+        for block in &blocks[12..14] {
+            assert_eq!(stream.step(&[])[0].1, reference.convert(block).unwrap());
+        }
+        for block in &blocks[14..20] {
+            assert_eq!(stream.step(block)[0].1, reference.convert(block).unwrap());
+        }
+        // Five silent blocks are sent as the tail, then sending stops.
+        let silence = vec![0; BLOCK_BYTES];
+        for _ in 0..SILENCE_TAIL_BLOCKS {
+            assert_eq!(
+                stream.step(&silence)[0].1,
+                reference.convert(&silence).unwrap()
+            );
+        }
+        for _ in 0..10 {
+            assert!(stream.step(&silence).is_empty());
+        }
+        // Sound resumes from a freshly primed resampler.
+        let mut reference = Resampler::new(2).unwrap();
+        for block in &blocks[20..30] {
+            let waves = stream.step(block);
+            assert_eq!(waves.len(), 1);
+            assert_eq!(waves[0].1, reference.convert(block).unwrap());
+        }
+    }
+
+    #[test]
+    fn drift_skip_on_the_44100_path_drops_a_48000_block_before_resampling() {
+        let mut stream = LiveStream::new(pcm44_format());
+        let loud = stereo_block(12000, -11000);
+        let quiet = stereo_block(150, -90);
+        let ms = Duration::from_millis;
+        for _ in 0..100 {
+            let waves = stream.step(&loud);
+            assert_eq!(waves.len(), 1);
+            assert_eq!(waves[0].1.len(), 3528);
+        }
+        assert_eq!(stream.stall(&loud, 15), MAX_PENDING);
+        while stream.elapsed() < ms(12_000) {
+            let waves = stream.step(&loud);
+            assert_eq!(waves.len(), 1);
+            assert_eq!(waves[0].1.len(), 3528, "pacing by time, one wave per 20 ms");
+        }
+        // The filter spans less than one block, so after loud blocks the
+        // resampler state is that of any warm reference fed loud blocks.
+        let mut warm = Resampler::new(2).unwrap();
+        warm.convert(&loud).unwrap();
+        warm.convert(&loud).unwrap();
+        assert!(stream.step(&quiet).is_empty(), "the quiet block is dropped");
+        let mut faded = loud.clone();
+        crossfade_into(&mut faded, &quiet[..DRIFT_SKIP_FADE_FRAMES * 4]);
+        // The dropped 48 kHz block never reached the resampler; the faded
+        // successor did, on its own tick.
+        assert_eq!(
+            stream.step(&loud),
+            [(ms(12_020), warm.convert(&faded).unwrap())]
+        );
+        assert_eq!(
+            stream.step(&loud),
+            [(ms(12_040), warm.convert(&loud).unwrap())]
+        );
+        assert_eq!(stream.skips(), 1);
+    }
+
+    #[test]
+    fn default_stereo_ignores_a_mono_client_format_and_keeps_exact_samples() {
+        // Even if a client lists mono PCM, the default offer has none, so the
+        // stereo format is selected and samples pass through unchanged.
+        let mut stream = LiveStream::with(vec![pcm_mono_format(), pcm()], AudioTuning::default());
+        let loud = stereo_block(12000, -11000);
+        for _ in 0..10 {
+            assert_eq!(stream.step(&loud)[0].1, loud, "exact stereo samples");
+        }
+    }
+
+    #[test]
     fn bunched_and_delayed_confirmations_cannot_repeat_unearned_skips() {
-        let mut stream = LiveStream::new(pcm_mono_format());
+        let mut stream = LiveStream::new(pcm());
         let loud = stereo_block(12000, -11000);
         let quiet = stereo_block(150, -90);
         let block = |step: u64| {

@@ -1,12 +1,14 @@
 # Performance controls and reproducible validation
 
 The remote desktop keeps one display and bounded latest-frame delivery. Since
-2026-10-18 the audio baseline prefers 48 kHz mono S16LE PCM in 20 ms blocks,
-falling back to the previously accepted stereo PCM, with both RDPSND timestamps
-zero and an earned 20 ms drift catch-up during continuous PCM sound (since
+2026-10-20 the audio baseline prefers 44.1 kHz stereo S16LE PCM in 20 ms blocks
+(about 1.41 Mbit/s, resampled from the 48 kHz capture because mstsc played
+48 kHz PCM about 9% slow), then 48 kHz stereo PCM (mono PCM is opt-in; it
+sounded pitched-up and robotic in mstsc), with both
+RDPSND timestamps zero and an earned 20 ms drift catch-up during continuous PCM sound (since
 2026-10-20 a drop needs an estimated client-queue surplus above a 60 ms jitter
-reserve, replacing a blind drop every 30 s; `NIRI_RDP_AUDIO_CHANNELS` and
-`NIRI_RDP_AUDIO_DRIFT_PPM` default to that baseline;
+reserve, replacing a blind drop every 30 s; `NIRI_RDP_AUDIO_CHANNELS`,
+`NIRI_RDP_AUDIO_RATE` and `NIRI_RDP_AUDIO_DRIFT_PPM` default to that baseline;
 [session audio](../bridge/README.md#session-audio)); Windows listening
 validation of these changes is pending. Audio and video measurements use internal monotonic
 time; graphics acknowledgements do not establish physical presentation or an
@@ -32,7 +34,8 @@ before desktop capture starts.
 | `NIRI_RDP_SCALE` | `client` or explicit 1.0–5.0; an explicit value takes precedence over client Display Control scale metadata |
 | `NIRI_RDP_ADAPTIVE_GRAPHICS` | `1` opts into coordinated FPS, which lowers the cadence with the bitrate level (not below 10); `0` (default) keeps the configured FPS. Either way the graphics credit window follows the measured ACK delay (2–8 frames, see below) |
 | `NIRI_RDP_MICROPHONE` | `auto` (default) offers mstsc microphone redirection (MS-RDPEAI `AUDIO_INPUT`, 48 kHz mono PCM preferred, about 0.8 Mbit/s upload while a remote application records); `off` offers no channel. Separate from playback; see [remote microphone](install.md#remote-microphone) |
-| `NIRI_RDP_AUDIO_CHANNELS` | `mono` (default) offers 48 kHz mono PCM first, then stereo PCM; `stereo` removes mono from the offer, so stereo PCM (about 1.54 Mbit/s) is preferred. Compressed fallbacks are unchanged. Invalid values warn and use `mono` |
+| `NIRI_RDP_AUDIO_CHANNELS` | `stereo` (default) offers stereo PCM first and no mono; `mono` is an opt-in that offers mono PCM (downmixed before resampling) first at the selected rate, then stereo PCM, but 48 kHz mono sounded pitched-up and robotic in Windows 10 mstsc (2026-10-20). Compressed fallbacks are unchanged. Invalid values warn and use `stereo` |
+| `NIRI_RDP_AUDIO_RATE` | `44100` (default) offers 44.1 kHz PCM (stereo about 1.41 Mbit/s, 3528-byte 20 ms waves resampled from the 48 kHz capture) first, then 48 kHz stereo PCM; `48000` restores the former 48 kHz-first offer, which mstsc played about 8.8% slow (25 s behind video after 5 minutes). Invalid values warn and use `44100` |
 | `NIRI_RDP_AUDIO_DRIFT_PPM` | 0–2000, default 100; the PCM drift skip's allowance for Windows audio clock drift (20 ms per 200 s of continuous sound at 100). Larger values clamp to 2000; invalid values warn and use 100 |
 | `NIRI_RDP_DIAGNOSTICS` | `1` enables bounded timing/counter reports, including `idr_frames`, `deferred_rate_increase_frames`, `bitrate_level_decreases` and `bitrate_level_increases`; ordinary operation avoids diagnostic aggregation |
 

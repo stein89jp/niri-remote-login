@@ -31,6 +31,28 @@ static const AUDIO_FORMAT aac_format = {
     .data = NULL,
 };
 
+static const AUDIO_FORMAT pcm44_format = {
+    .wFormatTag = WAVE_FORMAT_PCM,
+    .nChannels = 2,
+    .nSamplesPerSec = 44100,
+    .nAvgBytesPerSec = 176400,
+    .nBlockAlign = 4,
+    .wBitsPerSample = 16,
+    .cbSize = 0,
+    .data = NULL,
+};
+
+static const AUDIO_FORMAT pcm44_mono_format = {
+    .wFormatTag = WAVE_FORMAT_PCM,
+    .nChannels = 1,
+    .nSamplesPerSec = 44100,
+    .nAvgBytesPerSec = 88200,
+    .nBlockAlign = 2,
+    .wBitsPerSample = 16,
+    .cbSize = 0,
+    .data = NULL,
+};
+
 static const AUDIO_FORMAT pcm_format = {
     .wFormatTag = WAVE_FORMAT_PCM,
     .nChannels = 2,
@@ -90,8 +112,10 @@ static void test_formats(void) {
     assert(read.nAvgBytesPerSec == 12000 && read.nBlockAlign == 4);
     assert(read.wBitsPerSample == 16 && read.cbSize == 0 && read.data == NULL);
     assert(freerdp_dsp_supports_format(&read, FALSE) && "GNOME AAC_MS offer must be accepted");
-    assert(freerdp_dsp_supports_format(&pcm_mono_format, FALSE) && "preferred mono PCM must be accepted");
-    assert(freerdp_dsp_supports_format(&pcm_format, FALSE) && "stereo PCM fallback must be accepted");
+    assert(freerdp_dsp_supports_format(&pcm44_format, FALSE) && "preferred 44.1 kHz stereo PCM must be accepted");
+    assert(freerdp_dsp_supports_format(&pcm44_mono_format, FALSE) && "opt-in 44.1 kHz mono PCM must be accepted");
+    assert(freerdp_dsp_supports_format(&pcm_mono_format, FALSE) && "opt-in 48 kHz mono PCM must be accepted");
+    assert(freerdp_dsp_supports_format(&pcm_format, FALSE) && "48 kHz stereo PCM fallback must be accepted");
     audio_format_free(&read);
     Stream_Free(wire, TRUE);
 
@@ -104,7 +128,7 @@ static void test_formats(void) {
     adpcm.wBitsPerSample = 4;
     assert(!freerdp_dsp_supports_format(&adpcm, FALSE));
     puts("PASS: FreeRDP accepts exact AAC_MS and PCM formats; MS ADPCM is filtered");
-    puts("PASS: FreeRDP accepts 48 kHz mono and stereo PCM");
+    puts("PASS: FreeRDP accepts 44.1 kHz and 48 kHz mono and stereo PCM");
 }
 
 static void test_aac_client_decode(void) {

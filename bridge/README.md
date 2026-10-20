@@ -256,14 +256,30 @@ only a broker-authorized versioned PCM capture descriptor, without access to the
 This follows GNOME Remote Login's session-playback model: capture an audio sink
 and send it through RDP ([GNOME implementation](https://github.com/GNOME/gnome-remote-desktop/blob/main/src/grd-rdp-dvc-audio-playback.c)).
 
-Capture is stereo 48 kHz, signed 16-bit little-endian PCM. Since 2026-10-18
-the frontend prefers **48 kHz mono PCM**: it downmixes each stereo frame to
-(L+R)/2, rounding halves away from zero without overflow, and sends 1920 bytes
-per 20 ms block, about 768 kbit/s before framing. The offer order is mono PCM,
-then the previous 48 kHz stereo PCM (about 1.54 Mbit/s), then AAC-LC and MS
-ADPCM; stereo PCM is passed through unchanged. Mono is advertised as
-`WAVE_FORMAT_PCM`, 1 channel, 48000 Hz, 96000 bytes/s, block align 2,
-16 bits per sample. Windows 10 mstsc playback was intelligible with PCM, but
+Capture is stereo 48 kHz, signed 16-bit little-endian PCM. Since 2026-10-20
+(user-approved) the frontend prefers **44.1 kHz stereo PCM** (`WAVE_FORMAT_PCM`,
+2 channels, 44100 Hz, 176400 bytes/s, block align 4, 16 bits; about
+1.41 Mbit/s). With 48 kHz PCM, Windows 10 mstsc fell about 25 s behind video
+after 5 minutes of continuous playback, about 8.8% slow (48000/44100), while
+the server sent exactly real time: mstsc appears to play 48 kHz PCM at
+44.1 kHz. The bridge converts each 20 ms capture block (960 frames) with
+FFmpeg libswresample (64-tap filter) into exactly 882 frames, 3528 bytes per
+wave: the first block after a reset is led by the filter's 33-frame delay as
+silence, and every later block is exactly full, so nothing queues between
+blocks and the output rate equals the capture rate. The resampler restarts
+after actual sample loss and at silence suppression, never for an ordinary
+credit wait. The offer order is 44.1 kHz stereo PCM, 48 kHz stereo PCM
+(passed through unchanged, about 1.54 Mbit/s), then AAC-LC and MS ADPCM; no
+mono is offered. `NIRI_RDP_AUDIO_RATE=48000` restores the former order
+(48 kHz stereo PCM first, no 44.1 kHz PCM) for comparison tests; invalid values
+warn and use 44100. Mono PCM is opt-in with `NIRI_RDP_AUDIO_CHANNELS=mono` (at
+48 kHz it sounded pitched-up and robotic in actual Windows 10 mstsc on
+2026-10-20 and must not be the default): the frontend then downmixes each
+stereo frame to (L+R)/2, rounding halves away from zero without overflow,
+before resampling, and offers mono PCM at the selected rate first (44.1 kHz:
+1764 bytes per 20 ms wave, 88200 bytes/s; 48 kHz: 1920 bytes, 96000 bytes/s).
+At each audio channel start the journal lists the client-accepted formats
+(`RDP audio formats: client accepted [...]; chosen ...`). Windows 10 mstsc playback was intelligible with PCM, but
 both compressed offers have produced static in actual listening checks. Clients
 that do not accept PCM can use GNOME Remote Login's AAC-LC format: `AAC_MS`, stereo 44.1 kHz at 96 kbit/s,
 1024 sample frames per raw packet, with no ADTS header or WAVE extra data.
@@ -313,12 +329,16 @@ and at least 10 s since the previous drop or since sound started or resumed;
 silence suppression empties the estimate and the credit, and receipts of waves
 sent before it are ignored. Steady audio earns only the drift allowance: 20 ms
 per 200 s at the default 100 ppm, so its first drop comes after about 800 s of
-continuous sound. Two frontend settings, read once at startup and defaulting to
+continuous sound. Frontend settings, read once at startup and defaulting to
 this baseline, tune it: `NIRI_RDP_AUDIO_DRIFT_PPM` (0–2000, default 100) sets
-the allowance, and `NIRI_RDP_AUDIO_CHANNELS=stereo` removes mono from the PCM
-offer so stereo PCM is preferred (default `mono`); invalid values warn and keep
-the default. The `RDP audio PCM` start line reports `channels`, `drift_ppm` and
-whether the drift skip is on. While armed, the catch-up drops the first quiet block: mean
+the allowance, `NIRI_RDP_AUDIO_CHANNELS=mono` opts in to mono PCM first
+(default `stereo`, no mono offered) and `NIRI_RDP_AUDIO_RATE` selects the
+preferred PCM rate (default `44100`); invalid values warn and keep the default.
+The `RDP audio PCM` start line reports `channels`, `rate`, `drift_ppm` and
+whether the drift skip is on, for example `RDP audio PCM: 44100 Hz stereo,
+1411 kbps, 20.00 ms blocks; channels=stereo rate=44100 drift_ppm=100
+drift_skip=on`. The drop, its level checks and the crossfade act on the 48 kHz
+stereo capture block; downmix and resampling follow. While armed, the catch-up drops the first quiet block: mean
 absolute level at most about -40 dBFS, or at most a quarter of the recent
 average level. If no quiet block arrives within 5 s, it drops the next audible
 block. Digital silence is never dropped. The
@@ -360,14 +380,21 @@ Disposable compositor mode has no audio backend.
 `python3 -m unittest tests.test_audio -v` runs real private PipeWire playback,
 captures a tone and repeats after reconnect, and verifies AAC and ADPCM
 encode/decode with guarded source buffers. Rust tests negotiate the audio
-formats, verify the offer order and mono/stereo format fields, mono preference
-with exact (L+R)/2 samples, stereo fallback with exact signed stereo samples in
+formats, verify the default stereo-first offer with exact fields and no mono, the mono
+opt-in offer, mono preference under the opt-in
+with exact (L+R)/2 samples, stereo selection with exact signed stereo samples in
 both WaveInfo/Wave and Wave2 PDUs, and the client's format index. They check
 downmix extremes, the earned surplus (drift allowance only for steady audio,
 burst credit above the reserve, starvation credit at most once per 30 s and
 never across silence suppression or for AAC/ADPCM, no credit for discarded
 capture, return-path batching, the cap and the reset at silence suppression),
-the audio settings' parsing, stereo preference with `NIRI_RDP_AUDIO_CHANNELS`, drift-skip arming and spacing, quiet preference,
+the audio settings' parsing, mono opt-in with `NIRI_RDP_AUDIO_CHANNELS`, the
+44.1 kHz-first offer and `NIRI_RDP_AUDIO_RATE=48000` restoring the former one,
+3528-byte 44.1 kHz waves with the client's format index on both wave PDU
+versions, exactly 882 resampled frames per block for ten minutes without queue
+growth, tone frequency and level after resampling, resampler continuity across
+credit waits and its restart after sample loss and silence, the drift skip on
+the 44.1 kHz path, drift-skip arming and spacing, quiet preference,
 forced drops, restart after silence, crossfade continuity and an unchanged send
 schedule. They also check
 backpressure, long playback feedback, timestamp/block wrapping, healthy sample
